@@ -24,7 +24,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from aipotluck.installer import build_cache, build_strategy, fetch, model_presets, source_build
+from aipotluck.installer import build_cache, build_strategy, fetch, model_perf_store, model_presets, source_build
 from aipotluck.installer.platform_detect import (
     HostProfile,
     UnsupportedPlatformError,
@@ -244,11 +244,27 @@ def runtime_params(runtime_config: dict[str, Any]) -> dict[str, Any]:
         presets_path = Path(presets_path_str)
         raw_presets = model_presets.read_all(presets_path)
         tuning_by_model = model_presets.read_tuning(presets_path)
+        # Speed grades live in their own sibling file rather than in the tuning map, whose contract
+        # is {param: human readable reason} -- see model_perf_store's module docstring. They are
+        # surfaced here for the same traceability reason the presets are: a grade that decided
+        # whether a model could be installed at all should be inspectable, not printed once and lost.
+        graded = model_perf_store.read_all(presets_path).get("models", {})
         for model_id, raw_args in raw_presets.items():
             model_view = {
                 field: raw_args.get(key) for key, field in _PRESET_KEY_TO_FIELD.items()
             }
             model_view["tuning"] = tuning_by_model.get(model_id, {})
+            record = graded.get(model_id)
+            model_view["performance"] = {
+                "grade": record.get("grade"),
+                "n_fit": record.get("n_fit"),
+                "decode_tokens_per_second": record.get("decode_tokens_per_second"),
+                "source": record.get("source"),
+                "confidence": record.get("confidence"),
+                "measured_at": record.get("measured_at"),
+                "reason": record.get("reason"),
+                "stale": model_perf_store.is_stale(presets_path, record, llama_config=llama_cfg),
+            } if isinstance(record, dict) else None
             models[model_id] = model_view
 
     params["models"] = models

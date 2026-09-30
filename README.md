@@ -397,8 +397,9 @@ correctly sized *before* it's first requested, rather than paying a cold downloa
 stock-defaults sizing on that first real request:
 
 ```bash
-aipotluck-local-client pull bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M   # download + size
-aipotluck-local-client list                                              # what's cached locally
+aipotluck-local-client pull bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M   # download + size + speed-check
+aipotluck-local-client list                                              # what's cached, with grades
+aipotluck-local-client benchmark [model]                                 # re-measure speed only
 ```
 
 `pull` accepts any Hugging Face `repo` or `repo:quant` target and hands it straight to
@@ -415,8 +416,9 @@ Face Hub cache layout (`$LLAMA_CACHE` / `$HF_HUB_CACHE` / `$HUGGINGFACE_HUB_CACH
 `$HF_HOME/hub` / `$XDG_CACHE_HOME/huggingface/hub` / `~/.cache/huggingface/hub`, in that order --
 see `vendor/llama.cpp/common/hf-cache.cpp`) -- via `llama-server`'s own `--cache-list` flag, for
 the same "don't re-implement it" reason `pull` reuses `-hf`. Router mode means there's no single
-"active" model anymore -- any cached model can be requested at any time -- so a model with an
-already-computed sizing preset is marked `(sized)` instead.
+"active" model anymore -- any cached model can be requested at any time -- so instead each row
+carries its speed grade (below), plus a note when it has no sizing preset yet or has never been
+benchmarked.
 
 ### Automatic runtime sizing (`aipotluck/installer/model_sizing.py`)
 
@@ -462,6 +464,77 @@ CLAUDE.md's "Runtime parameters" convention. If sizing can't be done (memory can
 this platform yet, the probe times out, a required hparam can't be parsed, ...) it fails loud into
 a log warning and leaves whatever preset that model already had (or none) untouched -- it never
 blocks the download/pull itself, and never guesses.
+
+### Speed grading (`aipotluck/installer/model_perf.py`)
+
+Sizing answers "will this model *fit*". Grading answers the other question a small device makes
+urgent: **will a reply actually arrive before the web app gives up?** On a CPU-only mini PC or a
+Jetson it is easy to pull a model that loads perfectly, appears in the chat model picker, and then
+never finishes a turn.
+
+The budget is not a guess. `aipotluck.org`'s `deadlineLadder.ts` derives
+`MAX_SAFE_GENERATION_TIMEOUT_MS = 155_000`, a local turn is clamped to exactly that, and the clock
+starts *after* that app's prestream chain -- so cold model load, prefill and decode all come out of
+it. Two more facts from that side shape the estimate: every reply is hard-capped at **1024 tokens**,
+and the prompt is **never truncated** (a typical turn is ~2k tokens, 8-10k once retrieval or
+web-search grounding fires, 32k+ with an attached file).
+
+`pull` therefore benchmarks what it just downloaded, with `llama-bench` at the *same* K/V cache
+types and GPU-layer count the preset will actually serve at, and fits per-token cost as a straight
+line in KV-cache depth. Integrating that gives a closed form for a whole turn, which is solved for
+**`N_fit`**: the largest input, in tokens, that still finishes in time.
+
+```
+GREEN   N_fit >= 32,768    heavy long-context use is safe
+YELLOW  N_fit >=  8,192    grounded turns fine; long-file turns may time out
+RED     N_fit >=  2,048    short turns only
+REFUSE  N_fit <   2,048    not installed -- see below
+```
+
+`N_fit` is also clamped by the context size sizing picked for this device, because an over-long
+prompt fails outright rather than merely slowly. One deliberate consequence: a model whose fitted
+context is under ~33k **cannot be graded green at any speed** -- on this device it genuinely cannot
+do heavy context, and that is the honest answer rather than a quirk.
+
+Two details worth knowing, both of which came out of measuring real hardware rather than reasoning:
+
+- **The shallow measurement is taken at depth 512, not 0.** Decode cost per token nearly doubles
+  over the first few hundred tokens and then flattens (17.3ms at depth 0 vs 32.8ms at 512 and
+  33.9ms at 1024, measured on a CPU-only laptop), because generating at depth 0 does almost no
+  attention work. Anchoring the fit there made it *optimistic* across the whole range the app
+  actually uses -- the direction that promises turns which then time out.
+- **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and at pull time the
+  file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
+  `posix_fadvise(DONTNEED)` drops it first and a real sequential read is timed instead.
+- **The safety factor is measured, not guessed.** Checked against real full turns on the same
+  laptop, the fit under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
+  excludes tokenization and sampling from its numbers, nothing measures the chat template on top,
+  and real cost grows a little faster than linearly past the deepest point the probe can afford.
+  At the original 1.25x that left a turn at `N_fit` really taking ~169s against a 155s budget, so
+  the grade would have promised something false. It is 1.5x (1.75x for the live-server fallback),
+  which puts the same turn at ~141s.
+
+A refusal **deletes the model**, via the router's own `DELETE /models` (which reuses llama.cpp's
+cache logic to clear the snapshot, its symlinks and the orphaned blobs). Merely withholding a preset
+would not be enough: the router auto-discovers everything in the Hugging Face cache, so a refused
+model would still be listed by `/v1/models` and selectable in the chat UI. `pull --force` keeps it
+anyway, and `--skip-benchmark` skips the measurement entirely.
+
+Failing to measure never becomes a refusal -- a busy machine, a missing binary or a failed probe
+records no grade and keeps the model, because that says nothing about the model. Source-built
+installs (Jetson-class arm64+CUDA, old glibc) historically had no `llama-bench` at all; they now
+build it alongside `llama-server`, and any install still without it is measured through the running
+router instead (`model_perf_live.py`), labelled as such and graded more conservatively.
+
+`aipotluck-local-client benchmark [model]` re-measures without re-downloading -- the way back from
+a skipped grade or one gone stale after a llama.cpp upgrade or a re-size. Grades live in
+`llama_presets.performance.json` beside the presets file, with a device fingerprint so a stale one
+is shown as stale rather than silently trusted.
+
+**Validating the extrapolation is part of the work, not an afterthought:**
+`scripts/validate_model_perf.py` predicts a grid of turn sizes, then actually runs turns at those
+sizes and fails when the predictions do not hold -- in particular when they are optimistic, which
+is the only direction that hurts users.
 
 ### Router mode and memory budgeting
 
