@@ -231,6 +231,17 @@ class TestRunBenchPoint:
         point, _ = mp.run_bench_point(fake_bench, "org/repo:Q4_K_M", depth=0, timeout=30)
         assert point.noisy is True
 
+    def test_jitter_on_a_very_fast_run_is_not_called_noise(self, fake_bench, monkeypatch):
+        """Measured on a Jetson Orin NX: a GPU-served 0.5B model's whole probe ran in 7.2s, and
+        ordinary scheduler jitter across sub-second repetitions cleared 20% easily. Treating that
+        as low confidence would cap genuinely fast models at yellow over tens of milliseconds of
+        noise against a 155,000ms budget."""
+        monkeypatch.setenv("FAKE_BENCH_TG_BASE", "0.2")  # 32 tokens -> ~6ms a repetition
+        monkeypatch.setenv("FAKE_BENCH_PP_BASE", "0.01")
+        monkeypatch.setenv("FAKE_BENCH_NOISE", "0.5")  # 50% relative spread, a few ms absolute
+        point, _ = mp.run_bench_point(fake_bench, "org/repo:Q4_K_M", depth=0, timeout=30)
+        assert point.noisy is False
+
     def test_a_failing_binary_raises_rather_than_returning_a_guess(self, fake_bench, monkeypatch):
         monkeypatch.setenv("FAKE_BENCH_FAIL", "1")
         with pytest.raises(mp.ModelPerfError, match="exited 2"):

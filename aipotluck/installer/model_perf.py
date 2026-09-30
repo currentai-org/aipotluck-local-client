@@ -144,6 +144,14 @@ _CANDIDATE_DEPTHS = (4096, 2048, 1024)
 # process was probably competing for the machine.
 _HIGH_VARIANCE_RATIO = 0.20
 
+# ...but only once the spread is big enough to matter. On fast hardware a repetition lasts a few
+# hundred milliseconds, where ordinary scheduler jitter clears 20% routinely -- measured on a
+# Jetson Orin NX, where a GPU-served 0.5B model's whole probe ran in 7.2s and came back "low
+# confidence" for a spread worth tens of milliseconds against a 155,000ms budget. Left alone that
+# would have capped genuinely fast models at yellow for noise that cannot affect the verdict, so
+# the relative test is paired with an absolute floor.
+_MIN_MEANINGFUL_SPREAD_MS = 50.0
+
 # Refuse to grade at all when the machine is already this busy -- the numbers would describe the
 # contention, not the model.
 _MAX_LOADAVG_PER_CPU = 0.5
@@ -330,8 +338,10 @@ def _is_noisy(entry: dict) -> bool:
     mean = sum(samples) / len(samples)
     if mean <= 0:
         return False
-    spread = (max(samples) - min(samples)) / mean
-    return spread > _HIGH_VARIANCE_RATIO
+    spread_ns = max(samples) - min(samples)
+    if spread_ns / 1e6 <= _MIN_MEANINGFUL_SPREAD_MS:
+        return False
+    return spread_ns / mean > _HIGH_VARIANCE_RATIO
 
 
 def _parse_bench_output(stdout: str) -> list[dict]:
