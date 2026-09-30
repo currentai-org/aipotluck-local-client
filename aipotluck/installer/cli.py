@@ -218,16 +218,89 @@ def _parse_credentials_json(raw: str) -> tuple[str, str, str]:
     return data["tunnelId"], data["tunnelSecret"], data["tunnelEndpoint"]
 
 
+def _read_hidden_line_with_feedback(prompt: str) -> str:
+    """Like getpass.getpass, but echoes one '.' per character received instead of nothing at all.
+    A silent prompt gave a paste no visible effect until Enter was pressed, which read as "did that
+    even work?" -- the dots are just paste-landed feedback, not a strength meter, so a fixed
+    placeholder character is fine even though it says nothing about length.
+
+    Needs raw per-keystroke access to the terminal, which only a real interactive tty can give, so
+    this falls back to plain getpass.getpass whenever stdin isn't one -- piped input, a redirected
+    file, or (as in this module's own test suite) a monkeypatched getpass.getpass under pytest's
+    captured, non-tty stdin.
+    """
+    if not sys.stdin.isatty():
+        return getpass.getpass(prompt)
+
+    print(prompt, end="", flush=True)
+    try:
+        chars = _read_hidden_chars_windows() if sys.platform == "win32" else _read_hidden_chars_unix()
+    finally:
+        print()  # move past the dots onto their own line, matching getpass's own trailing newline
+    return "".join(chars)
+
+
+def _read_hidden_chars_unix() -> list[str]:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    chars: list[str] = []
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n", ""):
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x7f", "\x08"):  # backspace/delete
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            chars.append(ch)
+            sys.stdout.write(".")
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return chars
+
+
+def _read_hidden_chars_windows() -> list[str]:
+    import msvcrt  # type: ignore[import-not-found]
+
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            break
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x08":  # backspace
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        chars.append(ch)
+        sys.stdout.write(".")
+        sys.stdout.flush()
+    return chars
+
+
 def _prompt_credentials_json() -> tuple[str, str, str]:
     print("Pair this device with a managed tunnel endpoint.")
     print("Paste the JSON from Settings -> Local Inference -> Add a managed server (its Copy button")
-    print("copies exactly this), then press Enter.")
+    print("copies exactly this), then press Enter. Dots below confirm characters are being received.")
     print()
     while True:
-        # getpass, not input: the pasted blob contains the tunnel secret, so this must not echo to
-        # the terminal (or land in a screen recording/over-the-shoulder view) any more than a bare
-        # secret prompt would have.
-        raw = getpass.getpass("Credentials JSON: ").strip()
+        # Hidden, not plain input(): the pasted blob contains the tunnel secret, so it must not
+        # echo to the terminal (or land in a screen recording/over-the-shoulder view) any more than
+        # a bare secret prompt would have -- only the dot-per-character feedback is new.
+        raw = _read_hidden_line_with_feedback("Credentials JSON: ").strip()
         if not raw:
             print("  (required, try again)")
             continue
