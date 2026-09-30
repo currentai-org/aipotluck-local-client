@@ -38,8 +38,9 @@ if str(REPO_ROOT) not in sys.path:
 from aipotluck.installer import model_perf as mp  # noqa: E402
 from aipotluck.installer import model_perf_live as live  # noqa: E402
 
-# Spans the turn sizes the web app actually produces: a bare chat turn, a RAG/web-search grounded
-# one, and the long-attached-file case that Green is meant to promise is safe.
+# Context depths to test the promise at. The grade is stated at the model's FULL context, which for
+# a 131k model means a 131k-token prompt -- often too slow to stage here -- so this checks the same
+# promise at the depths a run can actually afford and reports which one it reached.
 DEFAULT_GRID = (1024, 4096, 8192, 16384, 32768)
 
 # What this gate is really for. model_perf's grade makes one promise to the user -- a turn with up
@@ -54,18 +55,17 @@ TOLERANCE = 0.25          # reported, not gated: how close raw predictions land
 GRID_SLACK = 1.10         # a turn measured at N_fit may overshoot the budget by this much before failing
 
 
-def measure_real_turn(base_url: str, model_id: str, words: int, *, cold: bool, timeout: float):
+def measure_real_turn(base_url: str, model_id: str, words: int, max_tokens: int, *, cold: bool, timeout: float):
     """Runs one real turn and returns (prompt_n, wall_ms). Unloads first by default so the measured
     turn pays the same cold model load the prediction includes -- and the same one a real turn pays,
     since --models-max 1 makes every model switch a cold load."""
     if cold:
         live._unload(base_url, model_id)
     started = time.monotonic()
-    # A REAL turn, not a probe-shaped one: the web app caps every reply at 1024 tokens, and that is
-    # the length predict_turn_ms assumes. Measuring a shorter generation here would compare a
-    # prediction about a full turn against something that was never one.
+    # A REAL turn of the length the grade claims this model can deliver -- measuring anything
+    # shorter would compare a prediction about a full answer against something that was never one.
     timings, _ = live._timed_completion(
-        base_url, model_id, words, salt=7, timeout=timeout, max_tokens=mp.MAX_OUTPUT_TOKENS,
+        base_url, model_id, words, salt=7, timeout=timeout, max_tokens=max_tokens,
     )
     wall_ms = (time.monotonic() - started) * 1000.0
     return int(timings["prompt_n"]), wall_ms
@@ -80,75 +80,91 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ctx-size", type=int, default=131072,
                         help="Context the model is served at (only clamps the grade, not the prediction)")
     parser.add_argument("--max-input", type=int, default=None, help="Skip grid points above this")
+    parser.add_argument(
+        "--budget-ms", type=float, default=None,
+        help="Override the turn budget (default: model_perf.TURN_BUDGET_MS). Every measured turn "
+             "is sized to fill this budget, so a smaller value trades coverage for a much faster "
+             "run -- and a smaller value is also how you check the grade against a stricter SLA "
+             "than the web app's current one.",
+    )
     parser.add_argument("--warm", action="store_true",
                         help="Don't unload between turns (measures warm loads; predictions include a cold one)")
     args = parser.parse_args(argv)
 
-    print(f"Measuring {args.model} ...")
+    budget_ms = args.budget_ms if args.budget_ms is not None else mp.TURN_BUDGET_MS
+    print(f"Measuring {args.model} ... (turn budget {budget_ms/1000:.0f}s)")
     if args.bench_binary:
         result = mp.probe_performance(args.bench_binary, args.model, ctx_size=args.ctx_size)
     else:
         result = live.probe_performance_live(args.base_url, args.model, ctx_size=args.ctx_size)
     fit = result.fit
     safety = mp.SAFETY_FACTOR_LIVE if fit.source == mp.SOURCE_LIVE_SERVER else mp.SAFETY_FACTOR_BENCH
-    print(f"  {result.grade.upper()}  n_fit={result.n_fit:,}  {result.decode_tokens_per_second:.1f} tok/s"
-          f"  (source={fit.source}, confidence={fit.confidence}, safety={safety})")
+    print(f"  {result.grade.upper()}  n_out={result.n_out:,} tokens  "
+          f"{result.decode_tokens_per_second:.1f} tok/s @ {result.ctx_size:,} ctx  "
+          f"(output={result.output_grade}, context_cap={result.context_cap}, "
+          f"source={fit.source}, confidence={fit.confidence}, safety={safety})")
     print(f"  fit: decode {fit.decode_base_ms:.2f}ms +{fit.decode_depth_ms:.2e}/tok  "
           f"prefill {fit.prefill_base_ms:.3f}ms +{fit.prefill_depth_ms:.2e}/tok  load {fit.load_ms:.0f}ms")
 
     if result.grade == mp.GRADE_REFUSE:
-        print("\nRefused, so there is no N_fit promise to check. Nothing to validate.")
+        print("\nRefused, so there is no promise to check. Nothing to validate.")
         return 0
 
-    # The grid exists for diagnostics; N_fit is the point the promise is actually about.
-    grid = sorted({n for n in DEFAULT_GRID if n <= result.n_fit} | {result.n_fit})
+    depths = [d for d in DEFAULT_GRID if d <= result.ctx_size]
     if args.max_input is not None:
-        grid = [n for n in grid if n <= args.max_input] or [min(grid)]
+        depths = [d for d in depths if d <= args.max_input] or [min(DEFAULT_GRID)]
 
     print()
-    print(f"{'input':>8} {'predicted':>11} {'actual':>10} {'error':>9} {'ratio':>7}  note")
-    print("-" * 62)
+    print("At each depth: how many output tokens the model claims it can deliver, then a real turn")
+    print("of exactly that length. The claim holds when the turn lands inside the budget.")
+    print()
+    print(f"{'depth':>8} {'claimed out':>12} {'predicted':>11} {'actual':>10} {'ratio':>7}  verdict")
+    print("-" * 64)
 
     worst_ratio = 0.0
-    n_fit_actual_ms = None
-    for target in grid:
+    overruns = 0
+    for depth in depths:
+        # What the cost model promises at THIS depth, by the same arithmetic the grade uses.
+        prefill_ms = fit.prefill_base_ms * depth + fit.prefill_depth_ms * depth * depth / 2.0
+        remaining = budget_ms / safety - fit.load_ms - prefill_ms
+        per_token = mp.decode_ms_per_token(fit, depth)
+        claimed = int(remaining / per_token) if remaining > 0 and per_token > 0 else 0
+        if claimed < 1:
+            print(f"{depth:>8} {0:>12} -- nothing claimed at this depth, skipping")
+            continue
+
         try:
             prompt_n, actual_ms = measure_real_turn(
-                args.base_url, args.model, target, cold=not args.warm, timeout=600,
+                args.base_url, args.model, depth, claimed, cold=not args.warm, timeout=900,
             )
         except mp.ModelPerfError as exc:
-            print(f"{target:>8}  turn failed: {exc}")
+            print(f"{depth:>8}  turn failed: {exc}")
             return 1
 
-        # Predict at the token count the server actually saw, so tokenizer drift in the filler
-        # isn't scored as extrapolation error.
-        predicted_ms = mp.predict_turn_ms(fit, prompt_n)
-        error = (predicted_ms - actual_ms) / actual_ms
+        predicted_ms = mp.predict_turn_ms(fit, prompt_n, claimed, decode_depth=depth)
         ratio = actual_ms / predicted_ms if predicted_ms > 0 else float("inf")
         worst_ratio = max(worst_ratio, ratio)
-        note = "<- N_fit" if target == result.n_fit else ""
-        if target == result.n_fit:
-            n_fit_actual_ms = actual_ms
-        print(f"{prompt_n:>8} {predicted_ms/1000:>10.1f}s {actual_ms/1000:>9.1f}s "
-              f"{error*100:>+8.1f}% {ratio:>6.2f}x  {note}")
+        over = actual_ms > budget_ms * GRID_SLACK
+        overruns += int(over)
+        verdict = "OVER BUDGET" if over else "ok"
+        print(f"{prompt_n:>8} {claimed:>12,} {predicted_ms/1000:>10.1f}s {actual_ms/1000:>9.1f}s "
+              f"{ratio:>6.2f}x  {verdict}")
 
     print()
     print(f"worst under-prediction: {worst_ratio:.2f}x   absorbed by safety factor {safety}: "
           f"{'yes' if worst_ratio <= safety else 'NO'}")
 
     failures = []
-    if n_fit_actual_ms is not None and n_fit_actual_ms > mp.TURN_BUDGET_MS * GRID_SLACK:
+    if overruns:
         failures.append(
-            f"a real turn at N_fit={result.n_fit:,} took {n_fit_actual_ms/1000:.0f}s, over the "
-            f"{mp.TURN_BUDGET_MS/1000:.0f}s budget -- the grade promises a turn that times out"
+            f"{overruns} turn(s) of the length this model claims it can deliver ran past the "
+            f"{budget_ms/1000:.0f}s budget -- the grade promises an answer that gets cut off"
         )
     if worst_ratio > safety:
         failures.append(
             f"the cost model under-predicted by {worst_ratio:.2f}x, more than the {safety}x safety "
             "factor absorbs -- raise the factor or improve the fit for this hardware"
         )
-    if result.grade == mp.GRADE_GREEN and n_fit_actual_ms and n_fit_actual_ms > mp.TURN_BUDGET_MS:
-        failures.append("a GREEN model exceeded the budget -- green is supposed to mean this cannot happen")
 
     if failures:
         print()

@@ -34,7 +34,9 @@ from aipotluck.installer import model_perf
 
 log = logging.getLogger("aipotluck.installer.model_perf_store")
 
-SCHEMA_VERSION = 1
+# 2: the grade moved from "largest input that fits" to "output tokens that fit", which is a
+# different number with a different meaning -- old records are dropped rather than reinterpreted.
+SCHEMA_VERSION = 2
 
 
 def performance_path(ini_path: Path) -> Path:
@@ -115,8 +117,10 @@ def write_record(
         models = {}
         data["models"] = models
     models[model_id] = {
-        "n_fit": result.n_fit,
+        "n_out": result.n_out,
         "grade": result.grade,
+        "output_grade": result.output_grade,
+        "context_cap": result.context_cap,
         "decode_tokens_per_second": round(result.decode_tokens_per_second, 2),
         "ctx_size": result.ctx_size,
         "reason": result.reason,

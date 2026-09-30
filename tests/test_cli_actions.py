@@ -836,14 +836,14 @@ class TestRunListModels:
         assert any("not supported" in rec.message for rec in caplog.records)
 
 
-def _graded(grade: str, n_fit: int = 40_000) -> "cli.model_perf.PerfResult":
+def _graded(grade: str, n_out: int = 5_000) -> "cli.model_perf.PerfResult":
     fit = cli.model_perf.PerfFit(
         decode_base_ms=20.0, decode_depth_ms=0.0, prefill_base_ms=2.0, prefill_depth_ms=0.0,
         load_ms=0.0, source=cli.model_perf.SOURCE_LLAMA_BENCH, confidence=cli.model_perf.CONFIDENCE_OK,
     )
     return cli.model_perf.PerfResult(
-        n_fit=n_fit, grade=grade, decode_tokens_per_second=50.0, ctx_size=131072,
-        fit=fit, reason="test reason",
+        n_out=n_out, grade=grade, output_grade=grade, context_cap=cli.model_perf.GRADE_GREEN,
+        decode_tokens_per_second=50.0, ctx_size=131072, fit=fit, reason="test reason",
     )
 
 
@@ -909,7 +909,7 @@ class TestPullSpeedGate:
         assert deletes == []
         out = capsys.readouterr().out
         assert grade.upper() in out
-        assert "5,000 tokens" in out
+        assert "5,000 output tokens" in out
 
     def test_skip_benchmark_pulls_without_measuring(self, tmp_path, monkeypatch, capsys):
         install_dir, deletes = self._setup(tmp_path, monkeypatch, _graded(cli.model_perf.GRADE_REFUSE, 0))
@@ -1058,3 +1058,63 @@ class TestDeleteCachedModel:
 
     def test_an_unreachable_router_reports_failure_rather_than_claiming_success(self):
         assert cli._delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
+
+
+class TestBenchmarkResizes:
+    """`benchmark` re-runs sizing before measuring. The grade is capped by the effective context --
+    min(model's trained context, what this device's memory can serve) -- so a stale ctx_size would
+    silently hold the grade at whatever was true when the model was first pulled."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "8192"})
+        write_runtime(
+            install_dir,
+            {
+                "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+                "service": {},
+            },
+        )
+        monkeypatch.setattr(cli, "list_cached_models", lambda binary: ["org/repo:Q4_K_M"])
+        return install_dir
+
+    def test_resizes_before_measuring(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        order = []
+        monkeypatch.setattr(
+            cli, "ensure_preset",
+            lambda *a, **kw: order.append(("size", kw.get("force"))) or _FAKE_SIZING,
+        )
+        monkeypatch.setattr(
+            cli, "_benchmark_model",
+            lambda *a, **kw: order.append(("measure", None)) or _graded(cli.model_perf.GRADE_YELLOW),
+        )
+
+        rc = cli.run_benchmark(make_pull_args(install_dir, model=None))
+
+        assert rc == 0
+        assert [step for step, _ in order] == ["size", "measure"]
+        assert order[0][1] is True  # force=True, or a stale preset would be kept
+        assert "re-sized" in capsys.readouterr().out
+
+    def test_a_sizing_failure_still_lets_the_benchmark_run(self, tmp_path, monkeypatch, caplog):
+        """Sizing is a refinement here, not a precondition -- an existing preset is still a valid
+        operating point to measure against."""
+        install_dir = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            cli, "ensure_preset",
+            lambda *a, **kw: (_ for _ in ()).throw(cli.ModelSizingError("probe timed out")),
+        )
+        measured = []
+        monkeypatch.setattr(
+            cli, "_benchmark_model",
+            lambda *a, **kw: measured.append(1) or _graded(cli.model_perf.GRADE_RED),
+        )
+
+        with caplog.at_level("WARNING"):
+            rc = cli.run_benchmark(make_pull_args(install_dir, model=None))
+
+        assert rc == 0
+        assert measured == [1]
+        assert "Could not re-size" in caplog.text

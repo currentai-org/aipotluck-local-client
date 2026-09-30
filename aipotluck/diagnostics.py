@@ -257,7 +257,9 @@ def runtime_params(runtime_config: dict[str, Any]) -> dict[str, Any]:
             record = graded.get(model_id)
             model_view["performance"] = {
                 "grade": record.get("grade"),
-                "n_fit": record.get("n_fit"),
+                "n_out": record.get("n_out"),
+                "output_grade": record.get("output_grade"),
+                "context_cap": record.get("context_cap"),
                 "decode_tokens_per_second": record.get("decode_tokens_per_second"),
                 "source": record.get("source"),
                 "confidence": record.get("confidence"),

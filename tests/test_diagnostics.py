@@ -123,7 +123,8 @@ class TestRuntimeParams:
         performance = diag.runtime_params({"llama_cpp": llama_cfg})["models"]["org/a:Q4_K_M"]["performance"]
 
         assert performance["grade"] == result.grade
-        assert performance["n_fit"] == result.n_fit
+        assert performance["n_out"] == result.n_out
+        assert performance["context_cap"] == result.context_cap
         assert performance["stale"] is False
 
     def test_a_grade_from_a_different_llama_cpp_build_is_marked_stale(self, tmp_path):

@@ -164,8 +164,9 @@ def probe_performance_live(
     load_ms = max(0.0, wall_seconds * 1000.0 - accounted_ms)
 
     shallow_fit = model_perf.fit_points(shallow, None, load_ms, model_perf.SOURCE_LIVE_SERVER)
-    if model_perf.solve_n_fit(shallow_fit, model_perf.TURN_BUDGET_MS / model_perf.SAFETY_FACTOR_LIVE) == 0:
-        log.info("%s cannot finish a reply even at a short prompt -- skipping the deep probe", model_id)
+    budget = model_perf.TURN_BUDGET_MS / model_perf.SAFETY_FACTOR_LIVE
+    if model_perf.solve_n_out(shallow_fit, budget, ctx_size) < model_perf.OUTPUT_RED_MIN:
+        log.info("%s cannot produce even a short answer in budget -- skipping the deep probe", model_id)
         return model_perf.compute_grade(shallow_fit, ctx_size)
 
     deep = None

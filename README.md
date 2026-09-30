@@ -487,20 +487,40 @@ web-search grounding fires, 32k+ with an attached file).
 
 `pull` therefore benchmarks what it just downloaded, with `llama-bench` at the *same* K/V cache
 types and GPU-layer count the preset will actually serve at, and fits per-token cost as a straight
-line in KV-cache depth. Integrating that gives a closed form for a whole turn, which is solved for
-**`N_fit`**: the largest input, in tokens, that still finishes in time.
+line in KV-cache depth. The grade then answers the question users actually feel: **how much
+thinking and answer arrives before the stream is cut off**. `N_out` is the number of output tokens
+that fit in the budget, priced at this model's full context depth -- the slowest it will ever run.
 
 ```
-GREEN   N_fit >= 32,768    heavy long-context use is safe
-YELLOW  N_fit >=  8,192    grounded turns fine; long-file turns may time out
-RED     N_fit >=  2,048    short turns only
-REFUSE  N_fit <   2,048    not installed -- see below
+GREEN   N_out >= 4,096    never cut off in practice
+YELLOW  N_out >= 1,536    fine for shorter queries
+RED     N_out >=   250    only a simple, direct answer
+REFUSE  N_out <    250    cannot answer at all -- not installed
 ```
 
-`N_fit` is also clamped by the context size sizing picked for this device, because an over-long
-prompt fails outright rather than merely slowly. One deliberate consequence: a model whose fitted
-context is under ~33k **cannot be graded green at any speed** -- on this device it genuinely cannot
-do heavy context, and that is the honest answer rather than a quirk.
+Context has not stopped mattering, it just enters in its proper place rather than dominating.
+Grading on how large an *input* fits made the verdict mostly a restatement of the context size,
+which is not the interesting question -- prefill is cheap next to generation. Now context bites
+twice: it slows every generated token, and it caps the grade outright.
+
+```
+context > 256k   -> no cap, green reachable
+context  16k-256k -> at most yellow
+context   4k-16k  -> at most red
+context <  4k     -> refused; the system prompt alone does not fit
+```
+
+That context is the **effective** one: the smaller of what the model was trained for and what
+runtime sizing could actually afford on this device's memory. A context this device cannot serve is
+not one the user gets, so on a 16GB board even a 1M-context model is graded on the ~75k it can
+really hold -- which means green is genuinely out of reach on small hardware, by design.
+`benchmark` re-runs sizing before measuring so that number never goes stale.
+
+A turn's prefill is charged at ~2k tokens, not at the full context, and that distinction is
+load-bearing. llama.cpp reuses the KV cache across turns, so a conversation grown to 131k prefills
+only its new tokens. Charging the whole context instead cost 630s of prefill for a 131k model on a
+real Jetson -- over budget before a single output token -- and rejected every large-context model
+for being large-context, the exact inversion this scheme exists to remove.
 
 Two details worth knowing, both of which came out of measuring real hardware rather than reasoning:
 
@@ -512,8 +532,8 @@ Two details worth knowing, both of which came out of measuring real hardware rat
 - **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and at pull time the
   file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
   `posix_fadvise(DONTNEED)` drops it first and a real sequential read is timed instead.
-- **The safety factor is measured, not guessed.** Checked against real full turns on the same
-  laptop, the fit under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
+- **The safety factor is measured, not guessed.** Checked against real full turns, the fit
+  under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
   excludes tokenization and sampling from its numbers, nothing measures the chat template on top,
   and real cost grows a little faster than linearly past the deepest point the probe can afford.
   At the original 1.25x that left a turn at `N_fit` really taking ~169s against a 155s budget, so

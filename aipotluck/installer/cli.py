@@ -515,8 +515,8 @@ def _print_perf_verdict(result: model_perf.PerfResult) -> None:
         print(f"  {result.grade.upper()} -- {result.reason}")
         return
     print(
-        f"  {result.grade.upper()} -- handles inputs up to ~{result.n_fit:,} tokens "
-        f"({result.decode_tokens_per_second:.1f} tok/s generation)"
+        f"  {result.grade.upper()} -- can produce ~{result.n_out:,} output tokens in budget "
+        f"({result.decode_tokens_per_second:.1f} tok/s at a {result.ctx_size:,}-token context)"
     )
     print(f"  {result.reason}")
 
@@ -734,9 +734,12 @@ def run_list_models(args: argparse.Namespace) -> int:
             notes.append("not benchmarked -- run `benchmark`")
         else:
             grade_label = f"  {record.get('grade', '?').upper():<6s}"
-            n_fit = record.get("n_fit")
-            if isinstance(n_fit, int):
-                notes.append(f"fits ~{n_fit:,}-token inputs")
+            n_out = record.get("n_out")
+            if isinstance(n_out, int):
+                notes.append(f"~{n_out:,} output tokens in budget")
+            ctx = record.get("ctx_size")
+            if isinstance(ctx, int):
+                notes.append(f"{ctx:,}-token context")
             tps = record.get("decode_tokens_per_second")
             if isinstance(tps, (int, float)):
                 notes.append(f"{tps:.1f} tok/s")
@@ -778,6 +781,26 @@ def run_benchmark(args: argparse.Namespace) -> int:
     failures = 0
     for target in targets:
         print(f"{target}:")
+        # Re-size before re-measuring. The grade is capped by the effective context -- the smaller
+        # of what the model was trained for and what this device's memory can actually serve -- so
+        # a stale ctx_size would silently cap the grade at whatever was true when the model was
+        # first pulled. Anything that moves that number (a llama.cpp upgrade, a GPU-layers change,
+        # RAM added or freed) should be picked up here rather than quietly ignored.
+        try:
+            sizing = ensure_preset(
+                Path(llama_cfg["server_binary"]), Path(presets_path), target,
+                model_hf=target, gpu_layers=llama_cfg.get("gpu_layers"), force=True,
+            )
+        except ModelSizingError as exc:
+            log.warning(
+                "Could not re-size %s (%s) -- grading against whatever preset it already had.",
+                target, exc,
+            )
+        else:
+            if sizing is not None:
+                print(f"  re-sized: ctx_size={sizing.ctx_size} cache_type_k={sizing.cache_type_k} "
+                      f"cache_type_v={sizing.cache_type_v}")
+
         result = _benchmark_model(
             llama_cfg, Path(presets_path), target, budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
         )

@@ -25,12 +25,18 @@ LINEAR = dict(prefill_base=0.002, prefill_slope=2e-8, decode_base=0.1, decode_sl
 # ABSORBED by that factor and passes, which is the behaviour the factor exists for.
 SUPERLINEAR = dict(LINEAR, decode_quadratic=6e-10)
 
-TABLE_ROW = re.compile(r"^\s*\d+\s+[\d.]+s\s+[\d.]+s")
+TABLE_ROW = re.compile(r"^\s*\d+\s+[\d,]+\s+[\d.]+s\s+[\d.]+s")
 
 
-def _run(router, ctx_size=40960, **kwargs) -> int:
+# Every measured turn is sized to fill the budget, so a real 155s one would make this suite take
+# minutes per case. A small budget keeps the SHAPE identical -- claim, measure, compare -- at a
+# scale a test can afford.
+TEST_BUDGET_MS = 400.0
+
+
+def _run(router, ctx_size=40960, budget_ms=TEST_BUDGET_MS, **kwargs) -> int:
     argv = ["--model", "org/repo:Q4_K_M", "--base-url", router.base_url, "--warm",
-            "--ctx-size", str(ctx_size)]
+            "--ctx-size", str(ctx_size), "--budget-ms", str(budget_ms)]
     for key, value in kwargs.items():
         argv += [f"--{key.replace('_', '-')}", str(value)]
     return vmp.main(argv)
@@ -58,13 +64,14 @@ class TestValidatorGate:
         assert "FAIL" in out
         assert "under-predicted" in out or "times out" in out
 
-    def test_measures_a_real_turn_at_n_fit_specifically(self, router_stub, capsys):
-        """N_fit is the whole promise -- a grid that never lands on it would validate everything
-        except the claim being made."""
+    def test_measures_a_turn_of_exactly_the_length_the_model_claims(self, router_stub, capsys):
+        """The claim is "this many output tokens arrive in time", so the turn measured has to be
+        that long -- a shorter one would validate something nobody promised."""
         with router_stub(**LINEAR) as router:
             _run(router)
         out = capsys.readouterr().out
-        assert "<- N_fit" in out
+        assert "claimed out" in out
+        assert "ok" in out
 
     def test_reports_whether_the_safety_factor_covered_the_error(self, router_stub, capsys):
         with router_stub(**LINEAR) as router:
@@ -74,14 +81,14 @@ class TestValidatorGate:
         assert "absorbed by safety factor" in out
 
     def test_a_refused_model_has_no_promise_to_check(self, router_stub, capsys):
-        with router_stub(decode_base=300.0) as router:
+        with router_stub(decode_base=900.0) as router:
             rc = _run(router)
         out = capsys.readouterr().out
         assert rc == 0
         assert "Nothing to validate" in out
 
-    def test_max_input_limits_the_grid(self, router_stub, capsys):
+    def test_max_input_limits_the_depths_tested(self, router_stub, capsys):
         with router_stub(**LINEAR) as router:
             _run(router, max_input=4096)
         rows = [l for l in capsys.readouterr().out.splitlines() if TABLE_ROW.match(l)]
-        assert 0 < len(rows) <= 2  # 1024 and 4096 only
+        assert 0 < len(rows) <= 2  # depths 1024 and 4096 only

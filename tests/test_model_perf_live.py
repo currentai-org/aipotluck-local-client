@@ -52,7 +52,8 @@ class TestProbePerformanceLive:
         assert router.requests[0][1] == "/models/unload"
 
     def test_a_hopeless_model_is_refused_after_a_single_request(self):
-        with RouterStub(decode_base=300.0) as router:
+        # Slow enough that even the optimistic shallow-only fit cannot reach OUTPUT_RED_MIN.
+        with RouterStub(decode_base=900.0) as router:
             result = live.probe_performance_live(router.base_url, "org/repo:Q4_K_M", ctx_size=131072)
 
         assert result.grade == mp.GRADE_REFUSE

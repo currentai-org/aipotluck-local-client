@@ -30,20 +30,24 @@ Two more facts from that side set the shape of the estimate:
 
 Standard decomposition (`E2E = TTFT + (n_out - 1) * TPOT`), but fitted on per-token *time* rather
 than on rates. Decode re-reads a KV cache that grows linearly with depth, so the cost of one token
-at depth d is `a + b*d`; integrating that over the tokens actually produced gives a closed form,
-which matters here because this package is stdlib-only (`pyproject.toml`: `dependencies = []`) and
-there is no numeric integrator to reach for:
+at depth d is `a + b*d`; that closed form matters here because this package is stdlib-only
+(`pyproject.toml`: `dependencies = []`) and there is no numeric integrator to reach for:
 
-    prefill token cost at depth d:  c + e*d   ->  T_prefill(n)      = c*n + e*n^2/2
-    decode  token cost at depth d:  a + b*d   ->  T_decode(N, n_in) = a*N + b*(n_in*N + N^2/2)
+    prefill token cost at depth d:  c + e*d   ->  T_prefill(n) = c*n + e*n^2/2
+    decode  token cost at depth d:  a + b*d
 
-Attention's O(n^2) term falls out of that same linear-in-depth fit, so two measurement points are
-enough and no quadratic term or third point is needed. `llama-bench -d <depth>` prefills the KV
-cache to a given depth before measuring, which is exactly the measurement this needs.
+`llama-bench -d <depth>` prefills the KV cache to a given depth before measuring, which is exactly
+the measurement this needs, and two points are enough to fit both lines.
 
-**The metric is `N_fit`**: the largest input, in tokens, for which a full turn still finishes
-inside the budget. Substituting the fixed 1024-token output makes the constraint a quadratic in
-`n`, solved in closed form by `solve_n_fit`.
+**The metric is `n_out`**: how many tokens the model can generate before the stream is cut off,
+with generation priced at the model's full context depth -- the slowest it will ever run. That is
+the failure users actually feel; a reply that stops mid-thought is the problem, and prefill is
+cheap next to generation. Grading on how large an INPUT fits made the verdict mostly a restatement
+of the context size, which is not the interesting question.
+
+Context has not stopped mattering, it just enters twice and in its proper place: it slows every
+generated token (through `b * ctx_size`), and it caps the grade outright (`context_grade_cap`),
+because a model that generates quickly is still limited by how much it can be told.
 
 ## Why the benchmark must copy the preset
 
@@ -71,9 +75,12 @@ log = logging.getLogger("aipotluck.installer.model_perf")
 # The web app's generation budget -- see module docstring for the derivation. Not 160_000.
 TURN_BUDGET_MS = 155_000.0
 
-# The web app hard-caps every reply at this many tokens, overriding any model config, so a turn's
-# decode cost is bounded and knowable rather than open-ended.
-MAX_OUTPUT_TOKENS = 1024
+# What the web app currently requests as a ceiling per reply (GROUNDED_DECODING.max_tokens,
+# overriding any model config). Kept as a documented fact rather than used in the grade: the
+# thresholds above deliberately reach past it, because a model that can only just manage 1024
+# tokens has no headroom for a reasoning model's thinking tokens or for that cap ever being raised.
+# A model graded red can still serve today's 1024-token replies; it simply cannot do more.
+APP_REQUESTED_MAX_OUTPUT_TOKENS = 1024
 
 # Applied to the predicted turn time before comparing it to the budget. It is not padding: the
 # cost model is KNOWN to run optimistic, and this is what keeps the grade's promise true anyway.
@@ -91,12 +98,31 @@ MAX_OUTPUT_TOKENS = 1024
 SAFETY_FACTOR_BENCH = 1.50
 SAFETY_FACTOR_LIVE = 1.75
 
-# Grade thresholds, in input tokens. Green is deliberately demanding: it is meant to promise that
-# heavy long-context use is safe, not merely that a short chat works, so it sits above the ~32k
-# turn an attached file produces. Yellow covers a RAG/web-search-grounded turn.
-GREEN_MIN_TOKENS = 32_768
-YELLOW_MIN_TOKENS = 8_192
-RED_MIN_TOKENS = 2_048
+# Grade thresholds, in OUTPUT tokens: how much thinking and answer a model can actually deliver
+# before the stream is cut off. Prefill is cheap next to generation, so grading on how big an input
+# fits made the verdict mostly a restatement of the context size; this asks the question users care
+# about instead -- how long an answer arrives intact.
+OUTPUT_GREEN_MIN = 4_096   # never cut off in practice
+OUTPUT_YELLOW_MIN = 1_536  # fine for shorter queries
+OUTPUT_RED_MIN = 250       # only a simple, direct answer
+                           # below OUTPUT_RED_MIN: cannot answer at all, refused
+
+# Context size separately caps the grade, since a model that generates fast is still limited by how
+# much it can be told. The cap is on the EFFECTIVE context -- min(model's trained context, what
+# runtime sizing could actually afford on this device's memory) -- because a context this device
+# cannot serve is not one the user gets.
+CONTEXT_GREEN_MIN = 262_144   # above this: no cap, green is reachable
+CONTEXT_YELLOW_MIN = 16_384   # 16k-256k: at most yellow
+CONTEXT_RED_MIN = 4_096       # 4k-16k: at most red
+                              # below CONTEXT_RED_MIN: the system prompt alone does not fit, refused
+
+# What a single turn actually prefills. NOT the full context, deliberately: llama.cpp reuses the KV
+# cache across turns of a conversation, so a chat that has grown to 100k tokens pays only for the
+# new tokens each turn, not a fresh 100k prefill. Charging the full context would have cost 630s of
+# prefill for a 131k model on a Jetson -- over budget before a single token came out -- and rejected
+# every large-context model for having a large context, which is exactly the inversion this grading
+# scheme exists to remove. Context still derates the grade, through decode depth and the cap above.
+ASSUMED_PREFILL_TOKENS = 2_048
 
 GRADE_GREEN = "green"
 GRADE_YELLOW = "yellow"
@@ -130,10 +156,6 @@ _BENCH_REPETITIONS = 3
 # alone is roughly 1,450 tokens before any conversation, retrieval or attachment is added.
 _SHALLOW_DEPTH = 512
 
-# The context depth the human-readable tok/s figure is quoted at. Not the fit's depth-0 intercept,
-# which no real turn ever runs at and which flatters the model -- this is a mid-range, realistic
-# operating point, and quoting every model at the SAME one keeps the number comparable between them.
-_REPORTED_RATE_DEPTH = 2048
 
 # Second measurement point, most-preferred first. A deeper point gives a longer lever arm for the
 # depth slope; a slow device cannot afford the deepest one, and settles for less extrapolation
@@ -201,22 +223,44 @@ class PerfFit:
 
 @dataclass
 class PerfResult:
-    n_fit: int
-    grade: str
-    decode_tokens_per_second: float
+    n_out: int            # output tokens that fit in the budget, at this model's full context
+    grade: str            # the worse of output_grade and context_cap
+    output_grade: str     # what n_out alone earns
+    context_cap: str      # the best grade this effective context size allows
+    decode_tokens_per_second: float  # quoted at ctx_size, the slowest depth a turn reaches
     ctx_size: int
     fit: PerfFit
     reason: str
 
 
-def grade_for(n_fit: int) -> str:
-    if n_fit >= GREEN_MIN_TOKENS:
+# Worst-first, so `min(..., key=GRADE_SEVERITY.get)` picks the more pessimistic of two grades.
+GRADE_SEVERITY = {GRADE_REFUSE: 0, GRADE_RED: 1, GRADE_YELLOW: 2, GRADE_GREEN: 3}
+
+
+def grade_for_output(n_out: int) -> str:
+    """Grade from how many output tokens fit in the budget."""
+    if n_out >= OUTPUT_GREEN_MIN:
         return GRADE_GREEN
-    if n_fit >= YELLOW_MIN_TOKENS:
+    if n_out >= OUTPUT_YELLOW_MIN:
         return GRADE_YELLOW
-    if n_fit >= RED_MIN_TOKENS:
+    if n_out >= OUTPUT_RED_MIN:
         return GRADE_RED
     return GRADE_REFUSE
+
+
+def context_grade_cap(ctx_size: int) -> str:
+    """The best grade this effective context size can earn, however fast the model generates."""
+    if ctx_size > CONTEXT_GREEN_MIN:
+        return GRADE_GREEN
+    if ctx_size >= CONTEXT_YELLOW_MIN:
+        return GRADE_YELLOW
+    if ctx_size >= CONTEXT_RED_MIN:
+        return GRADE_RED
+    return GRADE_REFUSE
+
+
+def worst(*grades: str) -> str:
+    return min(grades, key=lambda g: GRADE_SEVERITY[g])
 
 
 def machine_is_too_busy() -> bool:
@@ -230,86 +274,96 @@ def machine_is_too_busy() -> bool:
     return one_minute > _MAX_LOADAVG_PER_CPU * cpus
 
 
-def predict_turn_ms(fit: PerfFit, n_in: int, n_out: int = MAX_OUTPUT_TOKENS) -> float:
-    """Predicted wall-clock for one full turn: cold load, then prefilling `n_in` tokens, then
-    generating `n_out` tokens at a depth that keeps growing as it goes."""
+def predict_turn_ms(fit: PerfFit, n_in: int, n_out: int, decode_depth: int | None = None) -> float:
+    """Predicted wall-clock for one turn: cold load, prefilling `n_in` tokens, then generating
+    `n_out` tokens. `decode_depth` is the context depth generation runs at, defaulting to `n_in`
+    -- grading passes the model's full context there, since that is the slowest depth a turn will
+    ever generate at."""
+    depth = n_in if decode_depth is None else decode_depth
     prefill = fit.prefill_base_ms * n_in + fit.prefill_depth_ms * n_in * n_in / 2.0
-    decode = fit.decode_base_ms * n_out + fit.decode_depth_ms * (n_in * n_out + n_out * n_out / 2.0)
+    decode = n_out * decode_ms_per_token(fit, depth)
     return fit.load_ms + prefill + decode
 
 
-def solve_n_fit(fit: PerfFit, budget_ms: float, n_out: int = MAX_OUTPUT_TOKENS) -> int:
-    """Largest `n_in` whose predicted turn still fits in `budget_ms`.
+def decode_ms_per_token(fit: PerfFit, depth: int) -> float:
+    """Cost of one generated token at a given KV-cache depth."""
+    return fit.decode_base_ms + fit.decode_depth_ms * depth
 
-    Substituting the fixed output length into predict_turn_ms leaves a quadratic in `n_in`:
 
-        (e/2) * n^2 + (c + b*N) * n + (load + a*N + b*N^2/2 - budget) <= 0
+def solve_n_out(fit: PerfFit, budget_ms: float, ctx_size: int) -> int:
+    """How many output tokens fit in `budget_ms`, generating at the model's full context depth.
 
-    Returns 0 when even an empty prompt overruns the budget -- that is the "1024 tokens alone is
-    already too slow" case, and it is a refusal rather than a small number.
+    Generation is modelled at a constant rate for the whole reply, taken at `ctx_size` -- the
+    slowest depth a turn on this model ever reaches. Integrating upward from there would charge for
+    depth beyond the context window, which cannot happen; a prompt long enough to sit at `ctx_size`
+    leaves no room to generate past it.
+
+    Returns 0 when the cold load plus the turn's prefill already exhaust the budget -- there is no
+    answer at all in that case, not a short one.
     """
-    quad = fit.prefill_depth_ms / 2.0
-    lin = fit.prefill_base_ms + fit.decode_depth_ms * n_out
-    const = fit.load_ms + fit.decode_base_ms * n_out + fit.decode_depth_ms * n_out * n_out / 2.0 - budget_ms
-
-    if const >= 0:
+    prefill = (
+        fit.prefill_base_ms * ASSUMED_PREFILL_TOKENS
+        + fit.prefill_depth_ms * ASSUMED_PREFILL_TOKENS * ASSUMED_PREFILL_TOKENS / 2.0
+    )
+    remaining = budget_ms - fit.load_ms - prefill
+    if remaining <= 0:
         return 0
-    if quad <= 0:
-        if lin <= 0:
-            return _UNBOUNDED_TOKENS
-        return int(-const / lin)
-    # const < 0 and quad > 0 here, so the discriminant exceeds lin^2 and the positive root is real.
-    root = (-lin + math.sqrt(lin * lin - 4.0 * quad * const)) / (2.0 * quad)
-    return max(0, int(root))
+    per_token = decode_ms_per_token(fit, ctx_size)
+    if per_token <= 0:
+        return _UNBOUNDED_TOKENS
+    return max(0, int(remaining / per_token))
 
 
 def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
     """Turns a fit into a verdict. Never raises -- a grading step that could itself fail would be
     worse than the problem it exists to catch.
 
-    `ctx_size` is what model_sizing.compute_sizing picked for this device's memory, and it clamps
-    the answer: the app never truncates an over-long prompt, so a turn that does not fit the
-    context window fails outright no matter how fast the model is. A model whose fitted context is
-    below GREEN_MIN_TOKENS + MAX_OUTPUT_TOKENS therefore cannot be graded green at any speed,
-    which is the honest answer for this device rather than a quirk.
+    Two independent dimensions, and the worse one wins:
+
+    - **How much it can say.** `n_out` is the number of output tokens that fit in the budget while
+      generating at this model's full context depth. That is the question users actually feel: a
+      reply cut off mid-thought is the failure, and prefill is cheap next to generation.
+    - **How much it can be told.** `ctx_size` is the effective context -- what runtime sizing could
+      afford on this device's memory, already capped at the model's trained context. A model that
+      generates quickly is still limited by how much context it can hold, so it caps the grade.
     """
     safety = SAFETY_FACTOR_LIVE if fit.source == SOURCE_LIVE_SERVER else SAFETY_FACTOR_BENCH
     effective_budget = TURN_BUDGET_MS / safety
 
-    by_speed = solve_n_fit(fit, effective_budget)
-    by_context = max(0, ctx_size - MAX_OUTPUT_TOKENS)
-    n_fit = max(0, min(by_speed, by_context))
-    grade = grade_for(n_fit)
+    n_out = solve_n_out(fit, effective_budget, ctx_size)
+    output_grade = grade_for_output(n_out)
+    context_cap = context_grade_cap(ctx_size)
+    grade = worst(output_grade, context_cap)
 
-    # Green is a promise that heavy long-context use is safe. A measurement already known to be
-    # noisy, or one taken without a depth point at all, cannot support a promise -- and a fit with
-    # no depth point has both slopes pinned at zero, which is exactly the assumption that would
-    # manufacture a green. Cap those at yellow rather than certifying something unmeasured.
+    # Green is a promise that heavy use is safe. A measurement already known to be noisy, or one
+    # taken without a depth point at all, cannot support a promise -- and a fit with no depth point
+    # has both slopes pinned at zero, which is exactly the assumption that would manufacture one.
     capped_by_confidence = grade == GRADE_GREEN and fit.confidence == CONFIDENCE_LOW
     if capped_by_confidence:
         grade = GRADE_YELLOW
 
-    decode_ms_at_depth = fit.decode_base_ms + fit.decode_depth_ms * _REPORTED_RATE_DEPTH
-    decode_tps = 1000.0 / decode_ms_at_depth if decode_ms_at_depth > 0 else 0.0
+    decode_tps = 1000.0 / decode_ms_per_token(fit, ctx_size) if decode_ms_per_token(fit, ctx_size) > 0 else 0.0
 
     if capped_by_confidence:
         reason = "measurement was too noisy or too short to certify heavy use -- re-run the benchmark when the machine is idle"
-    elif by_speed == 0:
+    elif n_out == 0:
         reason = (
-            f"a full {MAX_OUTPUT_TOKENS}-token reply alone needs about "
-            f"{predict_turn_ms(fit, 0) / 1000:.0f}s, over the {effective_budget / 1000:.0f}s budget"
-        )  # n_in=0 isolates the reply's own cost from any prompt
-    elif by_context < by_speed:
-        reason = f"limited by this device's {ctx_size}-token context for this model, not by speed"
-    else:
-        reason = (
-            f"limited by speed at about {decode_tps:.1f} tok/s of generation "
-            f"at {_REPORTED_RATE_DEPTH:,} tokens of context"
+            f"this device cannot load the model and prefill a turn inside the "
+            f"{effective_budget / 1000:.0f}s budget, so no answer arrives at all"
         )
+    elif worst(output_grade, context_cap) == context_cap and context_cap != output_grade:
+        reason = (
+            f"generation is fine ({n_out:,} tokens in budget) but a {ctx_size:,}-token context "
+            f"limits this to {context_cap}"
+        )
+    else:
+        reason = f"about {n_out:,} output tokens fit in the budget at a {ctx_size:,}-token context"
 
     return PerfResult(
-        n_fit=n_fit,
+        n_out=n_out,
         grade=grade,
+        output_grade=output_grade,
+        context_cap=context_cap,
         decode_tokens_per_second=decode_tps,
         ctx_size=ctx_size,
         fit=fit,
@@ -574,10 +628,11 @@ def probe_performance(
             log.debug("Cold load estimated at %.0fms for %s", load_ms, model_id)
 
     shallow_fit = fit_points(shallow, None, load_ms, SOURCE_LLAMA_BENCH)
-    if solve_n_fit(shallow_fit, TURN_BUDGET_MS / SAFETY_FACTOR_BENCH) == 0:
-        # Hopeless at the shallowest context a real turn ever has. More depth can only make this
-        # worse, so stop here rather than spending another two minutes confirming it.
-        log.info("%s cannot finish a reply even at a minimal context -- skipping the deep probe", model_id)
+    # A shallow-only fit has no depth slope, so it OVER-estimates how much this model can generate
+    # at a deep context. If even that optimistic reading cannot reach the smallest useful answer,
+    # a deeper measurement can only confirm it -- so stop rather than spend another two minutes.
+    if solve_n_out(shallow_fit, TURN_BUDGET_MS / SAFETY_FACTOR_BENCH, ctx_size) < OUTPUT_RED_MIN:
+        log.info("%s cannot produce even a short answer in budget -- skipping the deep probe", model_id)
         return compute_grade(shallow_fit, ctx_size)
 
     deep: BenchPoint | None = None
