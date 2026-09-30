@@ -84,16 +84,19 @@ if (-not $gitExe) {
     }
 }
 
+# NOTE: deliberately NOT --recurse-submodules -- see install.sh's note at the same point. The only
+# submodule is vendor/llama.cpp (~174MB) and it is needed only for a from-source build, which
+# source_build._init_vendor_submodule fetches on demand.
 if (Test-Path (Join-Path $srcDir ".git")) {
     Write-Host "Existing checkout found at $srcDir -- updating"
     & $gitExe -C $srcDir fetch --depth 1 origin $ref
     & $gitExe -C $srcDir checkout $ref
     & $gitExe -C $srcDir reset --hard "origin/$ref"
-    & $gitExe -C $srcDir submodule update --init --recursive
+    & $gitExe -C $srcDir submodule update --recursive
 } else {
     Write-Host "Cloning $repoUrl (ref: $ref) into $srcDir"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $srcDir) | Out-Null
-    & $gitExe clone --branch $ref --depth 1 --recurse-submodules $repoUrl $srcDir
+    & $gitExe clone --branch $ref --depth 1 $repoUrl $srcDir
     if ($LASTEXITCODE -ne 0) {
         Write-Error "git clone failed (exit $LASTEXITCODE)."
         exit 1

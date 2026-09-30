@@ -11,6 +11,7 @@ variables (FAKE_CMAKE_*) so each test can shape its behavior without new script 
 from __future__ import annotations
 
 import stat
+import subprocess
 import textwrap
 import time
 from pathlib import Path
@@ -200,9 +201,48 @@ class TestRecommendedJobs:
 
 
 class TestEnsureSourceCheckedOut:
-    def test_missing_git_checkout_raises_with_actionable_message(self, tmp_path):
+    """vendor/llama.cpp is ~174MB and is only needed when a host actually compiles llama.cpp, which
+    most hosts never do -- so install.sh clones without it and this is where it gets fetched."""
+
+    def test_an_absent_submodule_is_fetched_on_demand_rather_than_failing(self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        vendor = tmp_path / "vendor" / "llama.cpp"
+        vendor.mkdir(parents=True)
+        calls = []
+
+        def fake_run(args, *, timeout):
+            calls.append(args)
+            if "submodule" in args:
+                (vendor / ".git").mkdir(exist_ok=True)  # what a real init produces
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr(sb, "_run", fake_run)
+        sb.ensure_source_checked_out(tmp_path, "b10989")
+
+        submodule_call = next(a for a in calls if "submodule" in a)
+        assert submodule_call[-1] == "vendor/llama.cpp"
+        # Shallow: ensure_source_checked_out detaches onto the pinned tag immediately after, so the
+        # submodule's own history is never read and fetching it would be pure download cost.
+        assert "--depth" in submodule_call and "1" in submodule_call
+        assert any("checkout" in a for a in calls)
+
+    def test_an_already_populated_submodule_is_not_re_fetched(self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        vendor = tmp_path / "vendor" / "llama.cpp"
+        (vendor / ".git").mkdir(parents=True)
+        calls = []
+        monkeypatch.setattr(
+            sb, "_run",
+            lambda args, *, timeout: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""),
+        )
+        sb.ensure_source_checked_out(tmp_path, "b10989")
+        assert not any("submodule" in a for a in calls)
+
+    def test_a_non_git_tree_cannot_self_heal_and_says_so(self, tmp_path):
+        """An unpacked tarball has no .git to fetch a submodule from, so this has to be a clear
+        message rather than a confusing git failure."""
         (tmp_path / "vendor" / "llama.cpp").mkdir(parents=True)
-        with pytest.raises(sb.BuildError, match="submodule update --init"):
+        with pytest.raises(sb.BuildError, match="not a git checkout"):
             sb.ensure_source_checked_out(tmp_path, "b10989")
 
 
