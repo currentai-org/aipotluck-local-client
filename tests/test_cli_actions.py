@@ -961,19 +961,40 @@ class TestBenchmarkModelSelection:
         assert result is None
         assert "no sized preset" in caplog.text
 
-    def test_declines_while_the_machine_is_busy(self, tmp_path, monkeypatch, caplog):
+    def test_declines_when_the_machine_never_goes_idle(self, tmp_path, monkeypatch, caplog):
         llama_cfg, presets_path = self._cfg(tmp_path)
-        monkeypatch.setattr(cli.model_perf, "machine_is_too_busy", lambda: True)
+        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: False)
+        monkeypatch.setattr(cli.model_perf_live, "unload_model", lambda *a, **kw: True)
         with caplog.at_level("WARNING"):
             result = cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
         assert result is None
-        assert "already busy" in caplog.text
+        assert "still busy" in caplog.text
+
+    def test_frees_the_routers_model_before_measuring(self, tmp_path, monkeypatch):
+        """Under --models-max 1 the router holds a full model's worth of memory, and llama-bench is
+        about to load its own copy on top. On a 16GB Jetson that was an outright allocation failure
+        (NvMapMemAllocInternalTagged error 12), not merely a slow measurement."""
+        llama_cfg, presets_path = self._cfg(tmp_path)
+        llama_cfg.update(host="127.0.0.1", port=9999)
+        unloaded = []
+        monkeypatch.setattr(
+            cli.model_perf_live, "unload_model",
+            lambda base_url, model_id, **kw: unloaded.append((base_url, model_id)) or True,
+        )
+        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
+        monkeypatch.setattr(cli.model_perf, "probe_performance",
+                            lambda *a, **kw: _graded(cli.model_perf.GRADE_YELLOW))
+
+        cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
+
+        assert unloaded == [("http://127.0.0.1:9999", "org/repo:Q4_K_M")]
 
     def test_falls_back_to_the_live_server_when_llama_bench_is_absent(self, tmp_path, monkeypatch):
         """Source-built installs (Jetson-class arm64+CUDA, old glibc) have no llama-bench, and they
         are the hardware most likely to be too slow -- so they must still get measured."""
         llama_cfg, presets_path = self._cfg(tmp_path, bench_exists=False)
-        monkeypatch.setattr(cli.model_perf, "machine_is_too_busy", lambda: False)
+        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
+        monkeypatch.setattr(cli.model_perf_live, "unload_model", lambda *a, **kw: True)
         live_calls = []
         monkeypatch.setattr(
             cli.model_perf_live, "probe_performance_live",
@@ -993,7 +1014,8 @@ class TestBenchmarkModelSelection:
 
     def test_prefers_llama_bench_when_it_is_present(self, tmp_path, monkeypatch):
         llama_cfg, presets_path = self._cfg(tmp_path, bench_exists=True)
-        monkeypatch.setattr(cli.model_perf, "machine_is_too_busy", lambda: False)
+        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
+        monkeypatch.setattr(cli.model_perf_live, "unload_model", lambda *a, **kw: True)
         bench_calls = []
         monkeypatch.setattr(
             cli.model_perf, "probe_performance",

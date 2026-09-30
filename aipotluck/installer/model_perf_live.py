@@ -130,7 +130,7 @@ def _point_from_timings(timings: dict) -> model_perf.BenchPoint:
     )
 
 
-def _unload(base_url: str, model_id: str, *, timeout: float = 30.0) -> bool:
+def unload_model(base_url: str, model_id: str, *, timeout: float = 30.0) -> bool:
     """Best-effort: forces the next request to pay a real cold load so it can be measured. The
     router already swaps models on demand under `--models-max 1`, so this is the same disruption
     the next differently-modelled request would have caused anyway."""
@@ -155,7 +155,7 @@ def probe_performance_live(
     # Cold load is inside the web app's turn budget and is the common case under --models-max 1,
     # so it is measured rather than assumed: unload, then attribute whatever the first request's
     # wall clock spent outside its own reported prefill and decode to loading the model.
-    _unload(base_url, model_id)
+    unload_model(base_url, model_id)
     shallow_timings, wall_seconds = _timed_completion(
         base_url, model_id, _SHALLOW_WORDS, salt=0, timeout=max(1.0, deadline - time.monotonic()),
     )

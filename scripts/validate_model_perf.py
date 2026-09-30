@@ -60,7 +60,7 @@ def measure_real_turn(base_url: str, model_id: str, words: int, max_tokens: int,
     turn pays the same cold model load the prediction includes -- and the same one a real turn pays,
     since --models-max 1 makes every model switch a cold load."""
     if cold:
-        live._unload(base_url, model_id)
+        live.unload_model(base_url, model_id)
     started = time.monotonic()
     # A REAL turn of the length the grade claims this model can deliver -- measuring anything
     # shorter would compare a prediction about a full answer against something that was never one.

@@ -555,9 +555,19 @@ def _benchmark_model(
         )
         return None
 
-    if model_perf.machine_is_too_busy():
+    host = llama_cfg.get("host", DEFAULT_HOST)
+    port = llama_cfg.get("port", DEFAULT_PORT)
+    base_url = f"http://{host}:{port}"
+
+    # Free the router's loaded model first. Under --models-max 1 it is holding a full model's worth
+    # of memory, and llama-bench is about to load its own copy on top -- on a 16GB Jetson that was
+    # an outright allocation failure (NvMapMemAllocInternalTagged error 12), not merely slow. The
+    # router reloads on the next request, and it would have had to swap for this model anyway.
+    model_perf_live.unload_model(base_url, model_id)
+
+    if not model_perf.wait_until_idle():
         log.warning(
-            "This machine is already busy, so a speed measurement would describe the contention "
+            "This machine is still busy, so a speed measurement would describe the contention "
             "rather than the model -- skipping. Re-run `aipotluck-local-client benchmark %s` when "
             "it's idle.", model_id,
         )
@@ -581,12 +591,9 @@ def _benchmark_model(
             # through the running router instead. Same numbers, noisier path, larger safety margin
             # -- see model_perf_live. Skipping outright would leave the slowest hardware we support
             # as the only hardware with no speed check at all.
-            host = llama_cfg.get("host", DEFAULT_HOST)
-            port = llama_cfg.get("port", DEFAULT_PORT)
             log.info("No llama-bench in this install -- measuring through the running server instead.")
             result = model_perf_live.probe_performance_live(
-                f"http://{host}:{port}", model_id,
-                ctx_size=ctx_size, budget_seconds=budget_seconds,
+                base_url, model_id, ctx_size=ctx_size, budget_seconds=budget_seconds,
             )
     except (model_perf.ModelPerfError, ValueError) as exc:
         log.warning("Could not measure %s on this device (%s) -- no grade recorded.", model_id, exc)

@@ -394,3 +394,27 @@ class TestMeasureColdLoadMs:
 
     def test_returns_none_for_an_unreadable_file(self, tmp_path):
         assert mp.measure_cold_load_ms(tmp_path / "missing.gguf", model_size_bytes=1024) is None
+
+
+class TestWaitUntilIdle:
+    """Bailing the moment load looks high is wrong when the load is OURS. Benchmarking several
+    models re-sizes each one first -- a full model load apiece -- so the one-minute average still
+    carries the previous model's probe. Measured on a Jetson: the first model graded, then every
+    later one was skipped as "busy" by work this same command had just finished."""
+
+    def test_returns_immediately_when_already_idle(self, monkeypatch):
+        monkeypatch.setattr(mp, "machine_is_too_busy", lambda: False)
+        assert mp.wait_until_idle(timeout_seconds=0.0) is True
+
+    def test_waits_for_transient_load_to_clear(self, monkeypatch):
+        readings = iter([True, True, False])
+        monkeypatch.setattr(mp, "machine_is_too_busy", lambda: next(readings))
+        monkeypatch.setattr(mp.time, "sleep", lambda _s: None)
+        assert mp.wait_until_idle(timeout_seconds=60.0) is True
+
+    def test_gives_up_on_a_machine_that_stays_busy(self, monkeypatch):
+        """A machine genuinely occupied by something else still gets declined -- the point is to
+        wait out our own noise, not to measure through someone else's workload."""
+        monkeypatch.setattr(mp, "machine_is_too_busy", lambda: True)
+        monkeypatch.setattr(mp.time, "sleep", lambda _s: None)
+        assert mp.wait_until_idle(timeout_seconds=0.01) is False

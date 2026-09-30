@@ -178,6 +178,11 @@ _MIN_MEANINGFUL_SPREAD_MS = 50.0
 # contention, not the model.
 _MAX_LOADAVG_PER_CPU = 0.5
 
+# How long to wait for that to clear before giving up. Sized for the load a sizing probe of a large
+# model leaves behind, which decays over roughly a load-average window.
+_IDLE_WAIT_SECONDS = 120.0
+_IDLE_POLL_SECONDS = 5.0
+
 # Stands in for "no measurable limit from speed alone"; always clamped by ctx_size downstream.
 _UNBOUNDED_TOKENS = 1 << 30
 
@@ -272,6 +277,25 @@ def machine_is_too_busy() -> bool:
         return False
     cpus = os.cpu_count() or 1
     return one_minute > _MAX_LOADAVG_PER_CPU * cpus
+
+
+def wait_until_idle(timeout_seconds: float = _IDLE_WAIT_SECONDS) -> bool:
+    """Waits for the machine to go quiet, up to `timeout_seconds`. Returns whether it did.
+
+    Bailing the moment load looks high is wrong when the load is OURS. Benchmarking several models
+    in a row re-sizes each one first -- a full model load apiece -- so a one-minute load average
+    still carries the previous model's probe long after it has exited. Measured on a Jetson: the
+    first model graded, then every later one was skipped as "busy" by work this command had just
+    finished doing. Waiting turns a self-inflicted skip into a short pause, while still declining
+    to measure a machine that is genuinely occupied by something else.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while machine_is_too_busy():
+        if time.monotonic() >= deadline:
+            return False
+        log.info("Waiting for this machine to go idle before measuring...")
+        time.sleep(_IDLE_POLL_SECONDS)
+    return True
 
 
 def predict_turn_ms(fit: PerfFit, n_in: int, n_out: int, decode_depth: int | None = None) -> float:
