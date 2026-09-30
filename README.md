@@ -52,17 +52,23 @@ only the OS-native "keep this process running" registration differs
 
 Linux / macOS:
 ```bash
-git clone --recurse-submodules https://github.com/currentai-org/aitpotluck-local-client.git
+git clone https://github.com/currentai-org/aitpotluck-local-client.git
 cd aitpotluck-local-client
 python3 -m aipotluck.installer.install --backend auto
 ```
 
 Windows (no prerequisites, installs Python itself if missing):
 ```powershell
-git clone --recurse-submodules https://github.com/currentai-org/aitpotluck-local-client.git
+git clone https://github.com/currentai-org/aitpotluck-local-client.git
 cd aitpotluck-local-client
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
+
+No `--recurse-submodules`: the only submodule is `vendor/llama.cpp` (~174MB), and it is needed
+only on a host that has to **compile** llama.cpp. Most don't -- they resolve to an upstream
+release asset or one of our own cached custom builds and never build anything. When a source
+build really is required, `source_build._init_vendor_submodule` fetches the source then, shallowly.
+Cloning with `--recurse-submodules` anyway is harmless, just a download most people won't use.
 
 ## One-line public installer
 

@@ -275,17 +275,44 @@ def _total_memory_gb() -> float | None:
     return None
 
 
-def ensure_source_checked_out(repo_root: Path, tag: str) -> Path:
-    """Point vendor/llama.cpp's submodule checkout at the pinned release tag, shallowly. Requires
-    the submodule to already be initialized (README.md's documented `git clone --recurse-submodules`
-    does this); a bare/uninitialized vendor/llama.cpp gets a clear, actionable error instead of a
-    confusing git failure."""
-    vendor_dir = repo_root / "vendor" / "llama.cpp"
+def _init_vendor_submodule(repo_root: Path, vendor_dir: Path) -> None:
+    """Fetch llama.cpp's source on demand, the first time a build actually needs it.
+
+    install.sh/install.ps1 deliberately clone WITHOUT --recurse-submodules. Most installs resolve
+    to a prebuilt binary -- an upstream release asset or one of our own cached custom builds -- and
+    never compile anything, so paying ~174MB of llama.cpp source up front is a download the great
+    majority of users have no use for. This function is the one place that genuinely needs it, so
+    this is where it gets paid.
+
+    Shallow on purpose: ensure_source_checked_out immediately fetches and detaches onto the pinned
+    tag anyway, so the submodule's own history is never read.
+    """
+    if not (repo_root / ".git").exists():
+        raise BuildError(
+            f"A source build needs llama.cpp's source at {vendor_dir}, but {repo_root} is not a git "
+            "checkout so it cannot be fetched automatically. Re-run the installer (which clones "
+            "this repo), or clone it yourself and retry."
+        )
+    log.info("Fetching llama.cpp source -- needed for a from-source build, downloaded only now")
+    _run(
+        ["git", "-C", str(repo_root), "submodule", "update", "--init", "--depth", "1",
+         "--", "vendor/llama.cpp"],
+        timeout=1800,
+    )
     if not (vendor_dir / ".git").exists():
         raise BuildError(
-            f"{vendor_dir} is not a populated git checkout (no .git). Run "
-            f"'git -C {repo_root} submodule update --init --recursive' first."
+            f"Initialising the llama.cpp submodule did not produce a checkout at {vendor_dir}. Run "
+            f"'git -C {repo_root} submodule update --init --recursive' by hand to see why."
         )
+
+
+def ensure_source_checked_out(repo_root: Path, tag: str) -> Path:
+    """Point vendor/llama.cpp's submodule checkout at the pinned release tag, shallowly, fetching
+    the submodule itself first if this install has never needed it before (see
+    _init_vendor_submodule for why it is not fetched at clone time)."""
+    vendor_dir = repo_root / "vendor" / "llama.cpp"
+    if not (vendor_dir / ".git").exists():
+        _init_vendor_submodule(repo_root, vendor_dir)
     log.info("Checking out llama.cpp %s into %s for source build", tag, vendor_dir)
     _run(["git", "-C", str(vendor_dir), "fetch", "--depth", "1", "origin", f"refs/tags/{tag}"], timeout=120)
     _run(["git", "-C", str(vendor_dir), "checkout", "--detach", "FETCH_HEAD"], timeout=30)

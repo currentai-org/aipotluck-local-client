@@ -124,16 +124,24 @@ if ! ensure_dependency "git" git git; then
     fi
 fi
 
+# NOTE: deliberately NOT --recurse-submodules. The only submodule is vendor/llama.cpp (~174MB),
+# and it is needed only when this host has to COMPILE llama.cpp. Most hosts don't: they resolve to
+# an upstream release asset or one of our own cached custom builds and never build anything. So the
+# source is fetched lazily, at the one moment it is genuinely required, by
+# source_build._init_vendor_submodule -- see that function for the full reasoning.
+# On the update path, `submodule update` WITHOUT --init deliberately refreshes only submodules that
+# are already populated, so a host that has previously source-built stays current while one that
+# never has doesn't start downloading now.
 if [[ -d "$SRC_DIR/.git" ]]; then
     log "Existing checkout found at $SRC_DIR -- updating"
     git -C "$SRC_DIR" fetch --depth 1 origin "$REF"
     git -C "$SRC_DIR" checkout "$REF"
     git -C "$SRC_DIR" reset --hard "origin/$REF"
-    git -C "$SRC_DIR" submodule update --init --recursive
+    git -C "$SRC_DIR" submodule update --recursive
 else
     log "Cloning $REPO_URL (ref: $REF) into $SRC_DIR"
     mkdir -p "$(dirname "$SRC_DIR")"
-    git clone --branch "$REF" --depth 1 --recurse-submodules "$REPO_URL" "$SRC_DIR"
+    git clone --branch "$REF" --depth 1 "$REPO_URL" "$SRC_DIR"
 fi
 
 PYTHON_BIN=""
