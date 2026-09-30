@@ -135,36 +135,59 @@ def stage(build_dir: Path, tag: str) -> Path:
     return staged
 
 
+# Binaries this project actually runs, and therefore has to prove still work after being moved.
+# llama-server is required; llama-bench is what model_perf grades a model with, and it is only
+# absent on an older build that predates it being added to the build targets -- so it is checked
+# when present rather than demanded. Both are thin launchers over their own *-impl.so, which is
+# exactly the shape that breaks when an RPATH is wrong, so neither can be taken on trust.
+_REQUIRED_BINARIES = ("llama-server",)
+_OPTIONAL_BINARIES = ("llama-bench",)
+
+
 def verify_relocatable(staged: Path) -> None:
-    """Copy the staged directory to a FRESH path elsewhere and confirm llama-server actually runs
-    from there -- proof, not inference, that it doesn't depend on the exact path it was built at."""
-    try:
-        original_binary = fetch.find_binary(staged, "llama-server")
-    except FileNotFoundError as exc:
-        raise PackagingError(str(exc)) from exc
+    """Copy the staged directory to a FRESH path elsewhere and confirm the binaries we ship
+    actually run from there -- proof, not inference, that they don't depend on the exact path they
+    were built at."""
+    targets: list[Path] = []
+    for stem in _REQUIRED_BINARIES:
+        try:
+            targets.append(fetch.find_binary(staged, stem))
+        except FileNotFoundError as exc:
+            raise PackagingError(str(exc)) from exc
+    for stem in _OPTIONAL_BINARIES:
+        try:
+            targets.append(fetch.find_binary(staged, stem))
+        except FileNotFoundError:
+            log.warning(
+                "%s is not in this build -- packaging without it. Hosts using this archive will "
+                "fall back to measuring model speed through the running server (model_perf_live).",
+                stem,
+            )
 
     with tempfile.TemporaryDirectory(prefix="relocate-check-") as tmp:
         elsewhere = Path(tmp) / "moved" / staged.name
         shutil.copytree(staged, elsewhere, symlinks=True)
-        moved_binary = elsewhere / original_binary.relative_to(staged)
-        try:
-            result = subprocess.run(
-                [str(moved_binary), "--list-devices"], capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise PackagingError(f"Could not run the relocated binary: {exc}") from exc
+        for original_binary in targets:
+            moved_binary = elsewhere / original_binary.relative_to(staged)
+            try:
+                result = subprocess.run(
+                    [str(moved_binary), "--list-devices"], capture_output=True, text=True, timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise PackagingError(f"Could not run the relocated {original_binary.name}: {exc}") from exc
 
-    combined = (result.stdout + result.stderr)
-    if any(sig in combined.lower() for sig in _RELOCATION_FAILURE_SIGNATURES):
-        raise PackagingError(
-            "This build is not relocatable -- it only works from the exact path it was built at. "
-            "This almost always means CMAKE_INSTALL_RPATH=$ORIGIN wasn't used (an old build, or a "
-            "manual one predating source_build.py's fix). Rebuild via the installer and re-run "
-            f"this script.\n\nFull output from the relocated binary:\n{combined}"
-        )
-    if result.returncode != 0:
-        raise PackagingError(f"The relocated binary exited {result.returncode}:\n{combined}")
-    log.info("Relocatability check passed (ran cleanly from a different path)")
+            combined = (result.stdout + result.stderr)
+            if any(sig in combined.lower() for sig in _RELOCATION_FAILURE_SIGNATURES):
+                raise PackagingError(
+                    f"This build is not relocatable -- {original_binary.name} only works from the "
+                    "exact path it was built at. This almost always means CMAKE_INSTALL_RPATH="
+                    "$ORIGIN wasn't used (an old build, or a manual one predating source_build.py's "
+                    f"fix). Rebuild via the installer and re-run this script.\n\nFull output from "
+                    f"the relocated binary:\n{combined}"
+                )
+            if result.returncode != 0:
+                raise PackagingError(f"The relocated {original_binary.name} exited {result.returncode}:\n{combined}")
+            log.info("Relocatability check passed for %s", original_binary.name)
 
 
 def package(staged: Path, tag: str, key: str, output_dir: Path) -> Path:

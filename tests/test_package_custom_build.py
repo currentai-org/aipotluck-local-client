@@ -39,7 +39,7 @@ FAKE_LLAMA_SERVER_SCRIPT = textwrap.dedent(
 )
 
 
-def _make_bin_dir(tmp_path: Path) -> Path:
+def _make_bin_dir(tmp_path: Path, *, with_bench: bool = False) -> Path:
     build_dir = tmp_path / "llama.cpp-build"
     bin_dir = build_dir / "bin"
     bin_dir.mkdir(parents=True)
@@ -53,6 +53,10 @@ def _make_bin_dir(tmp_path: Path) -> Path:
     real_lib.write_text("fake shared lib contents", encoding="utf-8")
     (bin_dir / "libggml-base.so.0").symlink_to(real_lib.name)
     (bin_dir / "libggml-base.so").symlink_to("libggml-base.so.0")
+    if with_bench:
+        bench = bin_dir / "llama-bench"
+        bench.write_text(FAKE_LLAMA_SERVER_SCRIPT, encoding="utf-8")
+        bench.chmod(bench.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return build_dir
 
 
@@ -131,6 +135,31 @@ class TestVerifyRelocatable:
         staged.mkdir()
         with pytest.raises(pcb.PackagingError):
             pcb.verify_relocatable(staged)
+
+    def test_llama_bench_is_verified_too_when_the_build_has_one(self, tmp_path, monkeypatch, caplog):
+        """llama-bench is what model_perf grades a model with, and like llama-server it is a thin
+        launcher over its own *-impl.so -- the exact shape that breaks on a bad RPATH. Shipping a
+        broken one would silently push every host onto the slower live-server fallback."""
+        build_dir = _make_bin_dir(tmp_path, with_bench=True)
+        staged = pcb.stage(build_dir, "b10989")
+        with caplog.at_level("INFO"):
+            pcb.verify_relocatable(staged)
+        assert "llama-bench" in caplog.text
+
+    def test_a_non_relocatable_llama_bench_fails_packaging(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FAKE_RELOCATE_FAIL", "1")
+        build_dir = _make_bin_dir(tmp_path, with_bench=True)
+        staged = pcb.stage(build_dir, "b10989")
+        with pytest.raises(pcb.PackagingError, match="not relocatable"):
+            pcb.verify_relocatable(staged)
+
+    def test_a_build_without_llama_bench_still_packages_with_a_warning(self, tmp_path, caplog):
+        """Older archives predate llama-bench being a build target; they must still package."""
+        build_dir = _make_bin_dir(tmp_path, with_bench=False)
+        staged = pcb.stage(build_dir, "b10989")
+        with caplog.at_level("WARNING"):
+            pcb.verify_relocatable(staged)
+        assert "llama-bench is not in this build" in caplog.text
 
 
 class TestPackage:
