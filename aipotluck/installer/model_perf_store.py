@@ -123,6 +123,7 @@ def write_record(
         "context_cap": result.context_cap,
         "decode_tokens_per_second": round(result.decode_tokens_per_second, 2),
         "ctx_size": result.ctx_size,
+        "grading_depth": result.grading_depth,
         "reason": result.reason,
         "source": result.fit.source,
         "confidence": result.fit.confidence,

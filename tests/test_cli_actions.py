@@ -843,7 +843,8 @@ def _graded(grade: str, n_out: int = 5_000) -> "cli.model_perf.PerfResult":
     )
     return cli.model_perf.PerfResult(
         n_out=n_out, grade=grade, output_grade=grade, context_cap=cli.model_perf.GRADE_GREEN,
-        decode_tokens_per_second=50.0, ctx_size=131072, fit=fit, reason="test reason",
+        decode_tokens_per_second=50.0, grading_depth=32768, ctx_size=131072,
+        fit=fit, reason="test reason",
     )
 
 

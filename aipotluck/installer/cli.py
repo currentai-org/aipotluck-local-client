@@ -516,7 +516,8 @@ def _print_perf_verdict(result: model_perf.PerfResult) -> None:
         return
     print(
         f"  {result.grade.upper()} -- can produce ~{result.n_out:,} output tokens in budget "
-        f"({result.decode_tokens_per_second:.1f} tok/s at a {result.ctx_size:,}-token context)"
+        f"({result.decode_tokens_per_second:.1f} tok/s at a {result.grading_depth:,}-token depth; "
+        f"model context {result.ctx_size:,})"
     )
     print(f"  {result.reason}")
 
@@ -748,9 +749,11 @@ def run_list_models(args: argparse.Namespace) -> int:
             ctx = record.get("ctx_size")
             if isinstance(ctx, int):
                 notes.append(f"{ctx:,}-token context")
+            depth = record.get("grading_depth")
             tps = record.get("decode_tokens_per_second")
             if isinstance(tps, (int, float)):
-                notes.append(f"{tps:.1f} tok/s")
+                at = f" at {depth:,} depth" if isinstance(depth, int) else ""
+                notes.append(f"{tps:.1f} tok/s{at}")
             if model_perf_store.is_stale(Path(presets_path), record, llama_config=llama_cfg):
                 notes.append("stale -- re-run `benchmark`")
         suffix = f"  ({', '.join(notes)})" if notes else ""

@@ -245,7 +245,8 @@ class PerfResult:
     grade: str            # the worse of output_grade and context_cap
     output_grade: str     # what n_out alone earns
     context_cap: str      # the best grade this effective context size allows
-    decode_tokens_per_second: float  # quoted at ctx_size, the slowest depth a turn reaches
+    decode_tokens_per_second: float  # quoted at grading_depth, not at ctx_size
+    grading_depth: int    # the context depth n_out and the rate were priced at
     ctx_size: int
     fit: PerfFit
     reason: str
@@ -372,6 +373,7 @@ def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
     safety = SAFETY_FACTOR_LIVE if fit.source == SOURCE_LIVE_SERVER else SAFETY_FACTOR_BENCH
     effective_budget = TURN_BUDGET_MS / safety
 
+    depth = grading_decode_depth(ctx_size)
     n_out = solve_n_out(fit, effective_budget, ctx_size)
     output_grade = grade_for_output(n_out)
     context_cap = context_grade_cap(ctx_size)
@@ -384,7 +386,6 @@ def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
     if capped_by_confidence:
         grade = GRADE_YELLOW
 
-    depth = grading_decode_depth(ctx_size)
     decode_ms = decode_ms_per_token(fit, depth)
     decode_tps = 1000.0 / decode_ms if decode_ms > 0 else 0.0
 
@@ -406,6 +407,7 @@ def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
     return PerfResult(
         n_out=n_out,
         grade=grade,
+        grading_depth=depth,
         output_grade=output_grade,
         context_cap=context_cap,
         decode_tokens_per_second=decode_tps,

@@ -258,6 +258,7 @@ def runtime_params(runtime_config: dict[str, Any]) -> dict[str, Any]:
             model_view["performance"] = {
                 "grade": record.get("grade"),
                 "n_out": record.get("n_out"),
+                "grading_depth": record.get("grading_depth"),
                 "output_grade": record.get("output_grade"),
                 "context_cap": record.get("context_cap"),
                 "decode_tokens_per_second": record.get("decode_tokens_per_second"),

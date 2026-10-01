@@ -433,3 +433,21 @@ class TestWaitUntilIdle:
         monkeypatch.setattr(mp, "machine_is_too_busy", lambda: True)
         monkeypatch.setattr(mp.time, "sleep", lambda _s: None)
         assert mp.wait_until_idle(timeout_seconds=0.01) is False
+
+
+class TestGradingDepthIsReported:
+    def test_the_quoted_rate_belongs_to_the_grading_depth_not_the_context(self):
+        """These differ whenever a model's context exceeds the grading depth, and conflating them
+        printed "8.7 tok/s at a 131,072-token context" for a rate actually measured at 32k -- a
+        number that was right attached to a label that was wrong."""
+        fit = make_fit(tg_tps=60.0, tg_slope=5e-4)
+        result = mp.compute_grade(fit, ctx_size=131072)
+        assert result.grading_depth == mp.GRADING_DECODE_DEPTH
+        assert result.ctx_size == 131072
+        assert result.decode_tokens_per_second == pytest.approx(
+            1000.0 / mp.decode_ms_per_token(fit, mp.GRADING_DECODE_DEPTH), rel=1e-9
+        )
+
+    def test_a_small_context_model_reports_its_own_depth(self):
+        result = mp.compute_grade(make_fit(tg_tps=60.0, tg_slope=5e-4), ctx_size=8192)
+        assert result.grading_depth == 8192 == result.ctx_size
