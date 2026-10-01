@@ -67,3 +67,26 @@ class TestProbePerformanceLive:
     def test_an_unreachable_router_raises(self):
         with pytest.raises(mp.ModelPerfError, match="could not reach"):
             live.probe_performance_live("http://127.0.0.1:1", "org/repo:Q4_K_M", ctx_size=4096)
+
+
+class TestFreeRouterMemory:
+    def test_unloads_every_loaded_model_not_just_one(self, monkeypatch):
+        """The router is frequently holding a model other than the one about to be measured, and
+        under --models-max 1 that one model is all of the memory a benchmark needs."""
+        with RouterStub() as router:
+            monkeypatch.setattr(
+                live, "_get",
+                lambda base_url, path, *, timeout: {"models": [
+                    {"name": "a:Q4", "status": {"value": "loaded"}},
+                    {"name": "b:Q4", "status": {"value": "unloaded"}},
+                    {"name": "c:Q4", "status": {"value": "loading"}},
+                ]},
+            )
+            freed = live.free_router_memory(router.base_url)
+
+        assert freed == ["a:Q4", "c:Q4"]  # the unloaded one is left alone
+        unloads = [b["model"] for _, path, b in router.requests if path == "/models/unload"]
+        assert unloads == ["a:Q4", "c:Q4"]
+
+    def test_an_unreachable_router_is_not_a_reason_to_skip_measuring(self):
+        assert live.free_router_memory("http://127.0.0.1:1", timeout=1.0) == []

@@ -130,6 +130,47 @@ def _point_from_timings(timings: dict) -> model_perf.BenchPoint:
     )
 
 
+def _get(base_url: str, path: str, *, timeout: float) -> dict | list:
+    try:
+        with urllib.request.urlopen(urllib.parse.urljoin(base_url, path), timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise model_perf.ModelPerfError(f"could not read {path} from {base_url}: {exc}") from exc
+
+
+def free_router_memory(base_url: str, *, timeout: float = 60.0) -> list[str]:
+    """Unloads every model the router currently holds, returning the ones it unloaded.
+
+    Under `--models-max 1` the router keeps one whole model resident, and a benchmark is about to
+    load its own copy on top. Unloading only the model being measured is not enough -- the router
+    is frequently holding a *different* one, which then keeps its memory and makes the measurement
+    fail outright. On a 16GB Jetson that was `NvMapMemAllocInternalTagged error 12`, sometimes at
+    model load and sometimes at context creation, for models that benchmark fine on an idle box.
+
+    Best-effort throughout: the router reloads whatever it needs on the next request, and a router
+    that cannot be reached at all is not a reason to skip measuring.
+    """
+    try:
+        body = _get(base_url, "/models", timeout=timeout)
+    except model_perf.ModelPerfError as exc:
+        log.debug("Could not list the router's models: %s", exc)
+        return []
+
+    entries = body.get("models", body.get("data", [])) if isinstance(body, dict) else body
+    unloaded = []
+    for entry in entries if isinstance(entries, list) else []:
+        name = entry.get("name") or entry.get("id")
+        status = entry.get("status")
+        value = status.get("value") if isinstance(status, dict) else status
+        if not name or value in (None, "unloaded", "downloaded"):
+            continue
+        if unload_model(base_url, name, timeout=timeout):
+            unloaded.append(name)
+    if unloaded:
+        log.info("Freed the router's loaded model(s) before measuring: %s", ", ".join(unloaded))
+    return unloaded
+
+
 def unload_model(base_url: str, model_id: str, *, timeout: float = 30.0) -> bool:
     """Best-effort: forces the next request to pay a real cold load so it can be measured. The
     router already swaps models on demand under `--models-max 1`, so this is the same disruption

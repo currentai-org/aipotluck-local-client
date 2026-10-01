@@ -559,11 +559,12 @@ def _benchmark_model(
     port = llama_cfg.get("port", DEFAULT_PORT)
     base_url = f"http://{host}:{port}"
 
-    # Free the router's loaded model first. Under --models-max 1 it is holding a full model's worth
-    # of memory, and llama-bench is about to load its own copy on top -- on a 16GB Jetson that was
-    # an outright allocation failure (NvMapMemAllocInternalTagged error 12), not merely slow. The
-    # router reloads on the next request, and it would have had to swap for this model anyway.
-    model_perf_live.unload_model(base_url, model_id)
+    # Free whatever the router is holding -- not just this model. Under --models-max 1 it keeps one
+    # whole model resident, and llama-bench is about to load its own copy on top; on a 16GB Jetson
+    # that was an outright allocation failure (NvMapMemAllocInternalTagged error 12) for models that
+    # benchmark fine on an idle box. Unloading only the target is not enough, because the router is
+    # frequently holding a different one. It reloads on the next request.
+    model_perf_live.free_router_memory(base_url)
 
     if not model_perf.wait_until_idle():
         log.warning(
