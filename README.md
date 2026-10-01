@@ -489,7 +489,14 @@ web-search grounding fires, 32k+ with an attached file).
 types and GPU-layer count the preset will actually serve at, and fits per-token cost as a straight
 line in KV-cache depth. The grade then answers the question users actually feel: **how much
 thinking and answer arrives before the stream is cut off**. `N_out` is the number of output tokens
-that fit in the budget, priced at this model's full context depth -- the slowest it will ever run.
+that fit in the budget, priced at a 32k-token context -- a long-but-plausible conversation, and the
+same depth for every model so the numbers compare.
+
+Pricing each model at its *own* full context instead is accurate and was tried: verified on a
+Jetson, a 3B really does fall to 3 tok/s once 131k tokens are in its KV cache. But no conversation
+gets there, and it quietly re-created the inversion this scheme exists to remove -- that 3B lost
+two thirds of its score against an otherwise-worse 32k model, so the grade tracked the sizing
+decision rather than the model.
 
 ```
 GREEN   N_out >= 4,096    never cut off in practice
@@ -524,6 +531,10 @@ for being large-context, the exact inversion this scheme exists to remove.
 
 Two details worth knowing, both of which came out of measuring real hardware rather than reasoning:
 
+- **The depth fit holds up a long way out.** Checked against real `llama-bench` runs on a Jetson,
+  a line fitted from depths 512 and 4096 predicted the measured cost at 16k within 1.1% and at 32k
+  within 1.8% -- an 8x extrapolation. That is why the grading depth can sit at 32k without needing
+  a 32k-deep probe every time.
 - **The shallow measurement is taken at depth 512, not 0.** Decode cost per token nearly doubles
   over the first few hundred tokens and then flattens (17.3ms at depth 0 vs 32.8ms at 512 and
   33.9ms at 1024, measured on a CPU-only laptop), because generating at depth 0 does almost no

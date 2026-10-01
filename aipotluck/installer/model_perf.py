@@ -124,6 +124,19 @@ CONTEXT_RED_MIN = 4_096       # 4k-16k: at most red
 # scheme exists to remove. Context still derates the grade, through decode depth and the cap above.
 ASSUMED_PREFILL_TOKENS = 2_048
 
+# The context depth generation is priced at. NOT each model's own full context, which is accurate
+# but describes a turn nobody has: verified on a Jetson, a 3B really does fall to 3 tok/s once
+# 131k tokens are actually in its KV cache, but no conversation gets there. Pricing every model at
+# its own maximum also re-introduced the very inversion this scheme exists to remove -- a 131k
+# model lost two thirds of its score against an otherwise-worse 32k one, so the grade tracked the
+# sizing decision rather than the model.
+#
+# 32k is a long-but-plausible conversation (roughly an attached-file turn), it keeps every model on
+# the same footing, and it stays close to measured ground: the linear depth fit was checked against
+# real llama-bench runs at 16k and 32k and came back within 2%. Context has not stopped counting --
+# it still slows every token up to this depth, and it still caps the grade outright.
+GRADING_DECODE_DEPTH = 32_768
+
 GRADE_GREEN = "green"
 GRADE_YELLOW = "yellow"
 GRADE_RED = "red"
@@ -314,13 +327,18 @@ def decode_ms_per_token(fit: PerfFit, depth: int) -> float:
     return fit.decode_base_ms + fit.decode_depth_ms * depth
 
 
-def solve_n_out(fit: PerfFit, budget_ms: float, ctx_size: int) -> int:
-    """How many output tokens fit in `budget_ms`, generating at the model's full context depth.
+def grading_decode_depth(ctx_size: int) -> int:
+    """The depth generation is priced at: a long-but-plausible conversation, or the whole context
+    when the model cannot even hold that much."""
+    return min(GRADING_DECODE_DEPTH, ctx_size)
 
-    Generation is modelled at a constant rate for the whole reply, taken at `ctx_size` -- the
-    slowest depth a turn on this model ever reaches. Integrating upward from there would charge for
-    depth beyond the context window, which cannot happen; a prompt long enough to sit at `ctx_size`
-    leaves no room to generate past it.
+
+def solve_n_out(fit: PerfFit, budget_ms: float, ctx_size: int) -> int:
+    """How many output tokens fit in `budget_ms`, generating at `grading_decode_depth(ctx_size)`.
+
+    Generation is modelled at a constant rate for the whole reply. Integrating upward from the
+    starting depth would charge for depth the reply may never reach, and the point here is a
+    comparable figure rather than a worst case already covered by the safety factor.
 
     Returns 0 when the cold load plus the turn's prefill already exhaust the budget -- there is no
     answer at all in that case, not a short one.
@@ -332,7 +350,7 @@ def solve_n_out(fit: PerfFit, budget_ms: float, ctx_size: int) -> int:
     remaining = budget_ms - fit.load_ms - prefill
     if remaining <= 0:
         return 0
-    per_token = decode_ms_per_token(fit, ctx_size)
+    per_token = decode_ms_per_token(fit, grading_decode_depth(ctx_size))
     if per_token <= 0:
         return _UNBOUNDED_TOKENS
     return max(0, int(remaining / per_token))
@@ -366,7 +384,9 @@ def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
     if capped_by_confidence:
         grade = GRADE_YELLOW
 
-    decode_tps = 1000.0 / decode_ms_per_token(fit, ctx_size) if decode_ms_per_token(fit, ctx_size) > 0 else 0.0
+    depth = grading_decode_depth(ctx_size)
+    decode_ms = decode_ms_per_token(fit, depth)
+    decode_tps = 1000.0 / decode_ms if decode_ms > 0 else 0.0
 
     if capped_by_confidence:
         reason = "measurement was too noisy or too short to certify heavy use -- re-run the benchmark when the machine is idle"
@@ -381,7 +401,7 @@ def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
             f"limits this to {context_cap}"
         )
     else:
-        reason = f"about {n_out:,} output tokens fit in the budget at a {ctx_size:,}-token context"
+        reason = f"about {n_out:,} output tokens fit in the budget, generating at a {depth:,}-token context"
 
     return PerfResult(
         n_out=n_out,

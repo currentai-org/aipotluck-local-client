@@ -201,14 +201,29 @@ class TestComputeGrade:
         live = mp.compute_grade(make_fit(tg_tps=30.0, source=mp.SOURCE_LIVE_SERVER), ctx_size=32768)
         assert live.n_out < bench.n_out
 
-    def test_the_quoted_rate_is_taken_at_the_full_context(self):
+    def test_the_quoted_rate_is_taken_at_the_grading_depth(self):
         """Generation slows with depth, so a rate quoted at depth 0 would flatter every model by
-        exactly the amount its own context costs it."""
+        exactly the amount context costs it."""
         fit = make_fit(tg_tps=100.0, tg_slope=1e-3)
         result = mp.compute_grade(fit, ctx_size=16384)
         assert result.decode_tokens_per_second == pytest.approx(
-            1000.0 / (10.0 + 1e-3 * 16384), rel=1e-6
+            1000.0 / (10.0 + 1e-3 * 16384), rel=1e-6  # ctx below the grading depth, so ctx wins
         )
+
+    def test_models_are_priced_at_the_same_depth_regardless_of_their_own_context(self):
+        """Pricing each model at its OWN full context punished it for offering a big one: on a
+        Jetson a 131k model lost two thirds of its score against an otherwise-worse 32k one, so the
+        grade tracked the sizing decision rather than the model. Same fit, different context -> the
+        bigger-context model must not score worse."""
+        fit = make_fit(tg_tps=60.0, tg_slope=5e-4)
+        small = mp.compute_grade(fit, ctx_size=mp.GRADING_DECODE_DEPTH)
+        large = mp.compute_grade(fit, ctx_size=131072)
+        assert large.n_out == small.n_out
+
+    def test_a_model_too_small_for_the_grading_depth_is_priced_at_its_own_context(self):
+        fit = make_fit(tg_tps=60.0, tg_slope=5e-4)
+        assert mp.grading_decode_depth(8192) == 8192
+        assert mp.compute_grade(fit, ctx_size=8192).n_out > mp.compute_grade(fit, ctx_size=131072).n_out
 
     def test_never_raises_on_degenerate_input(self):
         degenerate = mp.PerfFit(0.0, 0.0, 0.0, 0.0, 0.0, mp.SOURCE_LLAMA_BENCH, mp.CONFIDENCE_OK)
@@ -319,10 +334,10 @@ class TestProbePerformance:
         assert result.fit.decode_depth_ms == pytest.approx(0.001, rel=1e-6)
         assert result.fit.prefill_base_ms == pytest.approx(2.0, rel=1e-6)
         assert result.fit.prefill_depth_ms == pytest.approx(0.0002, rel=1e-6)
-        # The quoted rate is taken at the model's full context -- the slowest depth a turn ever
-        # reaches -- not at the fit's depth-0 intercept (50 tok/s here), which would flatter every
-        # model by exactly the amount its own context costs it.
-        expected = 1000.0 / (20.0 + 0.001 * 131072)
+        # The quoted rate is taken at the depth the grade is priced at, not at the fit's depth-0
+        # intercept (50 tok/s here), which would flatter every model by exactly the amount context
+        # costs it.
+        expected = 1000.0 / (20.0 + 0.001 * mp.grading_decode_depth(131072))
         assert result.decode_tokens_per_second == pytest.approx(expected, rel=1e-6)
         assert result.decode_tokens_per_second < 50.0
 
