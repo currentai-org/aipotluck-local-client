@@ -348,7 +348,7 @@ class TestProbePerformance:
         precisely because a real measurement can only be worse."""
         argv_log = tmp_path / "argv.jsonl"
         monkeypatch.setenv("FAKE_BENCH_ARGV_LOG", str(argv_log))
-        monkeypatch.setenv("FAKE_BENCH_TG_BASE", "600.0")  # ~1.7 tok/s
+        monkeypatch.setenv("FAKE_BENCH_TG_BASE", "1500.0")  # ~0.7 tok/s
 
         result = mp.probe_performance(fake_bench, "org/repo:Q4_K_M", ctx_size=131072, budget_seconds=600)
 

@@ -75,11 +75,15 @@ log = logging.getLogger("aipotluck.installer.model_perf")
 # The web app's generation budget -- see module docstring for the derivation. Not 160_000.
 TURN_BUDGET_MS = 155_000.0
 
-# What the web app currently requests as a ceiling per reply (GROUNDED_DECODING.max_tokens,
-# overriding any model config). Kept as a documented fact rather than used in the grade: the
-# thresholds above deliberately reach past it, because a model that can only just manage 1024
-# tokens has no headroom for a reasoning model's thinking tokens or for that cap ever being raised.
-# A model graded red can still serve today's 1024-token replies; it simply cannot do more.
+# The ceiling the web app requests per reply (GROUNDED_DECODING.max_tokens, merged over any model
+# config so it always wins). Verified against a real llama.cpp server: it honours the cap exactly
+# (predicted_n == max_tokens, finish_reason "length"), and hitting it is handled gracefully --
+# the app appends a "say continue for the rest" notice rather than ending mid-thought.
+#
+# It is a REQUEST, not a contract: the app imposes no cap of its own on what it will accept, so a
+# local server that ignored max_tokens would be bounded only by the 155s watchdog. For grading
+# purposes the compliant case is the one that matters, and it makes this the natural green line --
+# a model that can deliver this many tokens in budget is never cut off by time.
 APP_REQUESTED_MAX_OUTPUT_TOKENS = 1024
 
 # Applied to the predicted turn time before comparing it to the budget. It is not padding: the
@@ -102,9 +106,13 @@ SAFETY_FACTOR_LIVE = 1.75
 # before the stream is cut off. Prefill is cheap next to generation, so grading on how big an input
 # fits made the verdict mostly a restatement of the context size; this asks the question users care
 # about instead -- how long an answer arrives intact.
-OUTPUT_GREEN_MIN = 4_096   # never cut off in practice
-OUTPUT_YELLOW_MIN = 1_536  # fine for shorter queries
-OUTPUT_RED_MIN = 250       # only a simple, direct answer
+# Green is pinned to the app's own cap rather than chosen independently: at this many tokens the
+# model delivers the longest reply the app will ever ask for, so time never cuts it off and the
+# only limit left is the app's, which is graceful. Below that, the fractions mark how much of a
+# reply survives -- most of one, a short direct answer, or not even that.
+OUTPUT_GREEN_MIN = APP_REQUESTED_MAX_OUTPUT_TOKENS  # a full uncut reply
+OUTPUT_YELLOW_MIN = 400    # most answers land intact; a long one gets cut
+OUTPUT_RED_MIN = 100       # only a brief, direct answer
                            # below OUTPUT_RED_MIN: cannot answer at all, refused
 
 # Context size separately caps the grade, since a model that generates fast is still limited by how
