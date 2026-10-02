@@ -1,15 +1,15 @@
 {
   "_comment": "Pinned fosrl/newt release (Pangolin's tunnel client, CUR-1266). Bump deliberately, same way llama_version.json is bumped. sha256s computed by us at pin time -- newt's GitHub releases publish no checksums file. UNLIKE llama.cpp, these assets are single raw binaries, not tar.gz/zip archives -- no extraction step, just download + verify + chmod +x. Only linux-x64/linux-arm64 checksums have actually been downloaded and verified (this pin's local-dev/test target); darwin/windows entries are the real published filenames/URLs but their sha256 is a placeholder that MUST be verified (download once, compute sha256, replace) before relying on them -- see aipotluck/installer/newt_fetch.py's own warning on an unverified entry.",
-  "tag": "1.17.0",
+  "tag": "1.18.1",
   "release_base_url": "https://github.com/fosrl/newt/releases/download",
   "assets": {
     "linux-x64": {
       "file": "newt_linux_amd64",
-      "sha256": "70e05d107eeb0a866710948e6787de7e00e20382e880fb0c7e8191a63264f10c"
+      "sha256": "26deaf4478375b1f7380c4b8be18c8266ab4c476c6d5715972d629a512915832"
     },
     "linux-arm64": {
       "file": "newt_linux_arm64",
-      "sha256": "4fd90ba87bcd6d4a177176a2b2d6088ad110a8d88b1d3dcc34ca1e5c1db8b70b"
+      "sha256": "4def626ea3a7c25591e00855c32f5456295a871590571958d28ce470831d9952"
     },
     "macos-x64": {
       "file": "newt_darwin_amd64",
