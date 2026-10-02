@@ -29,28 +29,25 @@ def run_bench(binary, model, args, timeout):
     return json.JSONDecoder().raw_decode(out[out.index("["):])[0]
 
 def reference(binary, model, reps, timeout):
-    """Every scenario measured: pp from a prompt-only test, generation from a -pg test with the
-    prefill time subtracted out, which is exactly how LocalScore splits them."""
+    """Every scenario measured directly. prompt_tps from a prompt-only test; gen_tps from a
+    generation test with the KV cache pre-filled to that scenario's prompt length via -d, which is
+    where its generation actually happens."""
     prompts = sorted({p for p, _ in PAIRS})
-    args = ["-p", ",".join(map(str, prompts)), "-n", "0", "-d", "0", "-r", str(reps)]
-    for p, g in PAIRS:
-        args += ["-pg", f"{p},{g}"]
-    rows = run_bench(binary, model, args, timeout)
+    pp_rows = run_bench(binary, model, ["-p", ",".join(map(str, prompts)), "-n", "0", "-d", "0",
+                                        "-r", str(reps)], timeout)
+    pp_by_p = {r["n_prompt"]: r["avg_ts"] for r in pp_rows if r["n_gen"] == 0}
 
-    pp_by_p, pg_by_pair = {}, {}
-    for r in rows:
-        if r["n_gen"] == 0:
-            pp_by_p[r["n_prompt"]] = r["avg_ts"]
-        else:
-            pg_by_pair[(r["n_prompt"], r["n_gen"])] = r["avg_ts"]
+    gen_by_pair = {}
+    for P, G in PAIRS:
+        rows = run_bench(binary, model, ["-p", "0", "-n", str(G), "-d", str(P), "-r", str(reps)], timeout)
+        gen_by_pair[(P, G)] = next(r["avg_ts"] for r in rows if r["n_gen"])
 
     pps, gens, ttfts = [], [], []
-    for p, g in PAIRS:
-        pp = pp_by_p[p]
-        prefill_ms = p / pp * 1000.0
-        total_ms = (p + g) / pg_by_pair[(p, g)] * 1000.0
-        gen_ms = max(total_ms - prefill_ms, 1e-6)
-        pps.append(pp); gens.append(g / gen_ms * 1000.0); ttfts.append(prefill_ms)
+    for P, G in PAIRS:
+        pp = pp_by_p[P]
+        pps.append(pp)
+        gens.append(gen_by_pair[(P, G)])
+        ttfts.append(P / pp * 1000.0)
     return score(pps, gens, ttfts), list(zip(PAIRS, pps, gens, ttfts))
 
 def fit(x0, y0, x1, y1):
@@ -59,27 +56,31 @@ def fit(x0, y0, x1, y1):
     slope = (y1 - y0) / (x1 - x0)
     return y0 - slope*x0, max(slope, 0.0)
 
-def fast(binary, model, probes, gen_tokens, reps, timeout):
-    """Four measurements -> a prefill line and a decode line -> all nine scenarios in closed form."""
-    p_lo, p_hi = probes
-    args = ["-p", f"{p_lo},{p_hi}", "-n", "0", "-d", "0", "-r", str(reps)]
-    args += ["-pg", f"{p_lo},{gen_tokens}", "-pg", f"{p_hi},{gen_tokens}"]
-    rows = run_bench(binary, model, args, timeout)
+def fast(binary, model, prompt_len, depths, gen_tokens, reps, timeout):
+    """One model load, four measurements: a prompt test and a generation test at each of two KV
+    depths. Both costs are linear in depth, so two points fix each line and all nine scenarios
+    follow in closed form.
 
-    pp, pg = {}, {}
+    Generation is measured with -d rather than derived by subtracting prefill from a combined -pg
+    run. The subtraction is badly conditioned -- at a 2048-token prompt the prefill is ~20s against
+    ~1s of generation, so a 5% prefill error lands as an ~80% error on the generation estimate, and
+    it did: it put this laptop at 13 tok/s where it really does 26-55."""
+    d_lo, d_hi = depths
+    rows = run_bench(binary, model, [
+        "-p", str(prompt_len), "-n", str(gen_tokens), "-d", f"{d_lo},{d_hi}", "-r", str(reps),
+    ], timeout)
+
+    pp, gen = {}, {}
     for r in rows:
-        (pp if r["n_gen"] == 0 else pg)[r["n_prompt"]] = r["avg_ts"]
+        (pp if r["n_gen"] == 0 else gen)[r["n_depth"]] = r["avg_ts"]
 
-    # prefill cost per token at prompt length P averages c + e*(P/2)
-    c, e_half = fit(p_lo/2, 1000.0/pp[p_lo], p_hi/2, 1000.0/pp[p_hi])
-    def prefill_ms(P): return (c + e_half*(P/2)) * P
+    # A prompt test at depth d spans depths d..d+prompt_len, so its representative depth is the
+    # midpoint; same for a generation test over its own span.
+    c, e = fit(d_lo + prompt_len/2, 1000.0/pp[d_lo], d_hi + prompt_len/2, 1000.0/pp[d_hi])
+    a, b = fit(d_lo + gen_tokens/2, 1000.0/gen[d_lo], d_hi + gen_tokens/2, 1000.0/gen[d_hi])
 
-    # decode cost per token at depth d is a + b*d; recover it by removing the prefill time
-    def gen_ms_per_tok(P):
-        total = (P + gen_tokens) / pg[P] * 1000.0
-        return max(total - prefill_ms(P), 1e-6) / gen_tokens
-    a, b = fit(p_lo + gen_tokens/2, gen_ms_per_tok(p_lo),
-               p_hi + gen_tokens/2, gen_ms_per_tok(p_hi))
+    def prefill_ms(P):
+        return (c + e*(P/2)) * P      # integrate c + e*d over 0..P
 
     pps, gens, ttfts = [], [], []
     for P, G in PAIRS:
@@ -87,13 +88,14 @@ def fast(binary, model, probes, gen_tokens, reps, timeout):
         pps.append(P / pre * 1000.0)
         gens.append(1000.0 / (a + b*(P + G/2)))
         ttfts.append(pre)
-    return score(pps, gens, ttfts), {"c": c, "e": e_half*2, "a": a, "b": b}
+    return score(pps, gens, ttfts), {"c": c, "e": e, "a": a, "b": b}
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True); ap.add_argument("--model", required=True)
     ap.add_argument("--mode", choices=["reference", "fast"], required=True)
-    ap.add_argument("--probes", default="256,2048")
+    ap.add_argument("--prompt-len", type=int, default=512)
+    ap.add_argument("--depths", default="0,1024")
     ap.add_argument("--gen-tokens", type=int, default=32)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--timeout", type=float, default=3600)
@@ -105,8 +107,9 @@ def main():
         extra = {"scenarios": [{"prompt": p, "gen": g, "pp_tps": x, "gen_tps": y, "ttft_ms": z}
                                for (p, g), x, y, z in detail]}
     else:
-        lo, hi = (int(v) for v in a.probes.split(","))
-        (s, pp, gen, ttft), extra = fast(a.binary, a.model, (lo, hi), a.gen_tokens, a.reps, a.timeout)
+        lo, hi = (int(v) for v in a.depths.split(","))
+        (s, pp, gen, ttft), extra = fast(a.binary, a.model, a.prompt_len, (lo, hi),
+                                         a.gen_tokens, a.reps, a.timeout)
         extra = {"fit": extra}
     print(json.dumps({"mode": a.mode, "score": s, "avg_pp_tps": pp, "avg_gen_tps": gen,
                       "avg_ttft_ms": ttft, "wall_seconds": time.monotonic()-t0, **extra}, indent=2))

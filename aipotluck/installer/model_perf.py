@@ -473,13 +473,15 @@ def build_bench_command(
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
     gpu_layers: str | int | None = None,
+    n_prompt: int = _BENCH_N_PROMPT,
+    n_gen: int = _BENCH_N_GEN,
 ) -> list[str]:
     """The benchmark must run at the same operating point llama-server will actually serve at, so
     the K/V cache types and GPU-layer count come from this model's preset rather than from
     llama-bench's defaults. Thread count is deliberately omitted -- see the module docstring."""
     cmd = [
         str(bench_binary), "-hf", model_id, "--offline",
-        "-p", str(_BENCH_N_PROMPT), "-n", str(_BENCH_N_GEN), "-d", str(depth),
+        "-p", str(n_prompt), "-n", str(n_gen), "-d", str(depth),
         "-r", str(_BENCH_REPETITIONS), "-o", "json",
     ]
     if cache_type_k:
@@ -502,6 +504,8 @@ def run_bench_point(
     cache_type_v: str | None = None,
     gpu_layers: str | int | None = None,
     timeout: float,
+    n_prompt: int = _BENCH_N_PROMPT,
+    n_gen: int = _BENCH_N_GEN,
 ) -> tuple[BenchPoint, dict]:
     """Runs llama-bench once at `depth`. One invocation yields both a prompt-processing and a
     token-generation test, so both rates come from a single model load. Returns the point and the
@@ -510,6 +514,7 @@ def run_bench_point(
     cmd = build_bench_command(
         bench_binary, model_id, depth=depth,
         cache_type_k=cache_type_k, cache_type_v=cache_type_v, gpu_layers=gpu_layers,
+        n_prompt=n_prompt, n_gen=n_gen,
     )
     log.info("Benchmarking %s at depth %d", model_id, depth)
     try:
