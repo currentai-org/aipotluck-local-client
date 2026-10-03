@@ -9,7 +9,23 @@ NOT comparable to scores on localscore.ai: the official binary is pinned to llam
 and the scenarios are LocalScore's; the engine is ours, and is reported alongside the score.
 """
 from __future__ import annotations
-import argparse, json, subprocess, sys, time
+import argparse, json, os, subprocess, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from aipotluck.installer import model_localscore  # noqa: E402
+
+
+def _rate(r):
+    """Median of the per-repetition samples rather than llama-bench's mean. On a thermally
+    unstable laptop, three single-rep probes of one model scored 62/51/56 against a reference of
+    64 -- that spread is the machine, and a mean carries its outlier into the fit."""
+    samples = r.get("samples_ns") or []
+    if not samples:
+        return r["avg_ts"]
+    ordered = sorted(float(x) for x in samples)
+    mid = len(ordered)//2
+    median_ns = ordered[mid] if len(ordered) % 2 else (ordered[mid-1]+ordered[mid])/2
+    return (r["n_prompt"] or r["n_gen"]) / (median_ns / 1e9)
 
 # LocalScore's nine scenarios, verbatim from localscore.cpp (prompt, generate).
 PAIRS = [(1024,16),(4096,256),(2048,256),(2048,768),(1024,1024),(1280,3072),(384,1152),(64,1024),(16,1536)]
@@ -50,51 +66,43 @@ def reference(binary, model, reps, timeout):
         ttfts.append(P / pp * 1000.0)
     return score(pps, gens, ttfts), list(zip(PAIRS, pps, gens, ttfts))
 
-def fit(x0, y0, x1, y1):
-    if x1 == x0:
-        return y0, 0.0
-    slope = (y1 - y0) / (x1 - x0)
-    return y0 - slope*x0, max(slope, 0.0)
+def fast(binary, model, prefill_anchors, depths, gen_tokens, reps, timeout):
+    """One model load. Prefill is MEASURED at several prompt lengths and interpolated between them;
+    decode is fitted as a line in KV depth, which it genuinely is.
 
-def fast(binary, model, prompt_len, depths, gen_tokens, reps, timeout):
-    """One model load, four measurements: a prompt test and a generation test at each of two KV
-    depths. Both costs are linear in depth, so two points fix each line and all nine scenarios
-    follow in closed form.
-
-    Generation is measured with -d rather than derived by subtracting prefill from a combined -pg
-    run. The subtraction is badly conditioned -- at a 2048-token prompt the prefill is ~20s against
-    ~1s of generation, so a 5% prefill error lands as an ~80% error on the generation estimate, and
-    it did: it put this laptop at 13 tok/s where it really does 26-55."""
+    Prefill is not fitted to a line because it is not one: fixed per-call overhead inflates tiny
+    prompts (Jetson: 6.93 ms/token at 16 against 1.22 at 384) and CPU prefill steps at llama.cpp's
+    default n_ubatch of 512 (laptop: 4.33 at 384 against 9.37 at 1024). A straight line through two
+    points gave -12% on a laptop and +3% on a Jetson -- wrong on both, cancelling on one.
+    """
     d_lo, d_hi = depths
     rows = run_bench(binary, model, [
-        "-p", str(prompt_len), "-n", str(gen_tokens), "-d", f"{d_lo},{d_hi}", "-r", str(reps),
+        "-p", ",".join(str(a) for a in prefill_anchors), "-n", "0", "-d", "0", "-r", str(reps),
     ], timeout)
+    prefill = {r["n_prompt"]: _rate(r) for r in rows if r["n_gen"] == 0}
 
-    pp, gen = {}, {}
-    for r in rows:
-        (pp if r["n_gen"] == 0 else gen)[r["n_depth"]] = r["avg_ts"]
+    rows = run_bench(binary, model, [
+        "-p", "0", "-n", str(gen_tokens), "-d", f"{d_lo},{d_hi}", "-r", str(reps),
+    ], timeout)
+    gen = {r["n_depth"]: _rate(r) for r in rows if r["n_gen"]}
 
-    # A prompt test at depth d spans depths d..d+prompt_len, so its representative depth is the
-    # midpoint; same for a generation test over its own span.
-    c, e = fit(d_lo + prompt_len/2, 1000.0/pp[d_lo], d_hi + prompt_len/2, 1000.0/pp[d_hi])
-    a, b = fit(d_lo + gen_tokens/2, 1000.0/gen[d_lo], d_hi + gen_tokens/2, 1000.0/gen[d_hi])
+    y0, y1 = 1000.0/gen[d_lo], 1000.0/gen[d_hi]
+    x0, x1 = d_lo + gen_tokens/2, d_hi + gen_tokens/2
+    b = max((y1 - y0) / (x1 - x0), 0.0) if x1 != x0 else 0.0
+    a = y0 - b*x0
 
-    def prefill_ms(P):
-        return (c + e*(P/2)) * P      # integrate c + e*d over 0..P
-
-    pps, gens, ttfts = [], [], []
-    for P, G in PAIRS:
-        pre = prefill_ms(P)
-        pps.append(P / pre * 1000.0)
-        gens.append(1000.0 / (a + b*(P + G/2)))
-        ttfts.append(pre)
-    return score(pps, gens, ttfts), {"c": c, "e": e, "a": a, "b": b}
+    cost = model_localscore.CostModel({P: 1000.0/t for P, t in prefill.items()}, a, b)
+    r = model_localscore.localscore(cost)
+    return (r.score, r.avg_prompt_tps, r.avg_gen_tps, r.avg_ttft_ms), {
+        "prefill_ms_per_token": cost.prefill_ms_per_token,
+        "decode_base_ms": a, "decode_depth_ms": b, "band": r.band,
+    }
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True); ap.add_argument("--model", required=True)
     ap.add_argument("--mode", choices=["reference", "fast"], required=True)
-    ap.add_argument("--prompt-len", type=int, default=512)
+    ap.add_argument("--prefill-anchors", default="16,64,1024")
     ap.add_argument("--depths", default="0,1024")
     ap.add_argument("--gen-tokens", type=int, default=32)
     ap.add_argument("--reps", type=int, default=2)
@@ -108,9 +116,10 @@ def main():
                                for (p, g), x, y, z in detail]}
     else:
         lo, hi = (int(v) for v in a.depths.split(","))
-        (s, pp, gen, ttft), extra = fast(a.binary, a.model, a.prompt_len, (lo, hi),
+        anchors = [int(v) for v in a.prefill_anchors.split(",")]
+        (s, pp, gen, ttft), extra = fast(a.binary, a.model, anchors, (lo, hi),
                                          a.gen_tokens, a.reps, a.timeout)
-        extra = {"fit": extra}
+
     print(json.dumps({"mode": a.mode, "score": s, "avg_pp_tps": pp, "avg_gen_tps": gen,
                       "avg_ttft_ms": ttft, "wall_seconds": time.monotonic()-t0, **extra}, indent=2))
 

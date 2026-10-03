@@ -109,3 +109,21 @@ class TestReporting:
         assert result.elapsed_seconds >= 0
         assert result.projected_turn_ms is not None
         assert isinstance(result.measured, bool)
+
+
+class TestPrefillRegime:
+    def test_the_probe_prompt_sits_in_the_same_regime_it_extrapolates_into(self):
+        """Prefill cost per token is not flat across prompt lengths -- llama.cpp's default n_ubatch
+        is 512 and CPU prefill steps there. Measured on an i7: 4.33 ms/token at a 384-token prompt
+        against 10.05 at 2048. A probe below the step understates the 2048-token case by ~2.3x, and
+        understating is the dangerous direction for a gate: it passes models that should fail."""
+        assert ms._PROBE_PROMPT >= 512, "probe must be past llama.cpp's default n_ubatch"
+        assert ms._PROBE_PROMPT <= ms.MIN_PROMPT_TOKENS, "and must not cost more than the case it screens"
+
+    def test_a_model_just_past_the_limit_is_rejected_not_waved_through(self, fake_bench, monkeypatch):
+        """The regression this guards: with a probe in the wrong regime the projection came in low
+        and a model over the budget looked fine."""
+        monkeypatch.setenv("FAKE_BENCH_PP_BASE", "90.0")   # 2048 tokens of prompt alone ~184s
+        monkeypatch.setenv("FAKE_BENCH_TG_BASE", "50.0")
+        result = ms.screen_model(fake_bench, "org/repo:Q4_K_M", ctx_size=32768)
+        assert result.rejected and result.reason_code == ms.REJECT_TOO_SLOW

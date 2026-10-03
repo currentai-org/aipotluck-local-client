@@ -47,10 +47,16 @@ MIN_CONTEXT_TOKENS = 2_048
 # Inside this band the verdict is bought with a real measurement instead of guessed.
 _DECISIVE_MARGIN = 1.5
 
-# Shape of the cheap probe. Small enough to finish in seconds on hardware that has no hope.
-_PROBE_PROMPT = 256
+# Shape of the cheap probe. The prompt length is deliberately 1024 rather than something smaller:
+# prefill cost per token is NOT flat across prompt lengths, and a short probe lands in a different
+# regime from the 2048-token prompt this screen is about. Measured on an i7 laptop, prefill is
+# 4.33 ms/token at a 384-token prompt and 10.05 at 2048 -- llama.cpp's default n_ubatch is 512 and
+# the step sits right there. Projecting the 2048 case from a 256-token probe therefore understated
+# it by about 2.3x, in the optimistic direction, which is the wrong way for a gate to be wrong.
+# 1024 is on the far side of that step (9.37 ms/token) and costs half as much as measuring 2048.
+_PROBE_PROMPT = 1024
 _PROBE_GEN = 16
-_PROBE_DEPTH = 256
+_PROBE_DEPTH = 1024
 
 REJECT_WONT_LOAD = "wont_load"
 REJECT_CONTEXT_TOO_SMALL = "context_too_small"

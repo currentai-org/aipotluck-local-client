@@ -495,6 +495,48 @@ def build_bench_command(
     return cmd
 
 
+def run_bench_raw(bench_binary: Path, model_id: str, args: list[str], *, timeout: float) -> list[dict]:
+    """Runs llama-bench with explicit arguments and returns its parsed JSON rows. The generic form
+    behind run_bench_point, for callers that need several prompt lengths or depths from one model
+    load rather than a single point."""
+    cmd = [str(bench_binary), "-hf", model_id, "--offline", "-o", "json"] + args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ModelPerfError(f"llama-bench timed out after {timeout:.0f}s") from exc
+    if proc.returncode != 0:
+        raise ModelPerfError(f"llama-bench exited {proc.returncode}:\n{(proc.stderr or '')[-2000:]}")
+    return _parse_bench_output(proc.stdout)
+
+
+def median_rate(entry: dict) -> float:
+    """Tokens per second from the MEDIAN repetition, not llama-bench's mean.
+
+    On a thermally unstable laptop three probes of one model scored 62/51/56 against a reference of
+    64 -- that spread is the machine, and a mean carries its outlier straight into the fit."""
+    samples = [float(x) for x in (entry.get("samples_ns") or [])]
+    if not samples:
+        return float(entry["avg_ts"])
+    samples.sort()
+    mid = len(samples) // 2
+    median_ns = samples[mid] if len(samples) % 2 else (samples[mid-1] + samples[mid]) / 2
+    tokens = entry["n_prompt"] or entry["n_gen"]
+    return tokens / (median_ns / 1e9) if median_ns else float(entry["avg_ts"])
+
+
+def sample_spread(entry: dict) -> float:
+    """Relative spread across repetitions, as a fraction of the median. The signal for a device
+    whose own performance is moving under us -- a laptop measured 32% slower after sustained load
+    than when cool, which is three times the error of the projection it feeds."""
+    samples = [float(x) for x in (entry.get("samples_ns") or [])]
+    if len(samples) < 2:
+        return 0.0
+    samples.sort()
+    mid = len(samples) // 2
+    median_ns = samples[mid] if len(samples) % 2 else (samples[mid-1] + samples[mid]) / 2
+    return (samples[-1] - samples[0]) / median_ns if median_ns else 0.0
+
+
 def run_bench_point(
     bench_binary: Path,
     model_id: str,
