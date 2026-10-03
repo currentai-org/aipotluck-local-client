@@ -35,6 +35,7 @@ schema records it.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 
@@ -197,6 +198,12 @@ DEFAULT_REPS = 3
 # -- three times this method's own error -- and no projection can be more precise than the machine.
 UNSTABLE_SPREAD = 0.20
 
+# ...and only once the spread is big enough in absolute terms to mean anything. A 256-token
+# prefill on a Jetson GPU runs in ~77ms, where scheduler jitter routinely clears 65% relative
+# while being tens of milliseconds absolute. Without this floor every fast device declares itself
+# thermally unstable, which is the opposite of the truth.
+UNSTABLE_SPREAD_MS = 250.0
+
 CONFIDENCE_OK = "ok"
 CONFIDENCE_LOW = "low"
 
@@ -210,6 +217,7 @@ def probe_cost_model(
     gpu_layers: str | int | None = None,
     reps: int = DEFAULT_REPS,
     timeout: float = 600.0,
+    budget_seconds: float = 60.0,
 ) -> CostModel:
     """Measures this model on this device: prefill at several prompt lengths, decode at two depths.
 
@@ -217,6 +225,12 @@ def probe_cost_model(
     the numbers mean the same thing. The cost is that a passively-cooled device scores its peak
     rather than its sustained rate -- which is why the spread across repetitions is carried out as
     a confidence signal rather than averaged away.
+
+    Repetitions adapt to what the first measurement reveals. A 14B on a Jetson took 130s at three
+    repetitions where a 0.5B took 8s, because the cost is set by the model's own speed; spending
+    the same number of passes on both misses the budget for exactly the models that need it most.
+    The prefill pass goes first, times itself, and the decode pass takes however many repetitions
+    still fit.
     """
     from aipotluck.installer import model_perf
 
@@ -230,7 +244,8 @@ def probe_cost_model(
             args += ["-ngl", str(gpu_layers)]
         return args
 
-    spreads: list[float] = []
+    spreads: list[tuple[float, float]] = []
+    started = time.monotonic()
 
     prompts = ",".join(str(a) for a in PREFILL_ANCHORS)
     rows = model_perf.run_bench_raw(
@@ -244,10 +259,23 @@ def probe_cost_model(
             prefill[r["n_prompt"]] = 1000.0 / model_perf.median_rate(r)
             spreads.append(model_perf.sample_spread(r))
 
+    # The prefill pass has now told us what this model costs here. Spend what is left of the
+    # budget on decode rather than a fixed number of passes.
+    elapsed = time.monotonic() - started
+    remaining = budget_seconds - elapsed
+    decode_reps = reps
+    if remaining < elapsed:          # decode costs roughly what prefill did, per repetition
+        decode_reps = 1
+    elif remaining < elapsed * 2:
+        decode_reps = min(reps, 2)
+    if decode_reps != reps:
+        log.info("Trimming the decode probe to %d repetition(s): %.0fs of the %.0fs budget is gone",
+                 decode_reps, elapsed, budget_seconds)
+
     lo, hi = DECODE_DEPTHS
     rows = model_perf.run_bench_raw(
         bench_binary, model_id,
-        ["-p", "0", "-n", str(DECODE_TOKENS), "-d", f"{lo},{hi}", "-r", str(reps)] + extra_args(),
+        ["-p", "0", "-n", str(DECODE_TOKENS), "-d", f"{lo},{hi}", "-r", str(decode_reps)] + extra_args(),
         timeout=timeout,
     )
     decode: dict[int, float] = {}
@@ -264,11 +292,13 @@ def probe_cost_model(
     slope = max((y1 - y0) / (x1 - x0), 0.0) if x1 != x0 else 0.0
     base = max(y0 - slope*x0, 0.0)
 
-    worst_spread = max(spreads) if spreads else 0.0
+    # Unstable only when the wobble is both proportionally large AND large enough to matter.
+    unstable = [rel for rel, abs_ms in spreads if rel > UNSTABLE_SPREAD and abs_ms > UNSTABLE_SPREAD_MS]
+    worst_spread = max((rel for rel, _ in spreads), default=0.0)
     return CostModel(
         prefill_ms_per_token=prefill,
         decode_base_ms=base,
         decode_depth_ms=slope,
-        confidence=CONFIDENCE_LOW if worst_spread > UNSTABLE_SPREAD else CONFIDENCE_OK,
+        confidence=CONFIDENCE_LOW if unstable else CONFIDENCE_OK,
         observed_spread=worst_spread,
     )

@@ -256,16 +256,13 @@ def runtime_params(runtime_config: dict[str, Any]) -> dict[str, Any]:
             model_view["tuning"] = tuning_by_model.get(model_id, {})
             record = graded.get(model_id)
             model_view["performance"] = {
-                "grade": record.get("grade"),
-                "n_out": record.get("n_out"),
-                "grading_depth": record.get("grading_depth"),
-                "output_grade": record.get("output_grade"),
-                "context_cap": record.get("context_cap"),
-                "decode_tokens_per_second": record.get("decode_tokens_per_second"),
-                "source": record.get("source"),
+                "localscore": record.get("localscore"),
+                "band": record.get("band"),
+                "avg_prompt_tps": record.get("avg_prompt_tps"),
+                "avg_gen_tps": record.get("avg_gen_tps"),
                 "confidence": record.get("confidence"),
+                "engine": record.get("engine"),
                 "measured_at": record.get("measured_at"),
-                "reason": record.get("reason"),
                 "stale": model_perf_store.is_stale(presets_path, record, llama_config=llama_cfg),
             } if isinstance(record, dict) else None
             models[model_id] = model_view

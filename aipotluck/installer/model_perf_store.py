@@ -30,13 +30,13 @@ import platform
 from pathlib import Path
 from typing import Any
 
-from aipotluck.installer import model_perf
+from aipotluck.installer import model_localscore
 
 log = logging.getLogger("aipotluck.installer.model_perf_store")
 
-# 2: the grade moved from "largest input that fits" to "output tokens that fit", which is a
-# different number with a different meaning -- old records are dropped rather than reinterpreted.
-SCHEMA_VERSION = 2
+# 3: a Red/Yellow/Green grade became a LocalScore value, which is a different quantity on a
+# different scale -- old records are dropped rather than reinterpreted.
+SCHEMA_VERSION = 3
 
 
 def performance_path(ini_path: Path) -> Path:
@@ -99,8 +99,10 @@ def read_record(ini_path: Path, model_id: str) -> dict[str, Any] | None:
 def write_record(
     ini_path: Path,
     model_id: str,
-    result: model_perf.PerfResult,
+    result: "model_localscore.LocalScoreResult",
     *,
+    engine: str | None = None,
+    ctx_size: int | None = None,
     llama_config: dict[str, Any] | None = None,
     preset_args: dict[str, str | None] | None = None,
     probe_seconds: float | None = None,
@@ -117,23 +119,15 @@ def write_record(
         models = {}
         data["models"] = models
     models[model_id] = {
-        "n_out": result.n_out,
-        "grade": result.grade,
-        "output_grade": result.output_grade,
-        "context_cap": result.context_cap,
-        "decode_tokens_per_second": round(result.decode_tokens_per_second, 2),
-        "ctx_size": result.ctx_size,
-        "grading_depth": result.grading_depth,
-        "reason": result.reason,
-        "source": result.fit.source,
-        "confidence": result.fit.confidence,
-        "fit": {
-            "decode_base_ms": result.fit.decode_base_ms,
-            "decode_depth_ms": result.fit.decode_depth_ms,
-            "prefill_base_ms": result.fit.prefill_base_ms,
-            "prefill_depth_ms": result.fit.prefill_depth_ms,
-            "load_ms": result.fit.load_ms,
-        },
+        "localscore": round(result.score, 1),
+        "band": result.band,
+        "avg_prompt_tps": round(result.avg_prompt_tps, 1),
+        "avg_gen_tps": round(result.avg_gen_tps, 2),
+        "avg_ttft_ms": round(result.avg_ttft_ms, 1),
+        "confidence": result.confidence,
+        "observed_spread": round(result.observed_spread, 3),
+        "engine": engine,
+        "ctx_size": ctx_size,
         "preset_hash": preset_hash(preset_args or {}),
         "probe_seconds": round(probe_seconds, 1) if probe_seconds is not None else None,
         "measured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

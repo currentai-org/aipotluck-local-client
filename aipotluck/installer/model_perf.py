@@ -84,7 +84,6 @@ TURN_BUDGET_MS = 155_000.0
 # local server that ignored max_tokens would be bounded only by the 155s watchdog. For grading
 # purposes the compliant case is the one that matters, and it makes this the natural green line --
 # a model that can deliver this many tokens in budget is never cut off by time.
-APP_REQUESTED_MAX_OUTPUT_TOKENS = 1024
 
 # Applied to the predicted turn time before comparing it to the budget. It is not padding: the
 # cost model is KNOWN to run optimistic, and this is what keeps the grade's promise true anyway.
@@ -99,59 +98,10 @@ APP_REQUESTED_MAX_OUTPUT_TOKENS = 1024
 # At the old 1.25 that left a turn at N_fit really taking ~169s against a 155s budget -- the grade
 # would have promised something false. 1.5 puts the same turn at ~141s. The validator
 # (scripts/validate_model_perf.py) gates on exactly this: real turn at N_fit must fit the budget.
-SAFETY_FACTOR_BENCH = 1.50
-SAFETY_FACTOR_LIVE = 1.75
 
-# Grade thresholds, in OUTPUT tokens: how much thinking and answer a model can actually deliver
-# before the stream is cut off. Prefill is cheap next to generation, so grading on how big an input
-# fits made the verdict mostly a restatement of the context size; this asks the question users care
-# about instead -- how long an answer arrives intact.
-# Green is pinned to the app's own cap rather than chosen independently: at this many tokens the
-# model delivers the longest reply the app will ever ask for, so time never cuts it off and the
-# only limit left is the app's, which is graceful. Below that, the fractions mark how much of a
-# reply survives -- most of one, a short direct answer, or not even that.
-OUTPUT_GREEN_MIN = APP_REQUESTED_MAX_OUTPUT_TOKENS  # a full uncut reply
-OUTPUT_YELLOW_MIN = 400    # most answers land intact; a long one gets cut
-OUTPUT_RED_MIN = 100       # only a brief, direct answer
-                           # below OUTPUT_RED_MIN: cannot answer at all, refused
 
-# Context size separately caps the grade, since a model that generates fast is still limited by how
-# much it can be told. The cap is on the EFFECTIVE context -- min(model's trained context, what
-# runtime sizing could actually afford on this device's memory) -- because a context this device
-# cannot serve is not one the user gets.
-CONTEXT_GREEN_MIN = 262_144   # above this: no cap, green is reachable
-CONTEXT_YELLOW_MIN = 16_384   # 16k-256k: at most yellow
-CONTEXT_RED_MIN = 4_096       # 4k-16k: at most red
-                              # below CONTEXT_RED_MIN: the system prompt alone does not fit, refused
 
-# What a single turn actually prefills. NOT the full context, deliberately: llama.cpp reuses the KV
-# cache across turns of a conversation, so a chat that has grown to 100k tokens pays only for the
-# new tokens each turn, not a fresh 100k prefill. Charging the full context would have cost 630s of
-# prefill for a 131k model on a Jetson -- over budget before a single token came out -- and rejected
-# every large-context model for having a large context, which is exactly the inversion this grading
-# scheme exists to remove. Context still derates the grade, through decode depth and the cap above.
-ASSUMED_PREFILL_TOKENS = 2_048
 
-# The context depth generation is priced at. NOT each model's own full context, which is accurate
-# but describes a turn nobody has: verified on a Jetson, a 3B really does fall to 3 tok/s once
-# 131k tokens are actually in its KV cache, but no conversation gets there. Pricing every model at
-# its own maximum also re-introduced the very inversion this scheme exists to remove -- a 131k
-# model lost two thirds of its score against an otherwise-worse 32k one, so the grade tracked the
-# sizing decision rather than the model.
-#
-# 32k is a long-but-plausible conversation (roughly an attached-file turn), it keeps every model on
-# the same footing, and it stays close to measured ground: the linear depth fit was checked against
-# real llama-bench runs at 16k and 32k and came back within 2%. Context has not stopped counting --
-# it still slows every token up to this depth, and it still caps the grade outright.
-GRADING_DECODE_DEPTH = 32_768
-
-GRADE_GREEN = "green"
-GRADE_YELLOW = "yellow"
-GRADE_RED = "red"
-GRADE_REFUSE = "refuse"
-
-SOURCE_LLAMA_BENCH = "llama-bench"
-SOURCE_LIVE_SERVER = "live-server"
 
 CONFIDENCE_OK = "ok"
 CONFIDENCE_LOW = "low"
@@ -175,13 +125,11 @@ _BENCH_REPETITIONS = 3
 #
 # Nothing is lost by skipping depth 0, because the web app never operates there: its system prompt
 # alone is roughly 1,450 tokens before any conversation, retrieval or attachment is added.
-_SHALLOW_DEPTH = 512
 
 
 # Second measurement point, most-preferred first. A deeper point gives a longer lever arm for the
 # depth slope; a slow device cannot afford the deepest one, and settles for less extrapolation
 # accuracy in a regime where the verdict is decided by the shallow constant term anyway.
-_CANDIDATE_DEPTHS = (4096, 2048, 1024)
 
 # Relative spread across repetitions above which the measurement is called noisy. Some other
 # process was probably competing for the machine.
@@ -205,7 +153,6 @@ _IDLE_WAIT_SECONDS = 120.0
 _IDLE_POLL_SECONDS = 5.0
 
 # Stands in for "no measurable limit from speed alone"; always clamped by ctx_size downstream.
-_UNBOUNDED_TOKENS = 1 << 30
 
 
 class ModelPerfError(RuntimeError):
@@ -231,63 +178,6 @@ class BenchPoint:
     prefill_effective_depth: float
     decode_effective_depth: float
     noisy: bool
-
-
-@dataclass
-class PerfFit:
-    """The fitted cost model. All coefficients are milliseconds; `b` and `e` are ms per token of
-    KV-cache depth."""
-
-    decode_base_ms: float  # a
-    decode_depth_ms: float  # b
-    prefill_base_ms: float  # c
-    prefill_depth_ms: float  # e
-    load_ms: float
-    source: str
-    confidence: str
-
-
-@dataclass
-class PerfResult:
-    n_out: int            # output tokens that fit in the budget, at this model's full context
-    grade: str            # the worse of output_grade and context_cap
-    output_grade: str     # what n_out alone earns
-    context_cap: str      # the best grade this effective context size allows
-    decode_tokens_per_second: float  # quoted at grading_depth, not at ctx_size
-    grading_depth: int    # the context depth n_out and the rate were priced at
-    ctx_size: int
-    fit: PerfFit
-    reason: str
-
-
-# Worst-first, so `min(..., key=GRADE_SEVERITY.get)` picks the more pessimistic of two grades.
-GRADE_SEVERITY = {GRADE_REFUSE: 0, GRADE_RED: 1, GRADE_YELLOW: 2, GRADE_GREEN: 3}
-
-
-def grade_for_output(n_out: int) -> str:
-    """Grade from how many output tokens fit in the budget."""
-    if n_out >= OUTPUT_GREEN_MIN:
-        return GRADE_GREEN
-    if n_out >= OUTPUT_YELLOW_MIN:
-        return GRADE_YELLOW
-    if n_out >= OUTPUT_RED_MIN:
-        return GRADE_RED
-    return GRADE_REFUSE
-
-
-def context_grade_cap(ctx_size: int) -> str:
-    """The best grade this effective context size can earn, however fast the model generates."""
-    if ctx_size > CONTEXT_GREEN_MIN:
-        return GRADE_GREEN
-    if ctx_size >= CONTEXT_YELLOW_MIN:
-        return GRADE_YELLOW
-    if ctx_size >= CONTEXT_RED_MIN:
-        return GRADE_RED
-    return GRADE_REFUSE
-
-
-def worst(*grades: str) -> str:
-    return min(grades, key=lambda g: GRADE_SEVERITY[g])
 
 
 def machine_is_too_busy() -> bool:
@@ -320,109 +210,9 @@ def wait_until_idle(timeout_seconds: float = _IDLE_WAIT_SECONDS) -> bool:
     return True
 
 
-def predict_turn_ms(fit: PerfFit, n_in: int, n_out: int, decode_depth: int | None = None) -> float:
-    """Predicted wall-clock for one turn: cold load, prefilling `n_in` tokens, then generating
-    `n_out` tokens. `decode_depth` is the context depth generation runs at, defaulting to `n_in`
-    -- grading passes the model's full context there, since that is the slowest depth a turn will
-    ever generate at."""
-    depth = n_in if decode_depth is None else decode_depth
-    prefill = fit.prefill_base_ms * n_in + fit.prefill_depth_ms * n_in * n_in / 2.0
-    decode = n_out * decode_ms_per_token(fit, depth)
-    return fit.load_ms + prefill + decode
-
-
 def decode_ms_per_token(fit: PerfFit, depth: int) -> float:
     """Cost of one generated token at a given KV-cache depth."""
     return fit.decode_base_ms + fit.decode_depth_ms * depth
-
-
-def grading_decode_depth(ctx_size: int) -> int:
-    """The depth generation is priced at: a long-but-plausible conversation, or the whole context
-    when the model cannot even hold that much."""
-    return min(GRADING_DECODE_DEPTH, ctx_size)
-
-
-def solve_n_out(fit: PerfFit, budget_ms: float, ctx_size: int) -> int:
-    """How many output tokens fit in `budget_ms`, generating at `grading_decode_depth(ctx_size)`.
-
-    Generation is modelled at a constant rate for the whole reply. Integrating upward from the
-    starting depth would charge for depth the reply may never reach, and the point here is a
-    comparable figure rather than a worst case already covered by the safety factor.
-
-    Returns 0 when the cold load plus the turn's prefill already exhaust the budget -- there is no
-    answer at all in that case, not a short one.
-    """
-    prefill = (
-        fit.prefill_base_ms * ASSUMED_PREFILL_TOKENS
-        + fit.prefill_depth_ms * ASSUMED_PREFILL_TOKENS * ASSUMED_PREFILL_TOKENS / 2.0
-    )
-    remaining = budget_ms - fit.load_ms - prefill
-    if remaining <= 0:
-        return 0
-    per_token = decode_ms_per_token(fit, grading_decode_depth(ctx_size))
-    if per_token <= 0:
-        return _UNBOUNDED_TOKENS
-    return max(0, int(remaining / per_token))
-
-
-def compute_grade(fit: PerfFit, ctx_size: int) -> PerfResult:
-    """Turns a fit into a verdict. Never raises -- a grading step that could itself fail would be
-    worse than the problem it exists to catch.
-
-    Two independent dimensions, and the worse one wins:
-
-    - **How much it can say.** `n_out` is the number of output tokens that fit in the budget while
-      generating at this model's full context depth. That is the question users actually feel: a
-      reply cut off mid-thought is the failure, and prefill is cheap next to generation.
-    - **How much it can be told.** `ctx_size` is the effective context -- what runtime sizing could
-      afford on this device's memory, already capped at the model's trained context. A model that
-      generates quickly is still limited by how much context it can hold, so it caps the grade.
-    """
-    safety = SAFETY_FACTOR_LIVE if fit.source == SOURCE_LIVE_SERVER else SAFETY_FACTOR_BENCH
-    effective_budget = TURN_BUDGET_MS / safety
-
-    depth = grading_decode_depth(ctx_size)
-    n_out = solve_n_out(fit, effective_budget, ctx_size)
-    output_grade = grade_for_output(n_out)
-    context_cap = context_grade_cap(ctx_size)
-    grade = worst(output_grade, context_cap)
-
-    # Green is a promise that heavy use is safe. A measurement already known to be noisy, or one
-    # taken without a depth point at all, cannot support a promise -- and a fit with no depth point
-    # has both slopes pinned at zero, which is exactly the assumption that would manufacture one.
-    capped_by_confidence = grade == GRADE_GREEN and fit.confidence == CONFIDENCE_LOW
-    if capped_by_confidence:
-        grade = GRADE_YELLOW
-
-    decode_ms = decode_ms_per_token(fit, depth)
-    decode_tps = 1000.0 / decode_ms if decode_ms > 0 else 0.0
-
-    if capped_by_confidence:
-        reason = "measurement was too noisy or too short to certify heavy use -- re-run the benchmark when the machine is idle"
-    elif n_out == 0:
-        reason = (
-            f"this device cannot load the model and prefill a turn inside the "
-            f"{effective_budget / 1000:.0f}s budget, so no answer arrives at all"
-        )
-    elif worst(output_grade, context_cap) == context_cap and context_cap != output_grade:
-        reason = (
-            f"generation is fine ({n_out:,} tokens in budget) but a {ctx_size:,}-token context "
-            f"limits this to {context_cap}"
-        )
-    else:
-        reason = f"about {n_out:,} output tokens fit in the budget, generating at a {depth:,}-token context"
-
-    return PerfResult(
-        n_out=n_out,
-        grade=grade,
-        grading_depth=depth,
-        output_grade=output_grade,
-        context_cap=context_cap,
-        decode_tokens_per_second=decode_tps,
-        ctx_size=ctx_size,
-        fit=fit,
-        reason=reason,
-    )
 
 
 def _slowest_ms(entry: dict, n_tokens: int) -> float:
@@ -524,17 +314,24 @@ def median_rate(entry: dict) -> float:
     return tokens / (median_ns / 1e9) if median_ns else float(entry["avg_ts"])
 
 
-def sample_spread(entry: dict) -> float:
-    """Relative spread across repetitions, as a fraction of the median. The signal for a device
-    whose own performance is moving under us -- a laptop measured 32% slower after sustained load
-    than when cool, which is three times the error of the projection it feeds."""
+def sample_spread(entry: dict) -> tuple[float, float]:
+    """Spread across repetitions, as (fraction of the median, absolute milliseconds).
+
+    BOTH are needed, and returning only the fraction is a mistake this project has now made twice.
+    A device moving under the measurement is the signal worth having -- a laptop measured 32%
+    slower warmed than cool. But on fast hardware an individual test is tiny: a 256-token prefill
+    on a Jetson GPU runs in ~77ms, where ordinary scheduler jitter clears 65% relative while being
+    perhaps 50ms absolute, which cannot matter to anything. Judge on the relative figure alone and
+    every fast device reports itself unstable.
+    """
     samples = [float(x) for x in (entry.get("samples_ns") or [])]
     if len(samples) < 2:
-        return 0.0
+        return 0.0, 0.0
     samples.sort()
     mid = len(samples) // 2
     median_ns = samples[mid] if len(samples) % 2 else (samples[mid-1] + samples[mid]) / 2
-    return (samples[-1] - samples[0]) / median_ns if median_ns else 0.0
+    spread_ns = samples[-1] - samples[0]
+    return (spread_ns / median_ns if median_ns else 0.0), spread_ns / 1e6
 
 
 def run_bench_point(
@@ -603,157 +400,3 @@ def _fit_line(x0: float, y0: float, x1: float, y1: float) -> tuple[float, float]
     return max(0.0, y0 - slope * x0), slope
 
 
-def fit_points(shallow: BenchPoint, deep: BenchPoint | None, load_ms: float, source: str) -> PerfFit:
-    """Builds the cost model from one or two measured points. With only the shallow point the
-    depth slopes stay at zero, which is optimistic -- callers pair that with a refusal that is
-    already decided by the depth-0 numbers alone, never with a passing grade."""
-    if deep is None:
-        prefill_base, prefill_depth = shallow.prefill_ms_per_token, 0.0
-        decode_base, decode_depth = shallow.decode_ms_per_token, 0.0
-    else:
-        prefill_base, prefill_depth = _fit_line(
-            shallow.prefill_effective_depth, shallow.prefill_ms_per_token,
-            deep.prefill_effective_depth, deep.prefill_ms_per_token,
-        )
-        decode_base, decode_depth = _fit_line(
-            shallow.decode_effective_depth, shallow.decode_ms_per_token,
-            deep.decode_effective_depth, deep.decode_ms_per_token,
-        )
-    noisy = shallow.noisy or (deep.noisy if deep else False)
-    return PerfFit(
-        decode_base_ms=decode_base,
-        decode_depth_ms=decode_depth,
-        prefill_base_ms=prefill_base,
-        prefill_depth_ms=prefill_depth,
-        load_ms=load_ms,
-        source=source,
-        confidence=CONFIDENCE_LOW if (noisy or deep is None) else CONFIDENCE_OK,
-    )
-
-
-# Enough of the file to get a stable sequential-read rate, bounded so the sample itself cannot
-# become the expensive part of the probe on slow storage.
-_LOAD_SAMPLE_MAX_BYTES = 128 * 1024 * 1024
-_LOAD_SAMPLE_MAX_SECONDS = 2.0
-_LOAD_SAMPLE_CHUNK = 4 * 1024 * 1024
-
-
-def measure_cold_load_ms(model_path: Path, model_size_bytes: int) -> float | None:
-    """Estimates how long loading this model costs from COLD storage.
-
-    This matters more than it looks. `--models-max 1` (service/runner.py) means every switch
-    between models is a fresh load, so cold is the common case rather than the tail, and that load
-    happens inside the same 155s budget the reply does. But at pull time the file was just written
-    and is sitting in the page cache, so timing a load right now would measure RAM, not disk, and
-    would understate the real cost by an order of magnitude on eMMC or SD.
-
-    So: drop the sample range from the page cache with posix_fadvise(DONTNEED) -- stdlib, and no
-    root needed -- then time a real sequential read of it and scale to the whole file. Returns
-    None where that syscall does not exist (macOS, Windows), leaving the caller to fall back.
-    """
-    fadvise = getattr(os, "posix_fadvise", None)
-    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
-    if fadvise is None or dontneed is None or model_size_bytes <= 0:
-        return None
-    try:
-        sample_target = min(model_size_bytes, _LOAD_SAMPLE_MAX_BYTES)
-        with open(model_path, "rb", buffering=0) as handle:
-            fadvise(handle.fileno(), 0, sample_target, dontneed)
-            started = time.monotonic()
-            read_bytes = 0
-            while read_bytes < sample_target:
-                chunk = handle.read(min(_LOAD_SAMPLE_CHUNK, sample_target - read_bytes))
-                if not chunk:
-                    break
-                read_bytes += len(chunk)
-                if time.monotonic() - started > _LOAD_SAMPLE_MAX_SECONDS:
-                    break
-            elapsed = time.monotonic() - started
-    except OSError as exc:
-        log.debug("Could not measure cold read rate for %s: %s", model_path, exc)
-        return None
-
-    if read_bytes <= 0 or elapsed <= 0:
-        return None
-    bytes_per_ms = read_bytes / (elapsed * 1000.0)
-    return model_size_bytes / bytes_per_ms
-
-
-def _estimated_bench_ms(depth: int, fit: PerfFit) -> float:
-    """Roughly what a llama-bench run at `depth` will cost, used only to decide whether the budget
-    can afford it. Prefilling the cache to `depth` dominates, and llama-bench pays it once per
-    repetition plus once more for its warmup run."""
-    passes = _BENCH_REPETITIONS + 1
-    prefill_tokens = depth + _BENCH_N_PROMPT
-    return (
-        fit.load_ms
-        + passes * prefill_tokens * fit.prefill_base_ms
-        + passes * _BENCH_N_GEN * fit.decode_base_ms
-    )
-
-
-def probe_performance(
-    bench_binary: Path,
-    model_id: str,
-    *,
-    ctx_size: int,
-    cache_type_k: str | None = None,
-    cache_type_v: str | None = None,
-    gpu_layers: str | int | None = None,
-    budget_seconds: float = PROBE_BUDGET_SECONDS,
-) -> PerfResult:
-    """Measures `model_id` on this device and grades it, inside `budget_seconds` of wall clock.
-
-    Adaptive by design: the shallow measurement comes first and settles the hopeless case on its
-    own, because a model that cannot emit 1024 tokens at a realistic minimum context will not be
-    saved by anything a deeper measurement could show. Only if it survives that do we spend the
-    rest of the budget on the second, deeper point that gives the depth slope its lever arm.
-    """
-    if not bench_binary.exists():
-        raise ModelPerfError(f"llama-bench binary not found at {bench_binary}")
-
-    deadline = time.monotonic() + budget_seconds
-    shallow, raw = run_bench_point(
-        bench_binary, model_id, depth=_SHALLOW_DEPTH,
-        cache_type_k=cache_type_k, cache_type_v=cache_type_v, gpu_layers=gpu_layers,
-        timeout=budget_seconds,
-    )
-
-    model_size = int(raw.get("model_size") or 0)
-    model_filename = raw.get("model_filename") or ""
-    load_ms = 0.0
-    if model_filename and model_size > 0:
-        measured = measure_cold_load_ms(Path(model_filename), model_size)
-        if measured is not None:
-            load_ms = measured
-            log.debug("Cold load estimated at %.0fms for %s", load_ms, model_id)
-
-    shallow_fit = fit_points(shallow, None, load_ms, SOURCE_LLAMA_BENCH)
-    # A shallow-only fit has no depth slope, so it OVER-estimates how much this model can generate
-    # at a deep context. If even that optimistic reading cannot reach the smallest useful answer,
-    # a deeper measurement can only confirm it -- so stop rather than spend another two minutes.
-    if solve_n_out(shallow_fit, TURN_BUDGET_MS / SAFETY_FACTOR_BENCH, ctx_size) < OUTPUT_RED_MIN:
-        log.info("%s cannot produce even a short answer in budget -- skipping the deep probe", model_id)
-        return compute_grade(shallow_fit, ctx_size)
-
-    deep: BenchPoint | None = None
-    for depth in _CANDIDATE_DEPTHS:
-        if depth <= _SHALLOW_DEPTH:
-            continue  # no lever arm for the slope
-        remaining_ms = (deadline - time.monotonic()) * 1000.0
-        if _estimated_bench_ms(depth, shallow_fit) > remaining_ms:
-            continue
-        try:
-            deep, _ = run_bench_point(
-                bench_binary, model_id, depth=depth,
-                cache_type_k=cache_type_k, cache_type_v=cache_type_v, gpu_layers=gpu_layers,
-                timeout=max(1.0, remaining_ms / 1000.0),
-            )
-        except ModelPerfError as exc:
-            log.warning("Deep probe at depth %d failed, falling back to the shallow fit: %s", depth, exc)
-        break
-
-    if deep is None:
-        log.warning("No budget left for a deep probe of %s -- grading on the depth-0 point alone", model_id)
-
-    return compute_grade(fit_points(shallow, deep, load_ms, SOURCE_LLAMA_BENCH), ctx_size)

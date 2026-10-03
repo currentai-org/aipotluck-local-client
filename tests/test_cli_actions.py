@@ -779,9 +779,9 @@ class TestRunListModels:
         # The sized model carries no sizing complaint; the unsized one says so. Both are ungraded
         # here, so both carry the "?" marker and the benchmark prompt.
         assert "org/repo:Q4_K_M" in out
-        assert "org/repo:Q4_K_M  (not sized yet" not in out
         assert "org/other:Q8_0  (not sized yet" in out
-        assert out.count("not benchmarked -- run `benchmark`") == 2
+        assert out.count("not measured -- run `benchmark`") == 2
+        assert "comparable to scores published there" in out  # the engine caveat is printed
 
     def test_no_presets_path_marks_nothing_sized(self, tmp_path, monkeypatch, capsys):
         install_dir = tmp_path / "install"
@@ -836,205 +836,6 @@ class TestRunListModels:
         assert any("not supported" in rec.message for rec in caplog.records)
 
 
-def _graded(grade: str, n_out: int = 5_000) -> "cli.model_perf.PerfResult":
-    fit = cli.model_perf.PerfFit(
-        decode_base_ms=20.0, decode_depth_ms=0.0, prefill_base_ms=2.0, prefill_depth_ms=0.0,
-        load_ms=0.0, source=cli.model_perf.SOURCE_LLAMA_BENCH, confidence=cli.model_perf.CONFIDENCE_OK,
-    )
-    return cli.model_perf.PerfResult(
-        n_out=n_out, grade=grade, output_grade=grade, context_cap=cli.model_perf.GRADE_GREEN,
-        decode_tokens_per_second=50.0, grading_depth=32768, ctx_size=131072,
-        fit=fit, reason="test reason",
-    )
-
-
-class TestPullSpeedGate:
-    """The refusal half of the speed grade. Withholding a preset would NOT be enough on its own --
-    the router auto-discovers the HF cache, so a refused model would still be listed by /v1/models
-    and selectable in the web app's picker. Deleting the cached files is the enforcement, and these
-    assert it actually happens."""
-
-    def _setup(self, tmp_path, monkeypatch, result, presets_ini=True):
-        install_dir = tmp_path / "install"
-        presets_path = tmp_path / "presets.ini"
-        if presets_ini:
-            cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "131072"})
-        write_runtime(
-            install_dir,
-            {
-                "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
-                "service": {},
-            },
-        )
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
-        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: True)
-        monkeypatch.setattr(cli, "_benchmark_model", lambda *a, **kw: result)
-        deletes = []
-        monkeypatch.setattr(
-            cli, "_delete_cached_model",
-            lambda llama_cfg, model_id: deletes.append(model_id) or True,
-        )
-        return install_dir, deletes
-
-    def test_a_refused_model_is_deleted_and_the_pull_fails(self, tmp_path, monkeypatch, capsys):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _graded(cli.model_perf.GRADE_REFUSE, 0))
-
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-
-        assert rc == 1
-        assert deletes == ["org/repo:Q4_K_M"]
-        out = capsys.readouterr().out
-        assert "too slow" in out
-        assert "--force" in out
-
-    def test_force_keeps_a_refused_model(self, tmp_path, monkeypatch, capsys):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _graded(cli.model_perf.GRADE_REFUSE, 0))
-
-        rc = cli.run_pull_model(make_pull_args(install_dir, force=True))
-
-        assert rc == 0
-        assert deletes == []
-        assert "REFUSE" in capsys.readouterr().out
-
-    @pytest.mark.parametrize("grade", [
-        cli.model_perf.GRADE_GREEN, cli.model_perf.GRADE_YELLOW, cli.model_perf.GRADE_RED,
-    ])
-    def test_a_usable_model_is_kept_and_its_grade_reported(self, tmp_path, monkeypatch, capsys, grade):
-        """Red is a warning, not a refusal: it still works for short turns, and the user is told."""
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _graded(grade, 5_000))
-
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-
-        assert rc == 0
-        assert deletes == []
-        out = capsys.readouterr().out
-        assert grade.upper() in out
-        assert "5,000 output tokens" in out
-
-    def test_skip_benchmark_pulls_without_measuring(self, tmp_path, monkeypatch, capsys):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _graded(cli.model_perf.GRADE_REFUSE, 0))
-
-        rc = cli.run_pull_model(make_pull_args(install_dir, skip_benchmark=True))
-
-        assert rc == 0
-        assert deletes == []
-        assert "Measuring" not in capsys.readouterr().out
-
-    def test_an_unmeasurable_model_is_kept_rather_than_refused_on_no_evidence(self, tmp_path, monkeypatch):
-        """A missing grade must never become a refusal. Failing to measure says nothing about the
-        model, and deleting someone's download on the strength of a failed probe would be worse
-        than the problem this feature exists to solve."""
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, None)
-
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-
-        assert rc == 0
-        assert deletes == []
-
-    def test_refusal_survives_an_unreachable_router_by_telling_the_user(self, tmp_path, monkeypatch, capsys):
-        install_dir, _ = self._setup(tmp_path, monkeypatch, _graded(cli.model_perf.GRADE_REFUSE, 0))
-        monkeypatch.setattr(cli, "_delete_cached_model", lambda llama_cfg, model_id: False)
-
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-
-        assert rc == 1
-        assert "still on disk" in capsys.readouterr().out
-
-
-class TestBenchmarkModelSelection:
-    """_benchmark_model's guards -- the cases where it must decline to produce a number."""
-
-    def _cfg(self, tmp_path, *, ctx="131072", bench_exists=True):
-        presets_path = tmp_path / "presets.ini"
-        if ctx:
-            cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": ctx})
-        binary = tmp_path / "llama-server"
-        binary.write_text("#!/bin/sh\n", encoding="utf-8")
-        if bench_exists:
-            (tmp_path / "llama-bench").write_text("#!/bin/sh\n", encoding="utf-8")
-        return {"server_binary": str(binary)}, presets_path
-
-    def test_declines_when_the_model_has_no_sized_preset(self, tmp_path, monkeypatch, caplog):
-        llama_cfg, presets_path = self._cfg(tmp_path, ctx=None)
-        with caplog.at_level("WARNING"):
-            result = cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
-        assert result is None
-        assert "no sized preset" in caplog.text
-
-    def test_declines_when_the_machine_never_goes_idle(self, tmp_path, monkeypatch, caplog):
-        llama_cfg, presets_path = self._cfg(tmp_path)
-        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: False)
-        monkeypatch.setattr(cli.model_perf_live, "free_router_memory", lambda *a, **kw: [])
-        with caplog.at_level("WARNING"):
-            result = cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
-        assert result is None
-        assert "still busy" in caplog.text
-
-    def test_frees_whatever_the_router_holds_before_measuring(self, tmp_path, monkeypatch):
-        """Under --models-max 1 the router keeps one whole model resident and llama-bench loads its
-        own copy on top. Crucially it frees whatever is loaded, not just the model being measured --
-        the router is frequently holding a DIFFERENT one, and on a 16GB Jetson that left an outright
-        allocation failure (NvMapMemAllocInternalTagged error 12) for models that benchmark fine
-        when the box is idle."""
-        llama_cfg, presets_path = self._cfg(tmp_path)
-        llama_cfg.update(host="127.0.0.1", port=9999)
-        unloaded = []
-        monkeypatch.setattr(
-            cli.model_perf_live, "free_router_memory",
-            lambda base_url, **kw: unloaded.append(base_url) or ["some/other-model:Q4_K_M"],
-        )
-        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
-        monkeypatch.setattr(cli.model_perf, "probe_performance",
-                            lambda *a, **kw: _graded(cli.model_perf.GRADE_YELLOW))
-
-        cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
-
-        assert unloaded == ["http://127.0.0.1:9999"]
-
-    def test_falls_back_to_the_live_server_when_llama_bench_is_absent(self, tmp_path, monkeypatch):
-        """Source-built installs (Jetson-class arm64+CUDA, old glibc) have no llama-bench, and they
-        are the hardware most likely to be too slow -- so they must still get measured."""
-        llama_cfg, presets_path = self._cfg(tmp_path, bench_exists=False)
-        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
-        monkeypatch.setattr(cli.model_perf_live, "free_router_memory", lambda *a, **kw: [])
-        live_calls = []
-        monkeypatch.setattr(
-            cli.model_perf_live, "probe_performance_live",
-            lambda *a, **kw: live_calls.append((a, kw)) or _graded(cli.model_perf.GRADE_YELLOW),
-        )
-        monkeypatch.setattr(
-            cli.model_perf, "probe_performance",
-            lambda *a, **kw: pytest.fail("llama-bench path must not run when the binary is absent"),
-        )
-
-        result = cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
-
-        assert result is not None and len(live_calls) == 1
-        assert live_calls[0][1]["ctx_size"] == 131072
-        # The grade is persisted so `list` can show it without re-measuring.
-        assert cli.model_perf_store.read_record(presets_path, "org/repo:Q4_K_M")["grade"] == "yellow"
-
-    def test_prefers_llama_bench_when_it_is_present(self, tmp_path, monkeypatch):
-        llama_cfg, presets_path = self._cfg(tmp_path, bench_exists=True)
-        monkeypatch.setattr(cli.model_perf, "wait_until_idle", lambda *a, **kw: True)
-        monkeypatch.setattr(cli.model_perf_live, "free_router_memory", lambda *a, **kw: [])
-        bench_calls = []
-        monkeypatch.setattr(
-            cli.model_perf, "probe_performance",
-            lambda *a, **kw: bench_calls.append(kw) or _graded(cli.model_perf.GRADE_GREEN),
-        )
-        monkeypatch.setattr(
-            cli.model_perf_live, "probe_performance_live",
-            lambda *a, **kw: pytest.fail("live fallback must not run when llama-bench exists"),
-        )
-
-        cli._benchmark_model(llama_cfg, presets_path, "org/repo:Q4_K_M", budget_seconds=10)
-
-        assert bench_calls[0]["cache_type_k"] is None or "cache_type_k" in bench_calls[0]
-        assert bench_calls[0]["ctx_size"] == 131072
-
-
 class TestDeleteCachedModel:
     """Real HTTP: proves the exact request llama.cpp's router expects, since this is the only thing
     that actually removes a refused model. The route is `DELETE /models?model=<id>`
@@ -1085,61 +886,67 @@ class TestDeleteCachedModel:
         assert cli._delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
 
 
-class TestBenchmarkResizes:
-    """`benchmark` re-runs sizing before measuring. The grade is capped by the effective context --
-    min(model's trained context, what this device's memory can serve) -- so a stale ctx_size would
-    silently hold the grade at whatever was true when the model was first pulled."""
+def _screen(rejected, reason="test reason"):
+    return cli.model_screen.ScreenResult(rejected, "too_slow" if rejected else None,
+                                         reason, 1000.0, False, 0.5)
 
-    def _setup(self, tmp_path, monkeypatch):
+
+def _score(value=250.0, confidence="ok"):
+    return cli.model_localscore.LocalScoreResult(value, 900.0, 30.0, 1200.0, "good", False,
+                                                 confidence, 0.05)
+
+
+class TestPullGate:
+    """The screen gates the score, and a rejection deletes the model. Withholding a preset is not
+    enough on its own: the router auto-discovers the HF cache, so a refused model would still be
+    listed by /v1/models and selectable in the web app's picker."""
+
+    def _setup(self, tmp_path, monkeypatch, screened, score):
         install_dir = tmp_path / "install"
         presets_path = tmp_path / "presets.ini"
-        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "8192"})
-        write_runtime(
-            install_dir,
-            {
-                "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
-                "service": {},
-            },
-        )
-        monkeypatch.setattr(cli, "list_cached_models", lambda binary: ["org/repo:Q4_K_M"])
-        return install_dir
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "32768"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
+        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: True)
+        monkeypatch.setattr(cli, "_benchmark_model", lambda *a, **kw: (screened, score))
+        deletes = []
+        monkeypatch.setattr(cli, "_delete_cached_model",
+                            lambda cfg, mid: deletes.append(mid) or True)
+        return install_dir, deletes
 
-    def test_resizes_before_measuring(self, tmp_path, monkeypatch, capsys):
-        install_dir = self._setup(tmp_path, monkeypatch)
-        order = []
-        monkeypatch.setattr(
-            cli, "ensure_preset",
-            lambda *a, **kw: order.append(("size", kw.get("force"))) or _FAKE_SIZING,
-        )
-        monkeypatch.setattr(
-            cli, "_benchmark_model",
-            lambda *a, **kw: order.append(("measure", None)) or _graded(cli.model_perf.GRADE_YELLOW),
-        )
+    def test_a_rejected_model_is_deleted_and_the_pull_fails(self, tmp_path, monkeypatch, capsys):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+        out = capsys.readouterr().out
+        assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
+        assert "UNUSABLE" in out and "--force" in out
 
-        rc = cli.run_benchmark(make_pull_args(install_dir, model=None))
+    def test_force_keeps_a_rejected_model(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
+        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
+        assert deletes == []
 
-        assert rc == 0
-        assert [step for step, _ in order] == ["size", "measure"]
-        assert order[0][1] is True  # force=True, or a stale preset would be kept
-        assert "re-sized" in capsys.readouterr().out
+    def test_a_usable_model_reports_its_score(self, tmp_path, monkeypatch, capsys):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+        out = capsys.readouterr().out
+        assert rc == 0 and deletes == []
+        assert "LocalScore 412" in out
 
-    def test_a_sizing_failure_still_lets_the_benchmark_run(self, tmp_path, monkeypatch, caplog):
-        """Sizing is a refinement here, not a precondition -- an existing preset is still a valid
-        operating point to measure against."""
-        install_dir = self._setup(tmp_path, monkeypatch)
-        monkeypatch.setattr(
-            cli, "ensure_preset",
-            lambda *a, **kw: (_ for _ in ()).throw(cli.ModelSizingError("probe timed out")),
-        )
-        measured = []
-        monkeypatch.setattr(
-            cli, "_benchmark_model",
-            lambda *a, **kw: measured.append(1) or _graded(cli.model_perf.GRADE_RED),
-        )
+    def test_a_low_confidence_score_says_so(self, tmp_path, monkeypatch, capsys):
+        """A device that moved 30% under its own measurement cannot support a precise number, and
+        the output has to admit that rather than printing it as though it could."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch, _screen(False), _score(confidence="low"))
+        cli.run_pull_model(make_pull_args(install_dir))
+        assert "low confidence" in capsys.readouterr().out
 
-        with caplog.at_level("WARNING"):
-            rc = cli.run_benchmark(make_pull_args(install_dir, model=None))
-
-        assert rc == 0
-        assert measured == [1]
-        assert "Could not re-size" in caplog.text
+    def test_an_unmeasurable_model_is_kept_rather_than_rejected_on_no_evidence(self, tmp_path, monkeypatch):
+        """Failing to measure says nothing about the model; deleting someone's download on the
+        strength of a failed probe would be worse than the problem this feature solves."""
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, None, None)
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert deletes == []

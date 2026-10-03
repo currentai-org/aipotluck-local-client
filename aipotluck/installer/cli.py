@@ -49,7 +49,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from aipotluck.installer import (  # noqa: E402
     layout,
+    model_localscore,
     model_perf,
+    model_screen,
     model_perf_live,
     model_perf_store,
     model_presets,
@@ -510,16 +512,20 @@ def _bench_binary(llama_cfg: dict) -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def _print_perf_verdict(result: model_perf.PerfResult) -> None:
-    if result.grade == model_perf.GRADE_REFUSE:
-        print(f"  {result.grade.upper()} -- {result.reason}")
-        return
-    print(
-        f"  {result.grade.upper()} -- can produce ~{result.n_out:,} output tokens in budget "
-        f"({result.decode_tokens_per_second:.1f} tok/s at a {result.grading_depth:,}-token depth; "
-        f"model context {result.ctx_size:,})"
-    )
-    print(f"  {result.reason}")
+def _print_screen_verdict(model_id: str, screened: "model_screen.ScreenResult") -> None:
+    if screened.rejected:
+        print(f"  UNUSABLE -- {screened.reason}")
+    else:
+        print(f"  usable -- {screened.reason}")
+
+
+def _print_score(result: "model_localscore.LocalScoreResult") -> None:
+    print(f"  LocalScore {result.score:,.0f} ({result.band})")
+    print(f"    {result.avg_prompt_tps:,.0f} tok/s prompt, {result.avg_gen_tps:.1f} tok/s generated, "
+          f"{result.avg_ttft_ms/1000:.1f}s to first token")
+    if result.confidence == model_localscore.CONFIDENCE_LOW:
+        print(f"    low confidence: this device varied {result.observed_spread:.0%} between "
+              "repeats, so treat the number as approximate")
 
 
 def _delete_cached_model(llama_cfg: dict, model_id: str) -> bool:
@@ -545,68 +551,81 @@ def _delete_cached_model(llama_cfg: dict, model_id: str) -> bool:
 
 def _benchmark_model(
     llama_cfg: dict, presets_path: Path, model_id: str, *, budget_seconds: float
-) -> model_perf.PerfResult | None:
-    """Measures and grades one already-downloaded model, persisting the verdict. Returns None when
-    no trustworthy measurement was possible -- a missing grade, never a guessed one."""
+) -> tuple["model_screen.ScreenResult | None", "model_localscore.LocalScoreResult | None"]:
+    """Screens a model for viability, then scores it if it survives.
+
+    Returns (screen, score). A None screen means no trustworthy measurement was possible at all --
+    a missing verdict, never a guessed one. A screen that rejected carries a None score, because
+    there is no point reporting how fast a model is that cannot serve a turn.
+    """
     preset_args = model_presets.read_all(presets_path).get(model_id)
     if not preset_args or not preset_args.get("ctx-size"):
         log.warning(
-            "%s has no sized preset, so there's no operating point to benchmark at -- skipping the "
-            "speed check.", model_id,
+            "%s has no sized preset, so there's no operating point to measure at -- skipping.",
+            model_id,
         )
-        return None
+        return None, None
 
     host = llama_cfg.get("host", DEFAULT_HOST)
     port = llama_cfg.get("port", DEFAULT_PORT)
     base_url = f"http://{host}:{port}"
 
-    # Free whatever the router is holding -- not just this model. Under --models-max 1 it keeps one
-    # whole model resident, and llama-bench is about to load its own copy on top; on a 16GB Jetson
-    # that was an outright allocation failure (NvMapMemAllocInternalTagged error 12) for models that
-    # benchmark fine on an idle box. Unloading only the target is not enough, because the router is
-    # frequently holding a different one. It reloads on the next request.
+    # Free whatever the router holds -- not just this model. Under --models-max 1 it keeps one whole
+    # model resident and llama-bench is about to load its own copy on top; on a 16GB Jetson that was
+    # an outright allocation failure for models that benchmark fine on an idle box.
     model_perf_live.free_router_memory(base_url)
-
     if not model_perf.wait_until_idle():
         log.warning(
-            "This machine is still busy, so a speed measurement would describe the contention "
-            "rather than the model -- skipping. Re-run `aipotluck-local-client benchmark %s` when "
-            "it's idle.", model_id,
+            "This machine is still busy, so a measurement would describe the contention rather "
+            "than the model -- skipping. Re-run `aipotluck-local-client benchmark %s` when it's "
+            "idle.", model_id,
         )
-        return None
+        return None, None
 
     ctx_size = int(preset_args["ctx-size"])
     bench = _bench_binary(llama_cfg)
+    if bench is None:
+        log.warning(
+            "llama-bench isn't part of this llama.cpp install, so this model can't be measured. "
+            "Re-running the installer rebuilds it.",
+        )
+        return None, None
+
+    common = dict(
+        cache_type_k=preset_args.get("cache-type-k"),
+        cache_type_v=preset_args.get("cache-type-v"),
+        gpu_layers=llama_cfg.get("gpu_layers"),
+    )
+
+    # The screen runs first and on its own budget: most answers are obvious, and a user about to be
+    # told "no" should not wait out a full measurement to hear it.
+    try:
+        screened = model_screen.screen_model(
+            bench, model_id, ctx_size=ctx_size, budget_seconds=budget_seconds, **common
+        )
+    except (model_perf.ModelPerfError, ValueError) as exc:
+        log.warning("Could not screen %s on this device (%s) -- no verdict recorded.", model_id, exc)
+        return None, None
+    if screened.rejected:
+        return screened, None
+
     started = time.monotonic()
     try:
-        if bench is not None:
-            result = model_perf.probe_performance(
-                bench, model_id,
-                ctx_size=ctx_size,
-                cache_type_k=preset_args.get("cache-type-k"),
-                cache_type_v=preset_args.get("cache-type-v"),
-                gpu_layers=llama_cfg.get("gpu_layers"),
-                budget_seconds=budget_seconds,
-            )
-        else:
-            # A from-source install (arm64+CUDA, old glibc) builds llama-server alone, so measure
-            # through the running router instead. Same numbers, noisier path, larger safety margin
-            # -- see model_perf_live. Skipping outright would leave the slowest hardware we support
-            # as the only hardware with no speed check at all.
-            log.info("No llama-bench in this install -- measuring through the running server instead.")
-            result = model_perf_live.probe_performance_live(
-                base_url, model_id, ctx_size=ctx_size, budget_seconds=budget_seconds,
-            )
+        cost = model_localscore.probe_cost_model(
+            bench, model_id, budget_seconds=budget_seconds, **common
+        )
     except (model_perf.ModelPerfError, ValueError) as exc:
-        log.warning("Could not measure %s on this device (%s) -- no grade recorded.", model_id, exc)
-        return None
+        log.warning("Could not score %s on this device (%s) -- no score recorded.", model_id, exc)
+        return screened, None
 
+    score = model_localscore.localscore(cost)
     model_perf_store.write_record(
-        presets_path, model_id, result,
+        presets_path, model_id, score,
         llama_config=llama_cfg, preset_args=preset_args,
+        engine=llama_cfg.get("tag"), ctx_size=ctx_size,
         probe_seconds=time.monotonic() - started,
     )
-    return result
+    return screened, score
 
 
 def run_pull_model(args: argparse.Namespace) -> int:
@@ -664,19 +683,20 @@ def run_pull_model(args: argparse.Namespace) -> int:
                 f"cache_type_k={sizing.cache_type_k} cache_type_v={sizing.cache_type_v}"
             )
 
-    result = None
+    screened = score = None
     if presets_path and not args.skip_benchmark:
-        print(f"Measuring how fast this model runs here (up to {int(model_perf.PROBE_BUDGET_SECONDS)}s)...")
-        result = _benchmark_model(
-            llama_cfg, Path(presets_path), args.model,
-            budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
+        print("Checking this model can actually serve a turn here...")
+        screened, score = _benchmark_model(
+            llama_cfg, Path(presets_path), args.model, budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
         )
-        if result is not None:
-            _print_perf_verdict(result)
+        if screened is not None:
+            _print_screen_verdict(args.model, screened)
+        if score is not None:
+            _print_score(score)
 
-    if result is not None and result.grade == model_perf.GRADE_REFUSE and not args.force:
+    if screened is not None and screened.rejected and not args.force:
         print()
-        print(f"{args.model} is too slow to hold a conversation on this device.")
+        print(f"{args.model} cannot serve a conversation on this device.")
         removed = _delete_cached_model(llama_cfg, args.model)
         if removed:
             model_perf_store.forget(Path(presets_path), args.model)
@@ -739,25 +759,25 @@ def run_list_models(args: argparse.Namespace) -> int:
             notes.append("not sized yet")
         record = graded.get(target)
         if record is None:
-            grade_label = "  ?     "
-            notes.append("not benchmarked -- run `benchmark`")
+            label = f"{'--':>7}"
+            notes.append("not measured -- run `benchmark`")
         else:
-            grade_label = f"  {record.get('grade', '?').upper():<6s}"
-            n_out = record.get("n_out")
-            if isinstance(n_out, int):
-                notes.append(f"~{n_out:,} output tokens in budget")
-            ctx = record.get("ctx_size")
-            if isinstance(ctx, int):
-                notes.append(f"{ctx:,}-token context")
-            depth = record.get("grading_depth")
-            tps = record.get("decode_tokens_per_second")
+            label = f"{record.get('localscore', 0):>7,.0f}"
+            band = record.get("band")
+            if band:
+                notes.append(band)
+            tps = record.get("avg_gen_tps")
             if isinstance(tps, (int, float)):
-                at = f" at {depth:,} depth" if isinstance(depth, int) else ""
-                notes.append(f"{tps:.1f} tok/s{at}")
-            if model_perf_store.is_stale(Path(presets_path), record, llama_config=llama_cfg):
+                notes.append(f"{tps:.1f} tok/s generated")
+            if record.get("confidence") == model_localscore.CONFIDENCE_LOW:
+                notes.append("low confidence")
+            if presets_path and model_perf_store.is_stale(Path(presets_path), record, llama_config=llama_cfg):
                 notes.append("stale -- re-run `benchmark`")
         suffix = f"  ({', '.join(notes)})" if notes else ""
-        print(f"{grade_label}  {target}{suffix}")
+        print(f"{label}  {target}{suffix}")
+    print()
+    print("LocalScore (localscore.ai) measured on this device's own llama.cpp build, so it is not")
+    print("comparable to scores published there -- that tool ships a much older engine.")
     return 0
 
 
@@ -812,13 +832,15 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 print(f"  re-sized: ctx_size={sizing.ctx_size} cache_type_k={sizing.cache_type_k} "
                       f"cache_type_v={sizing.cache_type_v}")
 
-        result = _benchmark_model(
+        screened, score = _benchmark_model(
             llama_cfg, Path(presets_path), target, budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
         )
-        if result is None:
+        if screened is None:
             failures += 1
         else:
-            _print_perf_verdict(result)
+            _print_screen_verdict(target, screened)
+            if score is not None:
+                _print_score(score)
     return 1 if failures and len(targets) == 1 else 0
 
 
