@@ -377,8 +377,30 @@ def _configure(source_dir: Path, build_dir: Path, *, cuda_arch: str | None, cmak
 
 
 def _build(build_dir: Path, *, jobs: int, timeout: float, cmake_binary: str) -> None:
-    args = [cmake_binary, "--build", str(build_dir), "--target", "llama-server", "-j", str(jobs)]
-    log.info("Building llama-server with -j%d (this can take a long time -- output follows live)", jobs)
+    _build_target(build_dir, "llama-server", jobs=jobs, timeout=timeout, cmake_binary=cmake_binary)
+
+    # llama-bench is what model_perf grades a model with, and a source-built install is exactly the
+    # slow arm64/old-glibc hardware where an unusable model is most likely -- so it is worth having
+    # here rather than only in the prebuilt archives. It must be built BEFORE
+    # _cleanup_intermediate_objects() rmtree's the CMakeFiles dirs, which is why it lives in this
+    # same call rather than being added lazily later: afterwards it would cost a full rebuild.
+    #
+    # Best-effort on purpose. The heavy ggml/llama libraries are already compiled by this point, so
+    # this is one extra translation unit and a link, but if some toolchain refuses it the install
+    # must still succeed -- model_perf falls back to measuring through the running server, and a
+    # missing benchmark binary is a degraded grade rather than a broken device.
+    try:
+        _build_target(build_dir, "llama-bench", jobs=jobs, timeout=timeout, cmake_binary=cmake_binary)
+    except BuildError as exc:
+        log.warning(
+            "Could not build llama-bench (%s) -- the install is fine; model speed grading will "
+            "measure through the running server instead.", exc,
+        )
+
+
+def _build_target(build_dir: Path, target: str, *, jobs: int, timeout: float, cmake_binary: str) -> None:
+    args = [cmake_binary, "--build", str(build_dir), "--target", target, "-j", str(jobs)]
+    log.info("Building %s with -j%d (this can take a long time -- output follows live)", target, jobs)
     # A build process tree (cmake -> make/ninja -> cc1/nvcc/ld) can be deep; start a new session so
     # a timeout can kill the *whole tree* via its process group, not just cmake's direct child,
     # which would otherwise leave orphaned compiler workers running. Output is left uncaptured
@@ -389,9 +411,9 @@ def _build(build_dir: Path, *, jobs: int, timeout: float, cmake_binary: str) -> 
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        raise BuildError(f"Build did not finish within {timeout:.0f}s (killed)")
+        raise BuildError(f"Building {target} did not finish within {timeout:.0f}s (killed)")
     if proc.returncode != 0:
-        raise BuildError(f"Build failed (exit {proc.returncode}) -- see output above")
+        raise BuildError(f"Building {target} failed (exit {proc.returncode}) -- see output above")
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:

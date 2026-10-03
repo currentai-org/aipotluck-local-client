@@ -5,10 +5,11 @@
   "assets": {
     "linux-arm64-cuda-sm87": {
       "file": "llama-b10989-bin-linux-arm64-cuda-sm87.tar.gz",
-      "sha256": "c4d51188725a6e7185a1901295c74345c53031a34f19d29f61d7abf6b3814367",
+      "sha256": "40ff413804e0a7e910eb156e1442657ee69dbc7d5c790e0d34811f08ee810207",
       "source_tag": "b10989",
       "min_glibc": "2.35",
-      "built_on": "NVIDIA Jetson Orin Nano 8GB (Developer Kit Super), JetPack 6.2.3, via scripts/package_custom_build.py"
+      "built_on": "NVIDIA Jetson Orin NX 16GB (Developer Kit), JetPack R36.5.0, via scripts/package_custom_build.py",
+      "_note": "Rebuilt to include llama-bench alongside llama-server (model_perf grades a model with it; without it a host falls back to the slower live-server path). Both binaries verified relocatable at packaging time."
     }
   }
 }

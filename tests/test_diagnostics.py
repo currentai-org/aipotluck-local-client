@@ -98,8 +98,31 @@ class TestRuntimeParams:
             "org/a:Q4_K_M": {
                 "ctx_size": "16384", "parallel": "1", "cache_type_k": "q8_0", "cache_type_v": "q8_0",
                 "tuning": {"ctx_size": "largest context that fits"},
+                "performance": None,  # never measured
             }
         }
+
+    def test_a_measured_model_surfaces_its_localscore(self, tmp_path):
+        """A score decides whether a model is installable, so it has to be inspectable afterwards
+        -- the same traceability rule the sizing parameters follow."""
+        from aipotluck.installer import model_localscore, model_perf_store, model_presets
+
+        presets_path = tmp_path / "presets.ini"
+        preset = {"ctx-size": "16384"}
+        model_presets.write_preset(presets_path, "org/a:Q4_K_M", preset)
+        cost = model_localscore.CostModel({256: 1.0, 1024: 1.0, 2048: 1.0}, 20.0, 0.0)
+        result = model_localscore.localscore(cost)
+        llama_cfg = {"presets_path": str(presets_path), "tag": "b10989"}
+        model_perf_store.write_record(presets_path, "org/a:Q4_K_M", result,
+                                      llama_config=llama_cfg, preset_args=preset,
+                                      engine="b10989", ctx_size=16384)
+
+        perf = diag.runtime_params({"llama_cpp": llama_cfg})["models"]["org/a:Q4_K_M"]["performance"]
+        # the store rounds to one decimal on purpose -- a score is not precise to more than that
+        assert perf["localscore"] == pytest.approx(result.score, abs=0.05)
+        assert perf["band"] == result.band
+        assert perf["engine"] == "b10989"
+        assert perf["stale"] is False
 
     def test_a_model_with_no_tuning_entry_gets_an_empty_dict_not_a_crash(self, tmp_path):
         from aipotluck.installer import model_presets

@@ -32,11 +32,12 @@ FAKE_CMAKE_SCRIPT = textwrap.dedent(
 
     if args[0] == "--build":
         build_dir = args[1]
+        target_name = args[args.index("--target") + 1] if "--target" in args else "llama-server"
         delay = float(os.environ.get("FAKE_CMAKE_BUILD_DELAY", "0"))
         heartbeat = os.path.join(build_dir, "heartbeat.txt")
         log_path = os.path.join(build_dir, "build_log.txt")
         with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write("built\\n")
+            fh.write("built:" + target_name + "\\n")
         if delay:
             # A real child process (not just this script sleeping) so a process-group kill has
             # something real below it to prove it reaches -- exactly the shape `cmake --build`
@@ -50,9 +51,11 @@ FAKE_CMAKE_SCRIPT = textwrap.dedent(
             child.wait()
         if os.environ.get("FAKE_CMAKE_BUILD_FAIL"):
             sys.exit(1)
+        if os.environ.get("FAKE_CMAKE_BENCH_FAIL") and target_name == "llama-bench":
+            sys.exit(1)
         bin_dir = os.path.join(build_dir, "bin")
         os.makedirs(bin_dir, exist_ok=True)
-        target = os.path.join(bin_dir, "llama-server")
+        target = os.path.join(bin_dir, target_name)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\\necho fake\\n")
         os.chmod(target, 0o755)
@@ -324,7 +327,7 @@ class TestBuildLlamaServer:
         sb.build_llama_server(source_dir, build_dir, fingerprint="sha123:cpu", cmake_binary=str(fake_cmake))
         sb.build_llama_server(source_dir, build_dir, fingerprint="sha123:cpu", cmake_binary=str(fake_cmake))
         log_lines = (build_dir / "build_log.txt").read_text(encoding="utf-8").splitlines()
-        assert len(log_lines) == 1
+        assert log_lines.count("built:llama-server") == 1
 
     def test_changed_fingerprint_forces_a_rebuild(self, tmp_path, fake_cmake):
         source_dir = tmp_path / "src"
@@ -333,7 +336,36 @@ class TestBuildLlamaServer:
         sb.build_llama_server(source_dir, build_dir, fingerprint="sha123:cpu", cmake_binary=str(fake_cmake))
         sb.build_llama_server(source_dir, build_dir, fingerprint="sha456:87", cuda_arch="87", cmake_binary=str(fake_cmake))
         log_lines = (build_dir / "build_log.txt").read_text(encoding="utf-8").splitlines()
-        assert len(log_lines) == 2
+        assert log_lines.count("built:llama-server") == 2
+
+    def test_builds_llama_bench_alongside_llama_server(self, tmp_path, fake_cmake):
+        """model_perf grades a model with llama-bench, and a source build is exactly the slow
+        hardware where an unusable model is most likely -- so it has to come out of the same build
+        that produces llama-server, before _cleanup_intermediate_objects makes a later one cost a
+        full rebuild."""
+        source_dir = tmp_path / "src"
+        build_dir = tmp_path / "build"
+        source_dir.mkdir()
+        sb.build_llama_server(source_dir, build_dir, fingerprint="sha123:cpu", cmake_binary=str(fake_cmake))
+        log_lines = (build_dir / "build_log.txt").read_text(encoding="utf-8").splitlines()
+        assert log_lines == ["built:llama-server", "built:llama-bench"]
+        assert (build_dir / "bin" / "llama-bench").exists()
+
+    def test_llama_bench_build_failure_does_not_fail_the_install(self, tmp_path, fake_cmake, monkeypatch, caplog):
+        """A missing benchmark binary is a degraded grade (model_perf falls back to measuring
+        through the running server), never a broken device -- so it must not take the install with
+        it when some toolchain refuses to build it."""
+        monkeypatch.setenv("FAKE_CMAKE_BENCH_FAIL", "1")
+        source_dir = tmp_path / "src"
+        build_dir = tmp_path / "build"
+        source_dir.mkdir()
+        with caplog.at_level("WARNING"):
+            binary = sb.build_llama_server(
+                source_dir, build_dir, fingerprint="sha123:cpu", cmake_binary=str(fake_cmake),
+            )
+        assert binary.exists() and binary.name == "llama-server"
+        assert not (build_dir / "bin" / "llama-bench").exists()
+        assert "Could not build llama-bench" in caplog.text
 
     def test_configure_failure_raises_with_stderr(self, tmp_path, fake_cmake, monkeypatch):
         monkeypatch.setenv("FAKE_CMAKE_CONFIGURE_FAIL", "1")
@@ -348,7 +380,7 @@ class TestBuildLlamaServer:
         source_dir = tmp_path / "src"
         build_dir = tmp_path / "build"
         source_dir.mkdir()
-        with pytest.raises(sb.BuildError, match="Build failed"):
+        with pytest.raises(sb.BuildError, match="Building llama-server failed"):
             sb.build_llama_server(source_dir, build_dir, fingerprint="x", cmake_binary=str(fake_cmake))
 
     def test_timeout_really_kills_the_whole_process_tree(self, tmp_path, fake_cmake, monkeypatch):
