@@ -121,11 +121,49 @@ def extract_archive(archive_path: Path, extract_root: Path, tag: str, asset_key:
     return target_dir
 
 
+# Directory-name shapes that are leftovers rather than part of an extraction -- a hand-made backup
+# of a previous build parked beside the current one. A stale copy is not harmless: it holds a
+# working `llama-server`, so the install keeps serving while `server_binary` quietly names an older
+# engine, and anything resolved RELATIVE to that path reads as missing instead of stale. Seen live
+# on a Jetson, where `llama-b10989.bak-<epoch>` won an unordered rglob and the capability check
+# reported llama-bench absent while it sat in the real extraction next door.
+_DEBRIS_DIR_ENDINGS = (".old", "~")
+_DEBRIS_DIR_SUBSTRING = ".bak"
+
+
+def _looks_like_debris(path: Path, root: Path) -> bool:
+    """True when any directory between `root` and `path` is named like a leftover copy."""
+    for part in path.relative_to(root).parts[:-1]:
+        if part.endswith(_DEBRIS_DIR_ENDINGS) or _DEBRIS_DIR_SUBSTRING in part:
+            return True
+    return False
+
+
 def find_binary(extract_dir: Path, binary_stem: str) -> Path:
-    """Locate a binary (e.g. 'llama-server' or 'llama-server.exe') under
-    extract_dir, which may itself contain one nested top-level folder
-    (release archives ship as llama-<tag>/... on some platforms)."""
+    """Locate a binary (e.g. 'llama-server' or 'llama-bench') under extract_dir, which may itself
+    contain one nested top-level folder (release archives ship as llama-<tag>/... on some
+    platforms).
+
+    The choice is deterministic -- shallowest path first, then lexicographic -- and explicitly does
+    not depend on filesystem iteration order. `rglob` yields entries in whatever order the OS hands
+    back, so when two copies exist the winner varies between machines, and between runs on one
+    machine. That makes the resulting misconfiguration irreproducible, which is how a stale pick
+    survived a re-install unnoticed. Ambiguity is also reported rather than silently resolved,
+    because picking the wrong copy leaves a working install pointed at the wrong engine."""
     candidates = list(extract_dir.rglob(binary_stem)) + list(extract_dir.rglob(binary_stem + ".exe"))
     if not candidates:
         raise FileNotFoundError(f"Could not find {binary_stem} under {extract_dir}")
-    return candidates[0]
+
+    # Never let the debris heuristic be the reason nothing is found: if it would reject everything,
+    # fall back to the full set and let the ordering below decide.
+    live = [p for p in candidates if not _looks_like_debris(p, extract_dir)] or candidates
+    chosen = sorted(live, key=lambda p: (len(p.parts), p.parts))[0]
+
+    if len(candidates) > 1:
+        others = ", ".join(str(p) for p in sorted(candidates) if p != chosen)
+        log.warning(
+            "Found %d copies of %s under %s -- using %s. The rest (%s) are not part of this "
+            "install; remove them so a later run cannot resolve to a different one.",
+            len(candidates), binary_stem, extract_dir, chosen, others,
+        )
+    return chosen

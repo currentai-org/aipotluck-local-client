@@ -501,15 +501,44 @@ def _reload_router_models(llama_cfg: dict) -> bool:
 
 def _bench_binary(llama_cfg: dict) -> Path | None:
     """Locates llama-bench, which ships beside llama-server in every prebuilt llama.cpp release
-    archive (fetch.py extracts the whole archive, it doesn't cherry-pick). Its absence is expected
-    rather than broken: source_build.py builds only the llama-server target, so the arm64+CUDA and
-    old-glibc devices that take that path won't have it, and the caller measures through the
-    running server instead."""
+    archive (fetch.py extracts the whole archive, it doesn't cherry-pick) and which source_build
+    now builds too.
+
+    It is looked up strictly as a SIBLING of the llama-server we actually serve with, never by
+    searching the install root for any copy. A score has to describe the engine that will serve
+    turns, so pairing a llama-bench from one build with a llama-server from another would quietly
+    measure the wrong thing -- a worse failure than reporting it missing."""
     server_binary = llama_cfg.get("server_binary")
     if not server_binary:
         return None
     candidate = Path(server_binary).parent / ("llama-bench.exe" if os.name == "nt" else "llama-bench")
     return candidate if candidate.exists() else None
+
+
+def _warn_bench_missing(llama_cfg: dict) -> None:
+    """Says where we looked and what that absence actually implies.
+
+    The two cases need different advice. A source build makes llama-bench best-effort, so re-running
+    the installer really can produce it. A prebuilt install always ships it, so its absence means
+    `server_binary` is pointing somewhere that is not this install's own extraction -- and telling
+    that user to "re-run the installer to rebuild it" sends them after a rebuild that never happens
+    and cannot help."""
+    server_binary = llama_cfg.get("server_binary")
+    looked_in = Path(server_binary).parent if server_binary else "(no server binary recorded)"
+    if llama_cfg.get("built_from_source"):
+        log.warning(
+            "llama-bench isn't in %s, so this model can't be measured. This install was built from "
+            "source, where llama-bench is a best-effort extra target that can fail without failing "
+            "the build -- re-run the installer to try building it again.", looked_in,
+        )
+    else:
+        log.warning(
+            "llama-bench isn't in %s, so this model can't be measured -- but every prebuilt "
+            "llama.cpp archive ships it beside llama-server, so that directory is most likely a "
+            "stale or partial copy rather than this install's own. Look for leftover directories "
+            "under %s, remove them, and re-run the installer to re-resolve the binary.",
+            looked_in, llama_cfg.get("install_dir", "the install root"),
+        )
 
 
 def _print_screen_verdict(model_id: str, screened: "model_screen.ScreenResult") -> None:
@@ -585,10 +614,7 @@ def _benchmark_model(
     ctx_size = int(preset_args["ctx-size"])
     bench = _bench_binary(llama_cfg)
     if bench is None:
-        log.warning(
-            "llama-bench isn't part of this llama.cpp install, so this model can't be measured. "
-            "Re-running the installer rebuilds it.",
-        )
+        _warn_bench_missing(llama_cfg)
         return None, None
 
     common = dict(
