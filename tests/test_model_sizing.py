@@ -53,6 +53,7 @@ FAKE_SERVER_SCRIPT = textwrap.dedent(
     parser.add_argument("--fail", action="store_true")
     parser.add_argument("--hang", action="store_true")
     parser.add_argument("--omit-hparams", action="store_true")
+    parser.add_argument("--truncated-utf8", action="store_true")
     parser.add_argument("--n-ctx-train", default="131072")
     parser.add_argument("--n-layer", default="28")
     parser.add_argument("--n-embd-head-k", default="128")
@@ -68,6 +69,20 @@ FAKE_SERVER_SCRIPT = textwrap.dedent(
     if args.hang:
         time.sleep(600)
         sys.exit(0)
+
+    if args.truncated_utf8:
+        # The exact shape captured from a real Jetson run against LiquidAI/LFM2.5-8B-A1B-GGUF:
+        # llama.cpp cuts its kv-preview at a fixed width without honouring UTF-8 boundaries, so a
+        # two-byte `\u010a` (U+010A, b"\\xc4\\x8a" -- byte-level BPE's newline) loses its
+        # trailing byte and the line ends on a lead byte. Emitted BEFORE the hparams on purpose:
+        # under strict decoding the reader dies here and everything below never arrives, which is
+        # why the real failure surfaced as a missing n_ctx_train.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(
+            b"llama_model_loader: - kv  30: tokenizer.ggml.tokens arr[str,128000] = "
+            + b'["' + b"\\xc4\\x8a" * 5 + b'", "' + b"\\xc4\\x8a" * 5 + b"\\xc4...\\n"
+        )
+        sys.stdout.buffer.flush()
 
     if not args.omit_hparams:
         print("print_info: n_ctx_train           = " + args.n_ctx_train)
@@ -199,6 +214,41 @@ class TestProbeModelProfile:
         monkeypatch.setattr(model_sizing.subprocess, "Popen", _fake_popen)
         with pytest.raises(ModelSizingError, match="exited"):
             probe_model_profile(fake_server_binary, model_hf="org/does-not-exist:Q4_K_M")
+
+    def test_survives_a_half_written_utf8_character_in_the_server_log(
+        self, fake_server_binary, monkeypatch
+    ):
+        """llama.cpp truncates its kv preview without honouring UTF-8 boundaries, so a byte-level
+        BPE tokenizer can leave a lead byte with no continuation. Confirmed live on a Jetson with
+        LiquidAI/LFM2.5-8B-A1B-GGUF, where strict decoding killed the reader thread and the pull
+        died. The contract is that undecodable bytes cost nothing: the probe still returns the
+        hparams printed AFTER them."""
+        monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
+        real_popen = subprocess.Popen
+
+        def _fake_popen(cmd, *args, **kwargs):
+            return real_popen([*cmd, "--truncated-utf8"], *args, **kwargs)
+
+        monkeypatch.setattr(model_sizing.subprocess, "Popen", _fake_popen)
+        profile = probe_model_profile(fake_server_binary, model_hf="LiquidAI/LFM2.5-8B-A1B:Q4_K_M")
+        assert profile.n_ctx_train == 131072
+        assert profile.n_layer == 28
+
+    def test_blames_the_reader_when_output_was_cut_short(self, fake_server_binary, monkeypatch):
+        """A truncated read and a genuinely absent hparam are indistinguishable at the parse step --
+        both are just a key missing from the text. When the reader is why, the error has to say so,
+        or the next person debugs the regex instead of the pipe."""
+        monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
+        real_drain = model_sizing._drain
+
+        def _exploding_drain(proc, lines, failures):
+            # Let nothing through, exactly as a dead reader thread would.
+            failures.append(UnicodeDecodeError("utf-8", b"\xc4", 0, 1, "invalid continuation byte"))
+
+        monkeypatch.setattr(model_sizing, "_drain", _exploding_drain)
+        with pytest.raises(ModelSizingError, match="cut short by a read error"):
+            probe_model_profile(fake_server_binary, model_hf="org/model:Q4_K_M")
+        assert real_drain is not None  # the real one is restored by monkeypatch teardown
 
     def test_raises_on_timeout_rather_than_hanging_forever(self, fake_server_binary, monkeypatch):
         real_popen = subprocess.Popen

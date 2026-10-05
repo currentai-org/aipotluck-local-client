@@ -134,7 +134,9 @@ def list_cached_models(server_binary: Path) -> list[str]:
     try:
         result = subprocess.run(
             [str(server_binary), "--cache-list"],
-            capture_output=True, text=True, timeout=LIST_TIMEOUT_SECONDS,
+            # errors="replace" -- a cached model whose name or metadata decodes badly must not
+            # make the whole cache unlistable. See model_sizing.probe_model_profile.
+            capture_output=True, text=True, errors="replace", timeout=LIST_TIMEOUT_SECONDS,
         )
     except OSError as exc:
         raise ModelPullError(f"Could not run {server_binary} --cache-list: {exc}") from exc
