@@ -853,6 +853,135 @@ class TestRunPullModel:
         assert "next time it starts" in out
 
 
+class TestQuarantineSurfacing:
+    """A held-back model is still on disk and still pickable in the chat UI -- the router
+    discovers the HF cache for itself. `list` therefore has to say so plainly, because the
+    alternative reading is that the service already dealt with it, leaving the user waiting on a
+    turn that keeps failing.
+    """
+
+    def _setup(self, tmp_path, monkeypatch, cached=("org/repo:Q4_K_M",)):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "4096"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(cli, "list_cached_models", lambda binary: list(cached))
+        return install_dir
+
+    def _config_dir(self, install_dir):
+        return install_dir / "config"
+
+    def test_a_held_back_model_is_marked_and_explained(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.model_health.quarantine(
+            self._config_dir(install_dir), "org/repo:Q4_K_M",
+            "ran out of memory 3 times without completing a turn in between",
+        )
+
+        assert cli.run_list_models(make_pull_args(install_dir)) == 0
+
+        out = capsys.readouterr().out
+        assert "HELD BACK" in out
+        assert "ran out of memory 3 times" in out, "the reason has to reach the user, not just a flag"
+        assert "still installed and can still be picked" in out
+        assert "remove <model>" in out
+
+    def test_nothing_is_said_when_nothing_is_held_back(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.run_list_models(make_pull_args(install_dir))
+        out = capsys.readouterr().out
+        assert "HELD BACK" not in out and "Held back" not in out
+
+
+def make_remove_args(install_dir: Path, model="org/repo:Q4_K_M", yes=False) -> Namespace:
+    return Namespace(install_dir=install_dir, system=False, verbose=False, model=model, yes=yes)
+
+
+class TestRunRemoveModel:
+    """The user-confirmed half of a quarantine. The service never deletes a model on its own --
+    those are gigabytes the user chose to download -- so the decision lands here."""
+
+    def _setup(self, tmp_path, monkeypatch, *, cached=("org/repo:Q4_K_M",), deletes_ok=True):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "4096"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(cli, "list_cached_models", lambda binary: list(cached))
+        deletes = []
+        monkeypatch.setattr(cli, "_delete_cached_model",
+                            lambda cfg, mid: deletes.append(mid) or deletes_ok)
+        return install_dir, deletes
+
+    def test_yes_removes_without_prompting(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt with --yes"))
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 0
+        assert deletes == ["org/repo:Q4_K_M"]
+
+    def test_declining_the_prompt_keeps_the_model(self, tmp_path, monkeypatch, capsys):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == [] and "Left alone" in capsys.readouterr().out
+
+    def test_the_default_answer_is_no(self, tmp_path, monkeypatch):
+        """Empty input must not delete several gigabytes."""
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == []
+
+    def test_without_a_terminal_it_requires_the_flag(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == []
+
+    def test_an_unknown_model_is_rejected_before_anything_is_deleted(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        rc = cli.run_remove_model(make_remove_args(install_dir, model="org/nope:Q4_K_M", yes=True))
+        assert rc == 1 and deletes == []
+
+    def test_the_quarantine_reason_is_shown_before_deleting(self, tmp_path, monkeypatch, capsys):
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        cli.model_health.quarantine(
+            install_dir / "config", "org/repo:Q4_K_M", "ran out of memory 3 times"
+        )
+        cli.run_remove_model(make_remove_args(install_dir, yes=True))
+        assert "ran out of memory 3 times" in capsys.readouterr().out
+
+    def test_removal_clears_the_health_record(self, tmp_path, monkeypatch):
+        """A later re-pull of the same id must start clean rather than inherit a verdict reached
+        against a sizing that no longer exists."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        config_dir = install_dir / "config"
+        cli.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
+        cli.run_remove_model(make_remove_args(install_dir, yes=True))
+        assert cli.model_health.read_record(config_dir, "org/repo:Q4_K_M") is None
+
+    def test_a_failed_delete_keeps_the_records_and_says_why(self, tmp_path, monkeypatch, capsys):
+        """If the router couldn't be reached the files are still there, so forgetting the model
+        would leave it installed, unexplained and un-held-back."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
+        config_dir = install_dir / "config"
+        cli.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
+
+        rc = cli.run_remove_model(make_remove_args(install_dir, yes=True))
+
+        assert rc == 1
+        assert cli.model_health.read_record(config_dir, "org/repo:Q4_K_M") is not None
+        assert "wasn't reachable" in capsys.readouterr().out
+
+
 class TestRunListModels:
     def test_lists_cached_models_and_flags_the_unsized_one(self, tmp_path, monkeypatch, capsys):
         install_dir = tmp_path / "install"

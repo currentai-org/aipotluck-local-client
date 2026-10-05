@@ -70,6 +70,7 @@ from aipotluck.installer.model_sizing import ModelSizingError, ensure_preset  # 
 from aipotluck.installer.source_build import _total_memory_gb  # noqa: E402
 from aipotluck.installer.platform_detect import HostProfile, detect_host_profile  # noqa: E402
 from aipotluck.installer.service.base import get_service_manager  # noqa: E402
+from aipotluck.service import model_health  # noqa: E402
 from aipotluck.service.runner import DEFAULT_HOST, DEFAULT_PORT  # noqa: E402
 
 log = logging.getLogger("aipotluck.cli")
@@ -159,6 +160,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "list", parents=[common],
         help="List models already downloaded locally (via llama-server's own --cache-list)",
+    )
+
+    remove = sub.add_parser(
+        "remove", parents=[common],
+        help="Delete a downloaded model and everything this client remembers about it",
+    )
+    remove.add_argument("model", help="Hugging Face repo[:quant] exactly as `list` shows it")
+    remove.add_argument(
+        "--yes", action="store_true",
+        help="Skip the confirmation prompt (required when there's no terminal to prompt on)",
     )
 
     benchmark = sub.add_parser(
@@ -832,10 +843,13 @@ def run_list_models(args: argparse.Namespace) -> int:
     presets_path = llama_cfg.get("presets_path")
     sized = model_presets.known_model_ids(Path(presets_path)) if presets_path else set()
     graded = model_perf_store.read_all(Path(presets_path)).get("models", {}) if presets_path else {}
+    held_back = model_health.quarantined_models(lay.config_dir)
 
     print(f"{len(models)} model(s) cached locally:")
     for target in models:
         notes = []
+        if target in held_back:
+            notes.append("HELD BACK -- out of memory")
         if target not in sized:
             notes.append("not sized yet")
         record = graded.get(target)
@@ -856,9 +870,85 @@ def run_list_models(args: argparse.Namespace) -> int:
                 notes.append("stale -- re-run `benchmark`")
         suffix = f"  ({', '.join(notes)})" if notes else ""
         print(f"{label}  {target}{suffix}")
+
+    if held_back:
+        # These are still on disk and still selectable in the chat picker -- the router discovers
+        # the HF cache for itself. Saying so plainly matters: the alternative reading is that the
+        # service already dealt with it, and the user would be waiting for a turn that keeps
+        # failing.
+        print()
+        print("Held back after repeatedly running out of memory:")
+        for model_id, record in sorted(held_back.items()):
+            print(f"  {model_id}")
+            print(f"    {record.get('quarantine_reason', 'repeated out-of-memory failures')}")
+        print()
+        print("They are still installed and can still be picked in the chat model list. Remove one")
+        print("with `aipotluck-local-client remove <model>`, or re-pull it to size it again and")
+        print("give it another go.")
+
     print()
     print("LocalScore (localscore.ai) measured on this device's own llama.cpp build, so it is not")
     print("comparable to scores published there -- that tool ships a much older engine.")
+    return 0
+
+
+def run_remove_model(args: argparse.Namespace) -> int:
+    """Deletes a cached model and everything this client remembers about it.
+
+    This is the user-confirmed half of a quarantine. The service holds a model back on its own
+    when it keeps running out of memory, but it never deletes one: that is several gigabytes the
+    user chose to download, and a background process is the wrong thing to make that call with
+    nobody present. So it reports, and this is where the decision gets made."""
+    _profile, lay = _profile_and_layout(args)
+    runtime_path = _runtime_path(lay)
+    runtime_config = _load_runtime(runtime_path)
+
+    llama_cfg = runtime_config.get("llama_cpp")
+    if not llama_cfg or not llama_cfg.get("server_binary"):
+        log.error("No llama.cpp install found at %s -- run the installer first.", runtime_path)
+        return 1
+
+    try:
+        cached = list_cached_models(Path(llama_cfg["server_binary"]))
+    except ModelPullError as exc:
+        log.error("%s", exc)
+        return 1
+    if args.model not in cached:
+        log.error("%s isn't in the local cache -- `list` shows what is.", args.model)
+        return 1
+
+    record = model_health.read_record(lay.config_dir, args.model) or {}
+    if record.get("quarantine_reason"):
+        print(f"{args.model} was held back: {record['quarantine_reason']}.")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log.error(
+                "Removing %s deletes its downloaded weights. Re-run with --yes to confirm.",
+                args.model,
+            )
+            return 1
+        try:
+            answer = input(f"Delete {args.model} and its downloaded weights? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("Left alone.")
+            return 1
+
+    if not _delete_cached_model(llama_cfg, args.model):
+        print(
+            "Could not remove it -- the service wasn't reachable. Start the service and try "
+            "again (removal goes through the running router, which also stops any instance of "
+            "the model that is still loaded)."
+        )
+        return 1
+
+    presets_path = llama_cfg.get("presets_path")
+    if presets_path:
+        model_perf_store.forget(Path(presets_path), args.model)
+    model_health.forget(lay.config_dir, args.model)
+    print(f"{args.model} has been removed.")
     return 0
 
 
@@ -940,6 +1030,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_pull_model(args)
         if args.command == "list":
             return run_list_models(args)
+        if args.command == "remove":
+            return run_remove_model(args)
         if args.command == "benchmark":
             return run_benchmark(args)
     except SystemExit:

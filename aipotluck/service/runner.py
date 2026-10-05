@@ -42,6 +42,7 @@ from aipotluck import diagnostics  # noqa: E402
 from aipotluck.diagnostics import runtime_params  # noqa: E402, F401 -- re-exported, see below
 from aipotluck.installer import model_pull, model_presets, model_sizing  # noqa: E402
 from aipotluck.service.llama_supervisor import LlamaSupervisor  # noqa: E402
+from aipotluck.service import model_health  # noqa: E402
 from aipotluck.service.model_health import ModelHealthWatcher  # noqa: E402
 from aipotluck.service.newt_supervisor import NewtSupervisor  # noqa: E402
 
@@ -264,6 +265,10 @@ class _StatusHandler(BaseHTTPRequestHandler):
                     "runtime_params": runtime_params(self.runner.runtime_config),
                     "llama_server": llama_info,
                     "tunnel": tunnel_info,
+                    # Held-back models are reported here rather than only in the CLI, because the
+                    # web app is where the user picks a model and is the only surface that can
+                    # explain why one keeps failing at the moment they try it.
+                    "held_back_models": model_health.quarantined_models(self.runner.config_dir),
                 }
             )
             return

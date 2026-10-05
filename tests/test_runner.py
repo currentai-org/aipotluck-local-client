@@ -214,6 +214,55 @@ class TestRuntimeParamsWiring:
         assert model_params["tuning"] == {"ctx_size": "auto: test"}
 
 
+class TestHeldBackModelsInStatus:
+    """A real HTTP GET against a real running server. The web app is where a model gets picked, so
+    it is the only surface that can explain, at the moment a user chooses one, why it keeps
+    failing -- which means the quarantine has to leave the CLI and reach /status."""
+
+    def _status(self, config_dir):
+        import json
+        import urllib.request
+
+        svc = runner.AipotluckServiceRunner(
+            host="127.0.0.1", port=0, config_dir=config_dir, log_dir=None
+        )
+        try:
+            svc.start()
+            port = svc._server.server_address[1]
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as resp:
+                return json.loads(resp.read())
+        finally:
+            svc.stop(timeout=2)
+
+    def _config(self, tmp_path):
+        import json
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "runtime.json").write_text(
+            json.dumps({"logged_in": False, "llama_cpp": {}}), encoding="utf-8"
+        )
+        return config_dir
+
+    def test_a_held_back_model_reaches_the_status_endpoint_with_its_reason(self, tmp_path):
+        from aipotluck.service import model_health
+
+        config_dir = self._config(tmp_path)
+        model_health.quarantine(config_dir, "org/repo:Q4_K_M", "ran out of memory 3 times")
+
+        body = self._status(config_dir)
+
+        assert "org/repo:Q4_K_M" in body["held_back_models"]
+        assert body["held_back_models"]["org/repo:Q4_K_M"]["quarantine_reason"] == (
+            "ran out of memory 3 times"
+        )
+
+    def test_the_field_is_present_and_empty_when_nothing_is_held_back(self, tmp_path):
+        """Present-and-empty rather than absent, so a consumer can tell "nothing held back" from
+        "this client is too old to report it"."""
+        assert self._status(self._config(tmp_path))["held_back_models"] == {}
+
+
 class TestBuildSupervisor:
     def test_returns_none_without_llama_cpp_section(self, caplog):
         with caplog.at_level(logging.ERROR, logger="aipotluck.service"):
