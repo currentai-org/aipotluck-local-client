@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aipotluck.installer import cli
+from aipotluck.installer import model_sizing
 from aipotluck.installer.model_sizing import SizingResult
 from aipotluck.installer.platform_detect import HostProfile
 
@@ -936,6 +937,41 @@ class TestPullGate:
         out = capsys.readouterr().out
         assert rc == 0 and deletes == []
         assert "LocalScore 412" in out
+
+    def test_a_model_with_no_room_for_context_is_rejected_without_benchmarking(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Sizing already knows the answer, so the benchmark must not run at all -- loading and
+        measuring a model to confirm what the memory budget settled is pure cost to the user."""
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k="q4_0", cache_type_v="q4_0",
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT,
+            rejection="this device has 4.00GB of memory and its 8.00GB of weights exceed the budget",
+        )
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        benchmarks = []
+        monkeypatch.setattr(cli, "_benchmark_model",
+                            lambda *a, **kw: benchmarks.append(1) or (_screen(False), _score(412.0)))
+        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: unviable)
+
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+
+        out = capsys.readouterr().out
+        assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
+        assert benchmarks == [], "sizing already decided; the benchmark is wasted work"
+        assert "exceed the budget" in out, "the reason must survive into the user-facing output"
+
+    def test_force_keeps_a_model_sizing_would_reject(self, tmp_path, monkeypatch):
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k=None, cache_type_v=None,
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT, rejection="no room",
+        )
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: unviable)
+        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
+        assert deletes == []
 
     def test_a_low_confidence_score_says_so(self, tmp_path, monkeypatch, capsys):
         """A device that moved 30% under its own measurement cannot support a precise number, and

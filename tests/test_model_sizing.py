@@ -337,6 +337,70 @@ class TestComputeSizing:
         result = compute_sizing(_profile(0.001))
         assert result.ctx_size == model_sizing._MIN_CTX_SIZE
 
+
+class TestSizingViability:
+    """Whether this device can give the model a context big enough to hold one turn.
+
+    Sizing reaches this verdict from the memory budget alone, before anything is downloaded into a
+    benchmark, so it is the cheapest place to catch a model that has nowhere to put a conversation.
+    Before this, such a model was floored to 512 tokens and returned as though it had been sized:
+    the preset looked ordinary and the failure surfaced much later.
+    """
+
+    def test_a_comfortable_model_is_viable(self):
+        result = compute_sizing(_profile(3.0))
+        assert result.viable
+        assert result.rejection_code is None and result.rejection is None
+
+    def test_rejects_when_the_weights_leave_no_room_for_a_kv_cache(self):
+        # 8GB of weights against 4GB of RAM: the budget is negative before context is considered.
+        result = compute_sizing(_profile(4.0, model_size_bytes=8 * 1024**3))
+        assert not result.viable
+        assert result.rejection_code == model_sizing.REJECT_NO_ROOM_FOR_CONTEXT
+        assert "exceed the budget" in result.rejection
+
+    def test_rejects_when_room_exists_but_is_under_one_turn(self):
+        """The subtler half: memory is left over, just not enough for a turn. This is the case the
+        512-token floor used to hide."""
+        result = compute_sizing(_profile(0.001))
+        assert not result.viable
+        assert result.rejection_code == model_sizing.REJECT_NO_ROOM_FOR_CONTEXT
+        assert "one turn needs 2048" in result.rejection
+
+    def test_still_returns_a_usable_sizing_alongside_the_rejection(self):
+        """compute_sizing's never-raises contract is unchanged: callers that only want numbers
+        keep getting them, and only the ones that ask about `viable` change behaviour."""
+        result = compute_sizing(_profile(0.001))
+        assert result.ctx_size == model_sizing._MIN_CTX_SIZE
+        assert result.parallel == 1
+        assert result.tuning["ctx_size"]
+
+    def test_blames_the_model_not_the_device_when_the_trained_context_is_tiny(self):
+        """A 1k-token model fails on any hardware, so the reason must not point at this device --
+        otherwise a user goes looking for more RAM that would not have helped."""
+        result = compute_sizing(_profile(64.0, n_ctx_train=1024))
+        assert not result.viable
+        assert result.rejection_code == model_sizing.REJECT_CONTEXT_TOO_SMALL
+        assert "trained context" in result.rejection
+
+    def test_is_viable_at_exactly_the_minimum_servable_context(self):
+        """Pins the boundary: 2048 is servable, so the gate must not be off by one."""
+        profile = _profile(64.0, n_ctx_train=model_sizing.MIN_SERVABLE_CTX_TOKENS)
+        assert compute_sizing(profile).viable
+
+    def test_decides_a_tiny_trained_context_even_when_memory_cannot_be_measured(self):
+        """On a platform with no /proc/meminfo there is no budget to reason about, but a model
+        trained too narrow is a fact about the model, so it is still decidable."""
+        result = compute_sizing(_profile(None, n_ctx_train=1024))
+        assert not result.viable
+        assert result.rejection_code == model_sizing.REJECT_CONTEXT_TOO_SMALL
+
+    def test_stays_viable_when_memory_cannot_be_measured_and_the_model_is_wide_enough(self):
+        """Must not guess. With no memory reading, an adequately-trained model gets the benefit of
+        the doubt rather than a rejection built on a number we do not have."""
+        result = compute_sizing(_profile(None, n_ctx_train=8192))
+        assert result.viable and result.rejection is None
+
     def test_the_models_own_weight_size_is_subtracted_from_the_budget_before_sizing_context(self):
         # Same total RAM (1.0GB) and same trained context (8192, the _profile default) -- but one
         # profile's model weighs 0.9GB, leaving next to nothing for KV cache. Chosen so that

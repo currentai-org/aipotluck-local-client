@@ -654,6 +654,29 @@ def _benchmark_model(
     return screened, score
 
 
+def _reject_model(llama_cfg: dict, presets_path: Path, model_id: str, headline: str) -> int:
+    """Removes a model that cannot serve a turn here, and explains why.
+
+    Shared by both reject paths -- sizing (no room for a context) and the screen (too slow, or
+    won't load) -- because the consequence is identical and only the headline differs. Deleting is
+    what actually enforces it: the router auto-discovers the HF cache, so a model merely left
+    without a preset stays listed by /v1/models and pickable in the chat UI."""
+    print()
+    print(headline)
+    removed = _delete_cached_model(llama_cfg, model_id)
+    if removed:
+        model_perf_store.forget(presets_path, model_id)
+        print("It has been removed so it can't be picked in the chat model list.")
+    else:
+        print(
+            "It is still on disk -- the service wasn't reachable to remove it. Start the "
+            f"service and run `aipotluck-local-client pull {model_id}` again, or keep it "
+            "anyway with --force."
+        )
+    print("Pull it again with --force if you want it regardless.")
+    return 1
+
+
 def run_pull_model(args: argparse.Namespace) -> int:
     """Downloads `args.model` via llama-server's own -hf downloader (see model_pull.py), sizes it
     (aipotluck.installer.model_sizing -- ctx_size/parallel/cache_type_k/-v, written into the
@@ -708,6 +731,16 @@ def run_pull_model(args: argparse.Namespace) -> int:
                 f"  ctx_size={sizing.ctx_size} parallel={sizing.parallel} "
                 f"cache_type_k={sizing.cache_type_k} cache_type_v={sizing.cache_type_v}"
             )
+            # Sizing can already tell this model has nowhere to put a conversation. Stopping here
+            # saves the user a benchmark whose only possible answer is the one we already have, and
+            # it is the cheaper half of the same verdict: the screen would reach it too, but only
+            # after loading the model and measuring it.
+            if not sizing.viable and not args.force:
+                return _reject_model(
+                    llama_cfg, Path(presets_path), args.model,
+                    f"{args.model} cannot serve a conversation on this device -- "
+                    f"{sizing.rejection}.",
+                )
 
     screened = score = None
     if presets_path and not args.skip_benchmark:
@@ -721,20 +754,10 @@ def run_pull_model(args: argparse.Namespace) -> int:
             _print_score(score)
 
     if screened is not None and screened.rejected and not args.force:
-        print()
-        print(f"{args.model} cannot serve a conversation on this device.")
-        removed = _delete_cached_model(llama_cfg, args.model)
-        if removed:
-            model_perf_store.forget(Path(presets_path), args.model)
-            print("It has been removed so it can't be picked in the chat model list.")
-        else:
-            print(
-                "It is still on disk -- the service wasn't reachable to remove it. Start the "
-                f"service and run `aipotluck-local-client pull {args.model}` again, or keep it "
-                "anyway with --force."
-            )
-        print("Pull it again with --force if you want it regardless.")
-        return 1
+        return _reject_model(
+            llama_cfg, Path(presets_path), args.model,
+            f"{args.model} cannot serve a conversation on this device.",
+        )
 
     if _reload_router_models(llama_cfg):
         print()

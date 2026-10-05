@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from aipotluck.installer import model_perf
+from aipotluck.installer import model_perf, model_sizing
 
 log = logging.getLogger("aipotluck.installer.model_screen")
 
@@ -41,7 +41,9 @@ MIN_PROMPT_TOKENS = 2_048
 MIN_OUTPUT_TOKENS = 100
 
 # A context smaller than this cannot hold the system prompt, so no turn is servable at any speed.
-MIN_CONTEXT_TOKENS = 2_048
+# Defined in model_sizing, which reaches the same verdict earlier and more cheaply (from the memory
+# budget, before anything is benchmarked); re-exported here so both layers enforce one number.
+MIN_CONTEXT_TOKENS = model_sizing.MIN_SERVABLE_CTX_TOKENS
 
 # The cheap probe extrapolates ~8x, so it only decides a case that is clear by a wide margin.
 # Inside this band the verdict is bought with a real measurement instead of guessed.

@@ -72,6 +72,18 @@ _MEMORY_BUDGET_FRACTION = 0.80
 # back something too small to be useful.
 _MIN_CTX_SIZE = 512
 
+# The smallest context the web app can actually serve a turn in. Its system prompt alone is roughly
+# 1,450 tokens before any conversation, retrieval or attachment, so a window under this cannot hold
+# one exchange at any speed. Defined here rather than in model_screen because sizing is the first
+# place that can tell -- it knows the memory budget before a single token is benchmarked -- and
+# model_screen imports it from here so the two can never disagree about the same contract.
+MIN_SERVABLE_CTX_TOKENS = 2_048
+
+# Why a model's sizing can be non-viable. These mirror model_screen's reject codes deliberately:
+# the user sees one vocabulary regardless of which layer caught it.
+REJECT_NO_ROOM_FOR_CONTEXT = "no_room_for_context"
+REJECT_CONTEXT_TOO_SMALL = "context_too_small"
+
 _BYTES_PER_UNIT = {"MiB": 1024**2, "GiB": 1024**3}
 
 
@@ -92,11 +104,18 @@ class ModelProfile:
 
 @dataclass
 class SizingResult:
+    """`viable` is False when this device cannot give the model a servable context. The sizing is
+    still returned (callers that only want numbers keep working), but `ctx_size` is then a floor
+    that was never going to be enough -- see compute_sizing."""
+
     ctx_size: int
     parallel: int
     cache_type_k: str | None
     cache_type_v: str | None
     tuning: dict[str, str]
+    viable: bool = True
+    rejection_code: str | None = None
+    rejection: str | None = None
 
 
 def _free_port(host: str) -> int:
@@ -302,8 +321,17 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
             "could not measure total system memory on this platform -- sized to the model's own "
             f"trained context ({profile.n_ctx_train}) with no memory-budget check"
         )
+        # A trained context too small to hold one turn is a fact about the model, not the device,
+        # so it is still decidable here even with no memory reading to budget against.
+        too_narrow = profile.n_ctx_train < MIN_SERVABLE_CTX_TOKENS
         return SizingResult(
-            ctx_size=profile.n_ctx_train, parallel=parallel, cache_type_k=None, cache_type_v=None, tuning=tuning
+            ctx_size=profile.n_ctx_train, parallel=parallel, cache_type_k=None, cache_type_v=None,
+            tuning=tuning, viable=not too_narrow,
+            rejection_code=REJECT_CONTEXT_TOO_SMALL if too_narrow else None,
+            rejection=(
+                f"its trained context is {profile.n_ctx_train} tokens, under the "
+                f"{MIN_SERVABLE_CTX_TOKENS} a single turn needs"
+            ) if too_narrow else None,
         )
 
     # Budgeted against TOTAL installed RAM (a stable hardware fact), not a live "available now"
@@ -362,6 +390,39 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
         tuning["cache_type_k"] = tuning["cache_type_v"] = reason
 
     model_size_gb = profile.model_size_bytes / (1024**3)
+
+    # The verdict is taken from the context the budget ACTUALLY supports, before the floor below
+    # rewrites it. Flooring a hopeless model to 512 and returning it as though it were sized was
+    # the old behaviour: the preset looked ordinary, the model stayed installed, and the failure
+    # only surfaced later as a benchmark reject or a turn that could not fit its own system prompt.
+    fitted_ctx = ctx
+    if fitted_ctx < MIN_SERVABLE_CTX_TOKENS:
+        if profile.n_ctx_train < MIN_SERVABLE_CTX_TOKENS:
+            # Nothing to do with this device: the model was never trained wide enough to hold one
+            # turn, so no amount of memory would change the answer.
+            rejection_code = REJECT_CONTEXT_TOO_SMALL
+            rejection = (
+                f"its trained context is {profile.n_ctx_train} tokens, under the "
+                f"{MIN_SERVABLE_CTX_TOKENS} a single turn needs"
+            )
+        else:
+            headroom_gb = (
+                profile.total_memory_gb * _MEMORY_BUDGET_FRACTION - model_size_gb
+            )
+            shortfall = (
+                f"its {model_size_gb:.2f}GB of weights leave {headroom_gb:.2f}GB"
+                if headroom_gb >= 0
+                else f"its {model_size_gb:.2f}GB of weights exceed the budget by {-headroom_gb:.2f}GB"
+            )
+            rejection_code = REJECT_NO_ROOM_FOR_CONTEXT
+            rejection = (
+                f"this device has {profile.total_memory_gb:.2f}GB of memory and "
+                f"{shortfall} for a KV cache -- enough for about {max(fitted_ctx, 0)} tokens of "
+                f"context, where one turn needs {MIN_SERVABLE_CTX_TOKENS}"
+            )
+    else:
+        rejection_code = rejection = None
+
     if ctx < _MIN_CTX_SIZE:
         tuning["ctx_size"] = (
             f"memory budget only supports ~{max(ctx, 0)} tokens of context after the model's own "
@@ -377,7 +438,11 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
             f"capped at the model's trained context ({profile.n_ctx_train})"
         )
 
-    return SizingResult(ctx_size=ctx, parallel=parallel, cache_type_k=cache_type_k, cache_type_v=cache_type_v, tuning=tuning)
+    return SizingResult(
+        ctx_size=ctx, parallel=parallel, cache_type_k=cache_type_k, cache_type_v=cache_type_v,
+        tuning=tuning, viable=rejection_code is None, rejection_code=rejection_code,
+        rejection=rejection,
+    )
 
 
 def ensure_preset(
