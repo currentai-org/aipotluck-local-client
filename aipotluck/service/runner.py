@@ -42,6 +42,7 @@ from aipotluck import diagnostics  # noqa: E402
 from aipotluck.diagnostics import runtime_params  # noqa: E402, F401 -- re-exported, see below
 from aipotluck.installer import model_pull, model_presets, model_sizing  # noqa: E402
 from aipotluck.service.llama_supervisor import LlamaSupervisor  # noqa: E402
+from aipotluck.service.model_health import ModelHealthWatcher  # noqa: E402
 from aipotluck.service.newt_supervisor import NewtSupervisor  # noqa: E402
 
 SERVICE_NAME = "aipotluck"
@@ -164,6 +165,26 @@ def backfill_missing_presets(llama_cfg: dict) -> None:
             log.warning("Could not size cached model %r (%s) -- it will use llama-server's own defaults", model_id, exc)
 
 
+def build_health_watcher(
+    runtime_config: dict, config_dir: Path, log_dir: Path | None
+) -> ModelHealthWatcher | None:
+    """`None` when there is no router to watch or no presets file to adjust -- without a
+    --models-preset path there is no per-model context to shrink, so an OOM has no remedy this
+    layer could apply."""
+    llama_cfg = runtime_config.get("llama_cpp") or {}
+    presets_path = llama_cfg.get("presets_path")
+    if not llama_cfg.get("server_binary") or not presets_path:
+        return None
+    host = llama_cfg.get("host", DEFAULT_HOST)
+    port = llama_cfg.get("port", DEFAULT_PORT)
+    return ModelHealthWatcher(
+        base_url=f"http://{host}:{port}",
+        presets_path=Path(presets_path),
+        config_dir=Path(config_dir),
+        log_path=(Path(log_dir) / "llama-server.log") if log_dir else None,
+    )
+
+
 def build_newt_supervisor(runtime_config: dict, log_dir: Path | None) -> NewtSupervisor | None:
     """`None` when this install has no `tunnel` section -- true for every device until it's paired
     via `aipotluck-local-client login`, and again after `logout` drops the section."""
@@ -281,6 +302,7 @@ class AipotluckServiceRunner:
         self.runtime_config: dict = {}
         self.supervisor: LlamaSupervisor | None = None
         self.newt_supervisor: NewtSupervisor | None = None
+        self.health_watcher: ModelHealthWatcher | None = None
         self._server: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._stopped = threading.Event()
@@ -307,6 +329,15 @@ class AipotluckServiceRunner:
             if self.newt_supervisor:
                 log.info("Starting newt supervisor")
                 self.newt_supervisor.start()
+
+            # Started last and stopped first: it only observes, so it is never the reason anything
+            # else is unavailable.
+            self.health_watcher = build_health_watcher(
+                self.runtime_config, self.config_dir, self.log_dir
+            )
+            if self.health_watcher:
+                log.info("Starting model health watcher")
+                self.health_watcher.start()
         else:
             log.info(
                 "Device is logged out -- llama-server and the tunnel will not start until you run "
@@ -342,6 +373,8 @@ class AipotluckServiceRunner:
                 self._server_thread.join(timeout=5)
             self._server.server_close()
             self._server = None
+        if self.health_watcher:
+            self.health_watcher.stop()
         if self.supervisor:
             self.supervisor.stop(timeout=timeout)
         if self.newt_supervisor:
