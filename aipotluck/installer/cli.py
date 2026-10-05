@@ -54,6 +54,7 @@ from aipotluck.installer import (  # noqa: E402
     model_screen,
     model_perf_live,
     model_perf_store,
+    model_preflight,
     model_presets,
     newt_fetch,
 )
@@ -64,7 +65,9 @@ from aipotluck.installer.model_pull import (  # noqa: E402
     list_cached_models,
     pull_model,
 )
+from aipotluck.installer import model_sizing  # noqa: E402
 from aipotluck.installer.model_sizing import ModelSizingError, ensure_preset  # noqa: E402
+from aipotluck.installer.source_build import _total_memory_gb  # noqa: E402
 from aipotluck.installer.platform_detect import HostProfile, detect_host_profile  # noqa: E402
 from aipotluck.installer.service.base import get_service_manager  # noqa: E402
 from aipotluck.service.runner import DEFAULT_HOST, DEFAULT_PORT  # noqa: E402
@@ -654,6 +657,25 @@ def _benchmark_model(
     return screened, score
 
 
+def _confirm_oversized_pull(verdict: "model_preflight.PreflightVerdict") -> bool:
+    """Consent to downloading a model whose weights don't fit in this machine's memory.
+
+    Defaults to no, and never prompts without a controlling terminal: a piped or scripted pull has
+    no one to answer, and the safe default there is to stop rather than spend the download. --force
+    is the documented way through either way."""
+    print()
+    print(f"WARNING: {verdict.detail}")
+    print("Downloading it would spend the time and disk, and it still would not run here.")
+    if not sys.stdin.isatty():
+        print("Re-run with --force if you want it anyway.")
+        return False
+    try:
+        answer = input("Download it anyway? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def _reject_model(llama_cfg: dict, presets_path: Path, model_id: str, headline: str) -> int:
     """Removes a model that cannot serve a turn here, and explains why.
 
@@ -693,6 +715,16 @@ def run_pull_model(args: argparse.Namespace) -> int:
     if not llama_cfg or not llama_cfg.get("server_binary"):
         log.error("No llama.cpp install found at %s -- run the installer first.", runtime_path)
         return 1
+
+    # Before spending the download: are the weights simply bigger than the machine? This is the
+    # only question answerable from a file listing, and it is the one case where proceeding is
+    # certainly futile -- every other verdict needs the model on disk first.
+    if not args.force:
+        verdict = model_preflight.check_fits_in_memory(
+            args.model, total_memory_gb=_total_memory_gb()
+        )
+        if verdict is not None and not verdict.fits and not _confirm_oversized_pull(verdict):
+            return 1
 
     print(f"Pulling {args.model} -- this can take a while for a large quant.")
     try:

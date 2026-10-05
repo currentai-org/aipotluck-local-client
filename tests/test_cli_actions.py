@@ -22,6 +22,15 @@ from aipotluck.installer.model_sizing import SizingResult
 from aipotluck.installer.platform_detect import HostProfile
 
 
+@pytest.fixture(autouse=True)
+def no_preflight_network(monkeypatch):
+    """`pull` asks Hugging Face how big a model is before downloading it. Left alone that is a real
+    HTTP call from every pull test -- slow, offline-hostile, and dependent on a repo that doesn't
+    exist. Default every test to "no verdict" (the honest answer when the size can't be read) and
+    let the tests that are about the gate say otherwise."""
+    monkeypatch.setattr(cli.model_preflight, "check_fits_in_memory", lambda *a, **kw: None)
+
+
 def make_args(install_dir: Path, **overrides) -> Namespace:
     defaults = dict(
         install_dir=install_dir,
@@ -589,6 +598,93 @@ class TestReloadRouterModels:
         monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
         assert cli._reload_router_models({}) is True
         assert seen_urls == ["http://127.0.0.1:8080/models?reload=1"]
+
+
+class TestOversizedModelGate:
+    """Refusing a download whose weights are bigger than the machine.
+
+    This is the only check that runs before the download, so it is also the only one that can save
+    the user the download. It is deliberately advisory: it asks, it does not decide, and an absent
+    verdict always proceeds.
+    """
+
+    def _setup(self, tmp_path, monkeypatch, verdict, *, tty=True):
+        install_dir = tmp_path / "install"
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"},
+            "service": {},
+        })
+        pulls = []
+        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: pulls.append(1))
+        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: True)
+        monkeypatch.setattr(cli, "_benchmark_model", lambda *a, **kw: (None, None))
+        monkeypatch.setattr(cli.model_preflight, "check_fits_in_memory", lambda *a, **kw: verdict)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty, raising=False)
+        return install_dir, pulls
+
+    @staticmethod
+    def _verdict(fits):
+        return cli.model_preflight.PreflightVerdict(
+            fits=fits, model_bytes=8 * 1024**3, total_memory_bytes=4 * 1024**3,
+            detail="org/repo:Q4_K_M is 8.0GB of weights, and this device has 4.0GB of memory in total.",
+        )
+
+    def test_declining_the_prompt_stops_before_downloading(self, tmp_path, monkeypatch, capsys):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+
+        assert rc == 1
+        assert pulls == [], "the whole point is not spending the download"
+        assert "WARNING" in capsys.readouterr().out
+
+    def test_accepting_the_prompt_downloads_anyway(self, tmp_path, monkeypatch):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1]
+
+    def test_the_default_answer_is_no(self, tmp_path, monkeypatch):
+        """Empty input must not be read as consent -- this prompt spends gigabytes."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 1
+        assert pulls == []
+
+    def test_a_model_that_fits_is_never_mentioned(self, tmp_path, monkeypatch, capsys):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(True))
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1] and "WARNING" not in capsys.readouterr().out
+
+    def test_no_verdict_proceeds_without_a_prompt(self, tmp_path, monkeypatch):
+        """Offline, rate-limited or a private repo. Absence of evidence has to let the pull through
+        to the layers that measure for real, or this gate becomes an outage."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, None)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1]
+
+    def test_force_skips_the_check_entirely(self, tmp_path, monkeypatch):
+        lookups = []
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr(cli.model_preflight, "check_fits_in_memory",
+                            lambda *a, **kw: lookups.append(1) or self._verdict(False))
+        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
+        assert pulls == [1]
+        assert lookups == [], "--force means don't even ask Hugging Face"
+
+    def test_without_a_terminal_it_refuses_instead_of_prompting(self, tmp_path, monkeypatch, capsys):
+        """A piped or scripted pull has nobody to answer, so blocking on input would hang and
+        assuming yes would spend the download. Stop, and name the flag that overrides."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False), tty=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 1
+        assert pulls == []
+        assert "--force" in capsys.readouterr().out
 
 
 class TestRunPullModel:
