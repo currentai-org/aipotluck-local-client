@@ -113,10 +113,20 @@ def _check_health(host: str, port: int) -> bool:
         return False
 
 
-def _drain(proc: subprocess.Popen, lines: list[str]) -> None:
+def _drain(proc: subprocess.Popen, lines: list[str], failures: list[BaseException]) -> None:
+    """Reads the child's merged stdout+stderr until EOF, on its own thread.
+
+    Anything raised here would otherwise vanish into a dead thread: the output simply stops
+    arriving, and the probe fails much later with "could not find 'n_ctx_train'" -- a message about
+    the wrong thing entirely. So a reader failure is recorded and reported alongside the parse
+    error instead of being left to print a bare traceback from a thread nobody is watching."""
     assert proc.stdout is not None
-    for line in proc.stdout:
-        lines.append(line)
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad; see the docstring
+        failures.append(exc)
+        log.warning("Stopped reading llama-server's output early: %s", exc)
 
 
 def _parse_int(text: str, key: str) -> int:
@@ -197,9 +207,24 @@ def probe_model_profile(
         cmd += ["--gpu-layers", str(gpu_layers)]
 
     log.info("Probing model metadata for %s", model_path or model_hf)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    # errors="replace", not the default "strict": llama.cpp truncates long string values in its
+    # `llama_model_loader: - kv NN: ...` preview at a fixed width WITHOUT respecting UTF-8
+    # character boundaries, so a byte-level-BPE tokenizer whose token array happens to straddle
+    # that cut emits a half-written character. Confirmed on a Jetson against
+    # LiquidAI/LFM2.5-8B-A1B-GGUF: the `tokenizer.ggml.tokens` line ends `c4 8a c4 8a c4 2e 2e 2e`
+    # -- a two-byte `Ċ` (U+010A) chopped after its lead byte, then "...". Strict decoding raised
+    # UnicodeDecodeError inside the reader thread and took the whole probe down with it.
+    #
+    # Nothing here needs those bytes intact: this output is scanned with ASCII regexes for hparams
+    # (n_ctx_train, n_embd_k_gqa, file size) and otherwise echoed into error messages, so a U+FFFD
+    # in a tokenizer preview costs nothing, while a crash costs the user the model.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace", bufsize=1,
+    )
     lines: list[str] = []
-    reader = threading.Thread(target=_drain, args=(proc, lines), daemon=True)
+    drain_failures: list[BaseException] = []
+    reader = threading.Thread(target=_drain, args=(proc, lines, drain_failures), daemon=True)
     reader.start()
 
     try:
@@ -230,15 +255,26 @@ def probe_model_profile(
         reader.join(timeout=5)
 
     output = "".join(lines)
-    return ModelProfile(
-        n_ctx_train=_parse_int(output, "n_ctx_train"),
-        n_layer=_parse_int(output, "n_layer"),
-        n_embd_head_k=_parse_int(output, "n_embd_head_k"),
-        n_embd_k_gqa=_parse_int_or_list_max(output, "n_embd_k_gqa"),
-        n_embd_v_gqa=_parse_int_or_list_max(output, "n_embd_v_gqa"),
-        model_size_bytes=_parse_model_size_bytes(output),
-        total_memory_gb=_total_memory_gb(),
-    )
+    try:
+        return ModelProfile(
+            n_ctx_train=_parse_int(output, "n_ctx_train"),
+            n_layer=_parse_int(output, "n_layer"),
+            n_embd_head_k=_parse_int(output, "n_embd_head_k"),
+            n_embd_k_gqa=_parse_int_or_list_max(output, "n_embd_k_gqa"),
+            n_embd_v_gqa=_parse_int_or_list_max(output, "n_embd_v_gqa"),
+            model_size_bytes=_parse_model_size_bytes(output),
+            total_memory_gb=_total_memory_gb(),
+        )
+    except ModelSizingError as exc:
+        # A truncated read and a genuinely missing hparam look identical from here -- both are just
+        # a key that isn't in `output`. Say which one it was, so the next person debugs the reader
+        # rather than the regex.
+        if drain_failures:
+            raise ModelSizingError(
+                f"{exc} -- llama-server's output was cut short by a read error "
+                f"({drain_failures[0]!r}), so the value may well have been printed."
+            ) from exc
+        raise
 
 
 def _kv_cache_bytes_per_token(profile: ModelProfile, cache_type_k: str, cache_type_v: str) -> float:

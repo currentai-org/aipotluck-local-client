@@ -291,7 +291,10 @@ def run_bench_raw(bench_binary: Path, model_id: str, args: list[str], *, timeout
     load rather than a single point."""
     cmd = [str(bench_binary), "-hf", model_id, "--offline", "-o", "json"] + args
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # errors="replace": llama.cpp can emit half-written UTF-8 characters when it truncates long metadata strings (see model_sizing.probe_model_profile), and a decode error here would lose a measurement over mojibake in a log line nothing parses.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
     except subprocess.TimeoutExpired as exc:
         raise ModelPerfError(f"llama-bench timed out after {timeout:.0f}s") from exc
     if proc.returncode != 0:
@@ -357,7 +360,10 @@ def run_bench_point(
     )
     log.info("Benchmarking %s at depth %d", model_id, depth)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # errors="replace" -- same reason as run_bench_raw above.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
     except subprocess.TimeoutExpired as exc:
         raise ModelPerfError(f"llama-bench timed out after {timeout:.0f}s at depth {depth}") from exc
     if proc.returncode != 0:

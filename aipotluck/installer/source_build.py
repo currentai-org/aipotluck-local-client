@@ -326,7 +326,11 @@ def _git_commit(vendor_dir: Path) -> str:
 
 def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        # errors="replace": a compiler quoting a non-UTF-8 byte from a source file is enough to
+        # make strict decoding raise, which would abort a build over how its output is worded.
+        result = subprocess.run(
+            args, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
     except OSError as exc:
         raise BuildError(f"Could not run {' '.join(args)}: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
