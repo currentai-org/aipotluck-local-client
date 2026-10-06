@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,7 +43,8 @@ from aipotluck import diagnostics  # noqa: E402
 from aipotluck.diagnostics import runtime_params  # noqa: E402, F401 -- re-exported, see below
 from aipotluck.installer import model_pull, model_presets, model_sizing  # noqa: E402
 from aipotluck.service.llama_supervisor import LlamaSupervisor  # noqa: E402
-from aipotluck.service import model_health  # noqa: E402
+from aipotluck.service import jobs as jobs_module  # noqa: E402
+from aipotluck.service import model_health, model_ops  # noqa: E402
 from aipotluck.service.model_health import ModelHealthWatcher  # noqa: E402
 from aipotluck.service.newt_supervisor import NewtSupervisor  # noqa: E402
 
@@ -235,7 +237,55 @@ class _StatusHandler(BaseHTTPRequestHandler):
         sanitized["tunnel"] = {**runtime_config["tunnel"], "secret": "<redacted>"}
         return sanitized
 
+    def _write_error(self, message: str, *, code: str, status: int) -> None:
+        self._write_json({"error": {"code": code, "message": message}}, status=status)
+
+    def _read_json_body(self) -> dict:
+        """The request body as a dict. An empty body is an empty dict -- POST /models/benchmark
+        with no arguments is a legitimate "measure everything" request."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("body must be a JSON object")
+        return payload
+
+    def _llama_cfg(self) -> dict:
+        return self.runner.runtime_config.get("llama_cpp") or {}
+
+    def _query(self) -> dict[str, list[str]]:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+    def _route(self) -> str:
+        return urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
     def do_GET(self) -> None:
+        if self._route() == "/models":
+            try:
+                self._write_json(
+                    model_ops.list_models(self._llama_cfg(), self.runner.config_dir)
+                )
+            except model_ops.ModelOpError as exc:
+                self._write_error(str(exc), code=exc.code, status=exc.status)
+            return
+
+        if self._route() == "/jobs":
+            self._write_json({"jobs": [job.to_dict() for job in self.runner.jobs.list()]})
+            return
+
+        if self._route().startswith("/jobs/"):
+            job = self.runner.jobs.get(self._route()[len("/jobs/"):])
+            if job is None:
+                self._write_error("No such job.", code="unknown_job", status=404)
+            else:
+                self._write_json(job.to_dict())
+            return
+
         if self.path == "/healthz":
             body = b"ok"
             self.send_response(200)
@@ -286,6 +336,108 @@ class _StatusHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_POST(self) -> None:
+        route = self._route()
+        if route not in ("/models", "/models/benchmark"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            body = self._read_json_body()
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._write_error(f"Could not read the request body: {exc}", code="bad_request", status=400)
+            return
+
+        llama_cfg = self._llama_cfg()
+        config_dir = self.runner.config_dir
+        try:
+            model_ops.require_llama(llama_cfg)
+        except model_ops.ModelOpError as exc:
+            self._write_error(str(exc), code=exc.code, status=exc.status)
+            return
+
+        if route == "/models":
+            model_id = body.get("model")
+            if not isinstance(model_id, str) or not model_id.strip():
+                self._write_error(
+                    'A "model" field is required, e.g. {"model": "org/repo:Q4_K_M"}.',
+                    code="bad_request", status=400,
+                )
+                return
+            # The preflight runs HERE, before the job is queued, so an oversized model is refused
+            # in the response the caller is already waiting on rather than as a job that fails
+            # minutes later. It is also the one rejection a caller can act on by retrying.
+            force = bool(body.get("force"))
+            allow_oversized = bool(body.get("allow_oversized")) or force
+            if not allow_oversized:
+                verdict = model_ops.check_size_before_download(model_id)
+                if verdict is not None and not verdict["fits"]:
+                    self._write_json(
+                        {
+                            "error": {
+                                "code": "too_large_for_device",
+                                "message": verdict["detail"],
+                                "preflight": verdict,
+                                "retry_with": {"allow_oversized": True},
+                            }
+                        },
+                        status=409,
+                    )
+                    return
+
+            keep_rejected = bool(body.get("keep_rejected")) or force
+            skip_benchmark = bool(body.get("skip_benchmark"))
+            timeout = body.get("timeout")
+
+            def _pull(job):
+                return model_ops.pull(
+                    llama_cfg, config_dir, model_id,
+                    allow_oversized=True,  # already decided above, with the caller's answer
+                    keep_rejected=keep_rejected, skip_benchmark=skip_benchmark,
+                    timeout=float(timeout) if timeout is not None else None,
+                    progress=self.runner.jobs.progress_callback(job),
+                )
+
+            job = self.runner.jobs.submit("pull", model_id, _pull)
+            self._write_json({"job": job.to_dict()}, status=202)
+            return
+
+        model_id = body.get("model")
+        if model_id is not None and not isinstance(model_id, str):
+            self._write_error('"model" must be a string if given.', code="bad_request", status=400)
+            return
+
+        def _benchmark(job):
+            return model_ops.benchmark(
+                llama_cfg, config_dir, model_id,
+                progress=self.runner.jobs.progress_callback(job),
+            )
+
+        job = self.runner.jobs.submit("benchmark", model_id, _benchmark)
+        self._write_json({"job": job.to_dict()}, status=202)
+
+    def do_DELETE(self) -> None:
+        if self._route() != "/models":
+            self.send_response(404)
+            self.end_headers()
+            return
+        # `?model=` rather than a path segment: a model id carries both "/" and ":", and this is
+        # the exact shape llama.cpp's own router uses for the same operation (server-models.cpp's
+        # DELETE /models), which this ultimately calls through to.
+        model_id = (self._query().get("model") or [""])[0]
+        if not model_id:
+            self._write_error(
+                "A ?model= query parameter is required.", code="bad_request", status=400,
+            )
+            return
+        try:
+            self._write_json(
+                model_ops.remove(self._llama_cfg(), self.runner.config_dir, model_id)
+            )
+        except model_ops.ModelOpError as exc:
+            self._write_error(str(exc), code=exc.code, status=exc.status)
+
 
 class AipotluckServiceRunner:
     """OS-agnostic service body: HTTP status server + LlamaSupervisor.
@@ -308,6 +460,7 @@ class AipotluckServiceRunner:
         self.supervisor: LlamaSupervisor | None = None
         self.newt_supervisor: NewtSupervisor | None = None
         self.health_watcher: ModelHealthWatcher | None = None
+        self.jobs = jobs_module.JobRunner()
         self._server: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._stopped = threading.Event()
@@ -359,6 +512,10 @@ class AipotluckServiceRunner:
         self._server = ThreadingHTTPServer((self.host, self.port), BoundHandler)
         log.info("aipotluck service listening on http://%s:%s", self.host, self.port)
 
+        # Started regardless of login state: model management is independent of pairing, the
+        # same way `pull` and `list` are on the CLI.
+        self.jobs.start()
+
         self._server_thread = threading.Thread(
             target=self._server.serve_forever, name="aipotluck-http", daemon=True
         )
@@ -378,6 +535,7 @@ class AipotluckServiceRunner:
                 self._server_thread.join(timeout=5)
             self._server.server_close()
             self._server = None
+        self.jobs.stop()
         if self.health_watcher:
             self.health_watcher.stop()
         if self.supervisor:

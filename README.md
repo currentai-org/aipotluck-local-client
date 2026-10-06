@@ -580,6 +580,76 @@ the router may hold loaded simultaneously. The sizing math above assumes *one* m
 whole memory budget -- raising `--models-max` is a real capacity tradeoff (multiple models sharing
 one memory budget), not a free win, and isn't accounted for by anything in this repo today.
 
+## HTTP API: remote model management
+
+Everything `pull` / `list` / `benchmark` / `remove` do is also reachable over HTTP, on the same
+local service port the status endpoints use (`127.0.0.1:8069` by default). Both surfaces call one
+implementation (`aipotluck/service/model_ops.py`), so the preflight size check, the viability
+screen, the LocalScore probe and the out-of-memory history all behave identically whichever one you
+use -- there is no second code path to drift.
+
+**Security: these endpoints are unauthenticated, exactly like `/status` and `/capabilities`.** The
+service binds to localhost, and anything remote is expected to arrive through an authenticated
+Pangolin resource (Pangolin SSO-gates public resources by default). That is the whole protection:
+**mapping a public Pangolin resource straight at this port exposes model deletion to whoever can
+reach it.** Nothing here checks a token.
+
+| Method | Path | Returns | Notes |
+|---|---|---|---|
+| `GET` | `/models` | `200` listing | sizing, score, staleness and held-back state per model |
+| `POST` | `/models` | `202` job, or `409` | body `{"model": "...", ...}` |
+| `POST` | `/models/benchmark` | `202` job | body `{"model": "..."}`, or empty to measure everything |
+| `DELETE` | `/models?model=<urlencoded>` | `200` | synchronous |
+| `GET` | `/jobs` / `/jobs/{id}` | `200`, or `404` | newest first |
+
+**Slow operations return a job; fast ones answer directly.** A pull downloads gigabytes, sizes,
+screens and scores -- comfortably past ten minutes on a Jetson, which no client will hold a
+connection open for through a tunnel. So `POST` returns `202` with a job id immediately and you poll
+`/jobs/{id}`, where `state` moves `queued` → `running` → `succeeded`/`failed` and `progress` fills
+in as the work happens. `list` and `remove` finish in milliseconds and answer inline.
+
+**Jobs run one at a time, deliberately.** A benchmark taken while something else is loading a model
+measures the contention rather than the model, and two models resident at once was an outright
+allocation failure on a 16GB board. Parallel jobs would reintroduce both, and silently -- the
+scores would simply be wrong, with nothing to say so.
+
+```bash
+# What is installed, and how it performs
+curl -s localhost:8069/models | jq '.models[] | {id, ctx_size, score: .score.localscore, held_back}'
+
+# Pull, then watch it
+JOB=$(curl -s -XPOST localhost:8069/models \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"}' | jq -r .job.id)
+curl -s localhost:8069/jobs/$JOB | jq '{state, progress: [.progress[].message], result}'
+
+# Re-measure everything
+curl -s -XPOST localhost:8069/models/benchmark -d '{}' -H 'Content-Type: application/json'
+
+# Remove one (the id needs url-encoding -- it contains "/" and ":")
+curl -s -XDELETE "localhost:8069/models?model=bartowski%2FQwen2.5-0.5B-Instruct-GGUF%3AQ4_K_M"
+```
+
+**A model too big for the machine is refused before anything is downloaded**, in the response you
+are already waiting on rather than as a job that fails minutes later:
+
+```json
+{"error": {"code": "too_large_for_device",
+           "message": "... is 39.6GB of weights, and this device has 31.0GB of memory in total ...",
+           "preflight": {"fits": false, "model_bytes": 42520398432, "total_memory_bytes": 33272057856},
+           "retry_with": {"allow_oversized": true}}}
+```
+
+`allow_oversized` and `keep_rejected` are separate on purpose, because they answer different
+questions at different costs: one says "download it even though the weights do not fit", decided
+before spending anything; the other says "keep it even though it cannot serve a turn here", decided
+after measuring. `"force": true` sets both, matching the CLI's `--force`.
+
+Errors are always `{"error": {"code", "message"}}`. `code` is stable and worth branching on:
+`no_llama_install` (503), `bad_request` (400), `unknown_model` (404), `unknown_job` (404),
+`too_large_for_device` (409), `download_failed` (502), `delete_failed` (503), `cache_unreadable`
+(503). A failed job carries the same value in `error_code`.
+
 ## CLI on PATH
 
 `aipotluck-local-client` (`aipotluck/installer/cli_shim.py`) is written
