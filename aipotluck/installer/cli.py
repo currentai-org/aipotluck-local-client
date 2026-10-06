@@ -596,6 +596,8 @@ def run_pull_model(args: argparse.Namespace) -> int:
     if result.get("rejected"):
         print()
         print(f"{args.model} cannot serve a conversation on this device -- {result['rejection']}.")
+        if result.get("sizing_error"):
+            log.debug("%s", result["sizing_error"])
         if result.get("removed"):
             print("It has been removed so it can't be picked in the chat model list.")
         else:
@@ -755,6 +757,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if sizing:
             print(f"  re-sized: ctx_size={sizing['ctx_size']} "
                   f"cache_type_k={sizing['cache_type_k']} cache_type_v={sizing['cache_type_v']}")
+        if entry.get("held_back"):
+            print(f"  UNUSABLE -- {entry['rejection']}")
+            print("  It has been held back; it is still installed and still selectable in the")
+            print(f"  chat model list. Remove it with `aipotluck-local-client remove {entry['model']}`.")
+            continue
         if entry.get("measurement_skipped"):
             log.warning("%s", entry["measurement_skipped"])
         if entry.get("screen"):

@@ -43,7 +43,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from aipotluck.installer import model_presets
+from aipotluck.installer import llama_errors, model_presets
 from aipotluck.installer.source_build import _total_memory_gb
 
 log = logging.getLogger("aipotluck.installer.model_sizing")
@@ -88,7 +88,23 @@ _BYTES_PER_UNIT = {"MiB": 1024**2, "GiB": 1024**3}
 
 
 class ModelSizingError(RuntimeError):
-    pass
+    """A model could not be sized.
+
+    `model_failed_to_load` separates the two reasons this happens, because only one of them is a
+    verdict about the model. llama-server exiting while loading it means this device cannot run it
+    at all -- there is nothing to size, and nothing a later retry at a smaller context would fix.
+    Everything else (a missing binary, a timeout, output we could not parse) is a failure of the
+    probe, and a model must not be rejected for that. `failure_kind` then says whether the load
+    failure was an out-of-memory, from llama_errors' shared signatures."""
+
+    def __init__(
+        self, message: str, *, model_failed_to_load: bool = False,
+        failure_kind: str | None = None, exit_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.model_failed_to_load = model_failed_to_load
+        self.failure_kind = failure_kind
+        self.exit_code = exit_code
 
 
 @dataclass
@@ -252,9 +268,16 @@ def probe_model_profile(
         while time.monotonic() < deadline:
             exit_code = proc.poll()
             if exit_code is not None:
-                output = "".join(lines)
+                # The excerpt is filtered rather than tailed: llama.cpp prints its real error and
+                # then dumps a backtrace, so the last 2,000 characters are the frames and the
+                # allocation failure that explains everything sits just above them. Keeping the
+                # blind tail classified a real Jetson OOM as "some other failure" -- the evidence
+                # was in the output and was truncated away before anything could read it.
+                excerpt = llama_errors.diagnostic_excerpt("".join(lines))
+                kind = llama_errors.classify_failure(excerpt, exit_code)
                 raise ModelSizingError(
-                    f"llama-server exited (code={exit_code}) while probing model metadata:\n{output[-2000:]}"
+                    f"llama-server exited (code={exit_code}) while probing model metadata:\n{excerpt}",
+                    model_failed_to_load=True, failure_kind=kind, exit_code=exit_code,
                 )
             if _check_health(host, port):
                 healthy = True

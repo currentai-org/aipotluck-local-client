@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from aipotluck.installer import (
+    llama_errors,
     model_localscore,
     model_perf,
     model_perf_live,
@@ -285,6 +286,27 @@ def measure(
 # --------------------------------------------------------------------------
 
 
+def _load_failure_reason(exc: "model_sizing.ModelSizingError") -> str:
+    """Why a model could not be loaded, in the words the user needs."""
+    if exc.failure_kind == llama_errors.FAILURE_OOM:
+        return (
+            "it ran out of memory while loading on this device -- the weights, and any vision "
+            "projector shipped with them, do not fit"
+        )
+    return f"llama-server could not load it (exit code {exc.exit_code})"
+
+
+def _free_router_before_loading(llama_cfg: dict) -> None:
+    """Unload whatever the router is holding before we spawn something that loads a model on top.
+
+    Under --models-max 1 the router keeps one whole model resident, so a probe starting while it
+    does is competing with it for the same memory. measure() has always done this; sizing did not,
+    and a 24B model on a 16GB Jetson aborted against a router holding 10.9GB of a different model.
+    It matters more now than it did then: a load failure rejects the model, so getting this wrong
+    would delete one that works."""
+    model_perf_live.free_router_memory(base_url(llama_cfg))
+
+
 def list_models(llama_cfg: dict, config_dir: Path) -> dict[str, Any]:
     """Everything this device knows about every model it has: whether it is sized, how fast it
     scored, and whether the service has held it back for running out of memory."""
@@ -391,12 +413,25 @@ def pull(
         return result
 
     progress(f"sizing {model_id}")
+    _free_router_before_loading(llama_cfg)
     try:
         sizing = model_sizing.ensure_preset(
             Path(llama_cfg["server_binary"]), presets_path, model_id,
             model_hf=model_id, gpu_layers=llama_cfg.get("gpu_layers"), force=True,
         )
     except model_sizing.ModelSizingError as exc:
+        # A model that cannot be loaded at all has no sizing to fall back to and no slower mode to
+        # settle for. Leaving it installed-but-unsized was how one slipped through: the router
+        # discovers it anyway, picks llama-server's defaults, and the failure resurfaces as a dead
+        # turn later. Only a genuine load failure rejects -- a missing binary or an unparseable
+        # probe is the probe's problem, not the model's.
+        if exc.model_failed_to_load and not keep_rejected:
+            result["sizing"] = None
+            result["sizing_error"] = str(exc)
+            return _reject(
+                llama_cfg, presets_path, config_dir, model_id, result,
+                code=model_screen.REJECT_WONT_LOAD, reason=_load_failure_reason(exc),
+            )
         sizing = None
         result["warning"] = (
             f"Automatic runtime sizing failed ({exc}) -- {model_id} will run with llama-server's "
@@ -485,6 +520,7 @@ def benchmark(
         # of what the model was trained for and what this device's memory can serve -- so a stale
         # ctx_size would silently cap it at whatever was true when the model was first pulled.
         progress(f"re-sizing {target}")
+        _free_router_before_loading(llama_cfg)
         try:
             sizing = model_sizing.ensure_preset(
                 Path(llama_cfg["server_binary"]), presets_path, target,
@@ -492,6 +528,21 @@ def benchmark(
             )
         except model_sizing.ModelSizingError as exc:
             entry["sizing"] = None
+            if exc.model_failed_to_load:
+                # Held back rather than deleted. The model is already installed and the user is
+                # standing right here having asked for a measurement, so the gigabytes are theirs
+                # to decide about -- the same split the service's own quarantine makes. `list`
+                # surfaces it and `remove` acts on it.
+                reason = _load_failure_reason(exc)
+                model_health.quarantine(config_dir, target, reason)
+                entry["held_back"] = True
+                entry["rejection_code"] = model_screen.REJECT_WONT_LOAD
+                entry["rejection"] = reason
+                entry["sizing_error"] = str(exc)
+                entry["screen"] = entry["score"] = None
+                entry["measured"] = False
+                results.append(entry)
+                continue
             entry["warning"] = (
                 f"Could not re-size {target} ({exc}) -- measured against whatever preset it had."
             )

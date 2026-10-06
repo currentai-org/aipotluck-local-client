@@ -42,43 +42,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from aipotluck.installer import model_presets, model_sizing
+from aipotluck.installer import llama_errors, model_presets, model_sizing
 
 log = logging.getLogger("aipotluck.service.model_health")
 
-# Allocation-failure strings, taken from the vendored llama.cpp rather than invented: a lookup that
-# misses means a real OOM is classified as "some other failure" and silently never recovered from.
-#   ggml/src/ggml-cuda/ggml-cuda.cu:893   "allocating ... cudaMalloc failed: out of memory"
-#   src/llama-kv-cache.cpp:288            "failed to allocate buffer for kv cache"
-#   src/llama-model.cpp:1767,1783         "unable to allocate <buft> buffer"
-#   src/llama-context.cpp:644,656,681     "failed to allocate compute pp/tg buffers"
-#   src/llama-context.cpp:2463            "failed to allocate compute buffers"
-#   src/llama-context.cpp:2132            "failed to allocate output buffer of size"
-#   ggml/src/ggml-backend.cpp:2448        "failed to allocate buffer of size"
-# The last two entries are not llama.cpp's: `std::bad_alloc` is what an uncaught host-allocation
-# failure prints as it aborts, and NvMapMemAllocInternalTagged is how a Jetson's unified memory
-# reports exhaustion (seen live on an Orin NX while benchmarking with a model still resident).
-OOM_LOG_SIGNATURES = (
-    "cudamalloc failed: out of memory",
-    "failed to allocate buffer for kv cache",
-    "unable to allocate",
-    "failed to allocate compute",
-    "failed to allocate output buffer",
-    "failed to allocate buffer of size",
-    "failed to allocate graph",
-    "std::bad_alloc",
-    "cannot allocate memory",
-    "nvmapmemallocinternaltagged",
-    "out of memory",
-)
-
-# A child killed by the Linux OOM killer never gets to print anything, so the exit code is the only
-# evidence there is. 137 is a shell's 128+SIGKILL; -9 is what Python's subprocess reports for the
-# same thing, and the router passes through whichever its own platform produced.
-OOM_EXIT_CODES = (137, -9)
-
-FAILURE_OOM = "oom"
-FAILURE_OTHER = "other"
+# Recognising llama.cpp's failures is shared with the installer's sizing probe, which hits exactly
+# the same wall from the other side -- see aipotluck.installer.llama_errors for the signatures, the
+# exit codes, and why a bounded excerpt has to drop the backtrace to keep the error.
+OOM_LOG_SIGNATURES = llama_errors.OOM_LOG_SIGNATURES
+OOM_EXIT_CODES = llama_errors.OOM_EXIT_CODES
+FAILURE_OOM = llama_errors.FAILURE_OOM
+FAILURE_OTHER = llama_errors.FAILURE_OTHER
+classify_failure = llama_errors.classify_failure
 
 # How many OOMs a model may hit, with no working turn in between, before we stop blaming the
 # machine and start blaming the model. Three gives two real shrink-and-retry attempts before the
@@ -100,21 +75,6 @@ _CHILD_LINE_RE = re.compile(r"^\[(\d+)\]\s*(.*)$")
 # the slot is done with a task, which is the narrowest "this model actually served something"
 # marker available without instrumenting the inference path itself.
 _TURN_DONE_RE = re.compile(r"release:.*stop processing")
-
-
-def classify_failure(log_tail: str, exit_code: int | None) -> str:
-    """Was this child's death an out-of-memory, or something else?
-
-    Log evidence wins over the exit code, because it is specific: llama.cpp names the allocation it
-    could not make. The exit code is only consulted when there is nothing in the log to read, which
-    is exactly the OOM-killer case -- SIGKILL gives the process no chance to explain itself."""
-    haystack = (log_tail or "").lower()
-    for signature in OOM_LOG_SIGNATURES:
-        if signature in haystack:
-            return FAILURE_OOM
-    if exit_code in OOM_EXIT_CODES:
-        return FAILURE_OOM
-    return FAILURE_OTHER
 
 
 def models_that_served(log_chunk: str) -> set[str]:
