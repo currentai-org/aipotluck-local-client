@@ -117,6 +117,82 @@ class TestArgParsing:
             parser.parse_args(["--backend", "quantum"])
 
 
+class TestReinstallKeepsPairing:
+    """Re-running the installer is the normal way to pick up a newer llama.cpp build, so it must
+    not cost the device its pairing.
+
+    The failure it guards is quiet in the worst way: the running service keeps serving from the
+    config it already holds in memory, so nothing looks wrong until the next restart -- possibly
+    days later, and looking entirely unrelated to the install. Seen on a Jetson that went dark at
+    its next restart after being re-installed.
+    """
+
+    def _runtime(self, install_dir: Path) -> dict:
+        return json.loads((install_dir / "config" / "runtime.json").read_text())
+
+    def _pair(self, install_dir: Path) -> None:
+        path = install_dir / "config" / "runtime.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "llama_cpp": {"server_binary": "/old/llama-server"},
+            "logged_in": True,
+            "tunnel": {"provider": "pangolin", "id": "abc", "secret": "shh", "endpoint": "https://x"},
+        }), encoding="utf-8")
+
+    def test_an_existing_pairing_survives_a_reinstall(self, tmp_path, fake_fetch):
+        install_dir = tmp_path / "install"
+        self._pair(install_dir)
+
+        assert install.run_install(make_args(install_dir, ["--no-service"])) == 0
+
+        saved = self._runtime(install_dir)
+        assert saved["logged_in"] is True
+        assert saved["tunnel"]["id"] == "abc" and saved["tunnel"]["secret"] == "shh"
+
+    def test_the_llama_section_is_still_rebuilt(self, tmp_path, fake_fetch):
+        """Only the pairing is carried over. The llama.cpp paths describe what was just installed,
+        so keeping the old ones would point the service at a binary that may no longer be there."""
+        install_dir = tmp_path / "install"
+        self._pair(install_dir)
+
+        install.run_install(make_args(install_dir, ["--no-service"]))
+
+        assert self._runtime(install_dir)["llama_cpp"]["server_binary"] == str(fake_fetch)
+
+    def test_a_logged_out_device_stays_logged_out(self, tmp_path, fake_fetch):
+        install_dir = tmp_path / "install"
+        (install_dir / "config").mkdir(parents=True, exist_ok=True)
+        (install_dir / "config" / "runtime.json").write_text(
+            json.dumps({"logged_in": False}), encoding="utf-8"
+        )
+
+        install.run_install(make_args(install_dir, ["--no-service"]))
+
+        saved = self._runtime(install_dir)
+        assert saved["logged_in"] is False and "tunnel" not in saved
+
+    def test_a_claimed_login_with_no_tunnel_is_not_honoured(self, tmp_path, fake_fetch):
+        """`logged_in` without credentials cannot serve anything, so carrying it over would leave
+        the service trying to start a tunnel it has no details for."""
+        install_dir = tmp_path / "install"
+        (install_dir / "config").mkdir(parents=True, exist_ok=True)
+        (install_dir / "config" / "runtime.json").write_text(
+            json.dumps({"logged_in": True}), encoding="utf-8"
+        )
+
+        install.run_install(make_args(install_dir, ["--no-service"]))
+
+        assert self._runtime(install_dir)["logged_in"] is False
+
+    def test_a_corrupt_runtime_config_does_not_stop_the_install(self, tmp_path, fake_fetch):
+        install_dir = tmp_path / "install"
+        (install_dir / "config").mkdir(parents=True, exist_ok=True)
+        (install_dir / "config" / "runtime.json").write_text("{not json", encoding="utf-8")
+
+        assert install.run_install(make_args(install_dir, ["--no-service"])) == 0
+        assert self._runtime(install_dir)["logged_in"] is False
+
+
 class TestRunInstallNoService:
     def test_writes_logged_out_runtime_config(self, tmp_path, fake_fetch, capsys):
         install_dir = tmp_path / "install"

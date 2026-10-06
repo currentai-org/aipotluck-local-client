@@ -17,8 +17,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from aipotluck.installer import cli
+from aipotluck.service import model_ops
+from aipotluck.installer import model_sizing
 from aipotluck.installer.model_sizing import SizingResult
 from aipotluck.installer.platform_detect import HostProfile
+
+
+@pytest.fixture(autouse=True)
+def no_preflight_network(monkeypatch):
+    """`pull` asks Hugging Face how big a model is before downloading it. Left alone that is a real
+    HTTP call from every pull test -- slow, offline-hostile, and dependent on a repo that doesn't
+    exist. Default every test to "no verdict" (the honest answer when the size can't be read) and
+    let the tests that are about the gate say otherwise."""
+    monkeypatch.setattr(model_ops.model_preflight, "check_fits_in_memory", lambda *a, **kw: None)
 
 
 def make_args(install_dir: Path, **overrides) -> Namespace:
@@ -557,7 +568,7 @@ class TestReloadRouterModels:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            result = cli._reload_router_models({"host": "127.0.0.1", "port": port})
+            result = model_ops.reload_router({"host": "127.0.0.1", "port": port})
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -574,7 +585,7 @@ class TestReloadRouterModels:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
 
-        assert cli._reload_router_models({"host": "127.0.0.1", "port": port}) is False
+        assert model_ops.reload_router({"host": "127.0.0.1", "port": port}) is False
 
     def test_defaults_to_localhost_8080_when_unset(self, monkeypatch):
         # Must not raise with an empty llama_cfg -- falls back to llama-server's own conventional
@@ -586,8 +597,95 @@ class TestReloadRouterModels:
             return _FakeHttpResponse({})
 
         monkeypatch.setattr(cli.urllib.request, "urlopen", fake_urlopen)
-        assert cli._reload_router_models({}) is True
+        assert model_ops.reload_router({}) is True
         assert seen_urls == ["http://127.0.0.1:8080/models?reload=1"]
+
+
+class TestOversizedModelGate:
+    """Refusing a download whose weights are bigger than the machine.
+
+    This is the only check that runs before the download, so it is also the only one that can save
+    the user the download. It is deliberately advisory: it asks, it does not decide, and an absent
+    verdict always proceeds.
+    """
+
+    def _setup(self, tmp_path, monkeypatch, verdict, *, tty=True):
+        install_dir = tmp_path / "install"
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"},
+            "service": {},
+        })
+        pulls = []
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pulls.append(1))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "reload_router", lambda llama_cfg: True)
+        monkeypatch.setattr(model_ops, "measure", lambda *a, **kw: (None, None, None))
+        monkeypatch.setattr(model_ops.model_preflight, "check_fits_in_memory", lambda *a, **kw: verdict)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty, raising=False)
+        return install_dir, pulls
+
+    @staticmethod
+    def _verdict(fits):
+        return model_ops.model_preflight.PreflightVerdict(
+            fits=fits, model_bytes=8 * 1024**3, total_memory_bytes=4 * 1024**3,
+            detail="org/repo:Q4_K_M is 8.0GB of weights, and this device has 4.0GB of memory in total.",
+        )
+
+    def test_declining_the_prompt_stops_before_downloading(self, tmp_path, monkeypatch, capsys):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+
+        assert rc == 1
+        assert pulls == [], "the whole point is not spending the download"
+        assert "WARNING" in capsys.readouterr().out
+
+    def test_accepting_the_prompt_downloads_anyway(self, tmp_path, monkeypatch):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1]
+
+    def test_the_default_answer_is_no(self, tmp_path, monkeypatch):
+        """Empty input must not be read as consent -- this prompt spends gigabytes."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 1
+        assert pulls == []
+
+    def test_a_model_that_fits_is_never_mentioned(self, tmp_path, monkeypatch, capsys):
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(True))
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1] and "WARNING" not in capsys.readouterr().out
+
+    def test_no_verdict_proceeds_without_a_prompt(self, tmp_path, monkeypatch):
+        """Offline, rate-limited or a private repo. Absence of evidence has to let the pull through
+        to the layers that measure for real, or this gate becomes an outage."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, None)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
+        assert pulls == [1]
+
+    def test_force_skips_the_check_entirely(self, tmp_path, monkeypatch):
+        lookups = []
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False))
+        monkeypatch.setattr(model_ops.model_preflight, "check_fits_in_memory",
+                            lambda *a, **kw: lookups.append(1) or self._verdict(False))
+        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
+        assert pulls == [1]
+        assert lookups == [], "--force means don't even ask Hugging Face"
+
+    def test_without_a_terminal_it_refuses_instead_of_prompting(self, tmp_path, monkeypatch, capsys):
+        """A piped or scripted pull has nobody to answer, so blocking on input would hang and
+        assuming yes would spend the download. Stop, and name the flag that overrides."""
+        install_dir, pulls = self._setup(tmp_path, monkeypatch, self._verdict(False), tty=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+
+        assert cli.run_pull_model(make_pull_args(install_dir)) == 1
+        assert pulls == []
+        assert "--force" in capsys.readouterr().out
 
 
 class TestRunPullModel:
@@ -604,11 +702,11 @@ class TestRunPullModel:
             {"llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"}, "service": {}},
         )
         pull_calls = []
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: pull_calls.append((a, kw)))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pull_calls.append((a, kw)))
         ensure_preset_calls = []
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append((a, kw)) or _FAKE_SIZING)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append((a, kw)) or _FAKE_SIZING)
         reload_calls = []
-        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: reload_calls.append(1) or True)
+        monkeypatch.setattr(model_ops, "reload_router", lambda llama_cfg: reload_calls.append(1) or True)
         args = make_pull_args(install_dir, model="new/model:Q8_0")
 
         rc = cli.run_pull_model(args)
@@ -626,7 +724,7 @@ class TestRunPullModel:
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"service": {}, "logged_in": False})  # no llama_cpp section at all
         pull_calls = []
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: pull_calls.append((a, kw)))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pull_calls.append((a, kw)))
         args = make_pull_args(install_dir)
 
         rc = cli.run_pull_model(args)
@@ -643,9 +741,9 @@ class TestRunPullModel:
         def raise_pull_error(*a, **kw):
             raise cli.ModelPullError("bad repo/quant")
 
-        monkeypatch.setattr(cli, "pull_model", raise_pull_error)
+        monkeypatch.setattr(model_ops, "pull_model", raise_pull_error)
         ensure_preset_calls = []
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append(1))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append(1))
         args = make_pull_args(install_dir, model="bad/repo")
 
         rc = cli.run_pull_model(args)
@@ -657,8 +755,8 @@ class TestRunPullModel:
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {"server_binary": "/fake/llama-server"}, "service": {}})
         seen_kwargs = {}
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: seen_kwargs.update(kw))
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: seen_kwargs.update(kw))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
         args = make_pull_args(install_dir, timeout=None)
 
         cli.run_pull_model(args)
@@ -669,8 +767,8 @@ class TestRunPullModel:
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {"server_binary": "/fake/llama-server"}, "service": {}})
         seen_kwargs = {}
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: seen_kwargs.update(kw))
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: seen_kwargs.update(kw))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
         args = make_pull_args(install_dir, timeout=45.0)
 
         cli.run_pull_model(args)
@@ -689,10 +787,11 @@ class TestRunPullModel:
             },
         )
         pull_kwargs = {}
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: pull_kwargs.update(kw))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pull_kwargs.update(kw))
         ensure_preset_kwargs = {}
         monkeypatch.setattr(
-            cli, "ensure_preset", lambda *a, **kw: ensure_preset_kwargs.update(kw) or _FAKE_SIZING
+            model_ops.model_sizing, "ensure_preset",
+            lambda *a, **kw: ensure_preset_kwargs.update(kw) or _FAKE_SIZING,
         )
         args = make_pull_args(install_dir)
 
@@ -704,9 +803,9 @@ class TestRunPullModel:
     def test_no_presets_path_skips_sizing_but_still_succeeds(self, tmp_path, monkeypatch, caplog):
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {"server_binary": "/fake/llama-server"}, "service": {}})
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
         ensure_preset_calls = []
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append(1))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append(1))
         args = make_pull_args(install_dir)
 
         with caplog.at_level(logging.WARNING, logger="aipotluck.cli"):
@@ -724,12 +823,12 @@ class TestRunPullModel:
             install_dir,
             {"llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"}, "service": {}},
         )
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
 
         def raise_sizing_error(*a, **kw):
             raise cli.ModelSizingError("probe timed out")
 
-        monkeypatch.setattr(cli, "ensure_preset", raise_sizing_error)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", raise_sizing_error)
         args = make_pull_args(install_dir, model="new/model:Q8_0")
 
         with caplog.at_level(logging.WARNING, logger="aipotluck.cli"):
@@ -744,9 +843,9 @@ class TestRunPullModel:
             install_dir,
             {"llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"}, "service": {}},
         )
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
-        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: False)
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "reload_router", lambda llama_cfg: False)
         args = make_pull_args(install_dir)
 
         rc = cli.run_pull_model(args)
@@ -754,6 +853,158 @@ class TestRunPullModel:
         assert rc == 0
         out = capsys.readouterr().out
         assert "next time it starts" in out
+
+
+class TestQuarantineSurfacing:
+    """A held-back model is still on disk and still pickable in the chat UI -- the router
+    discovers the HF cache for itself. `list` therefore has to say so plainly, because the
+    alternative reading is that the service already dealt with it, leaving the user waiting on a
+    turn that keeps failing.
+    """
+
+    def _setup(self, tmp_path, monkeypatch, cached=("org/repo:Q4_K_M",)):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "4096"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: list(cached))
+        return install_dir
+
+    def _config_dir(self, install_dir):
+        return install_dir / "config"
+
+    def test_a_held_back_model_is_marked_and_explained(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        model_ops.model_health.quarantine(
+            self._config_dir(install_dir), "org/repo:Q4_K_M",
+            "ran out of memory 3 times without completing a turn in between",
+        )
+
+        assert cli.run_list_models(make_pull_args(install_dir)) == 0
+
+        out = capsys.readouterr().out
+        assert "HELD BACK" in out
+        assert "ran out of memory 3 times" in out, "the reason has to reach the user, not just a flag"
+        assert "still installed and can still be picked" in out
+        assert "remove <model>" in out
+
+    def test_a_held_back_model_is_not_told_to_run_benchmark(self, tmp_path, monkeypatch, capsys):
+        """Benchmarking is usually what held it back -- a model that cannot be loaded is
+        discovered by exactly that command -- so the suggestion would send the user round the
+        same loop and watch it fail again."""
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.model_health.quarantine(
+            self._config_dir(install_dir), "org/repo:Q4_K_M", "it ran out of memory while loading",
+        )
+
+        cli.run_list_models(make_pull_args(install_dir))
+
+        out = capsys.readouterr().out
+        assert "HELD BACK" in out
+        assert "run `benchmark`" not in out
+
+    def test_an_unmeasured_model_that_is_fine_is_still_told_to_run_benchmark(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The other half of the pair -- the advice must not disappear for everyone."""
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.run_list_models(make_pull_args(install_dir))
+        assert "run `benchmark`" in capsys.readouterr().out
+
+    def test_nothing_is_said_when_nothing_is_held_back(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.run_list_models(make_pull_args(install_dir))
+        out = capsys.readouterr().out
+        assert "HELD BACK" not in out and "Held back" not in out
+
+
+def make_remove_args(install_dir: Path, model="org/repo:Q4_K_M", yes=False) -> Namespace:
+    return Namespace(install_dir=install_dir, system=False, verbose=False, model=model, yes=yes)
+
+
+class TestRunRemoveModel:
+    """The user-confirmed half of a quarantine. The service never deletes a model on its own --
+    those are gigabytes the user chose to download -- so the decision lands here."""
+
+    def _setup(self, tmp_path, monkeypatch, *, cached=("org/repo:Q4_K_M",), deletes_ok=True):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "4096"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: list(cached))
+        deletes = []
+        monkeypatch.setattr(model_ops, "delete_cached_model",
+                            lambda cfg, mid: deletes.append(mid) or deletes_ok)
+        return install_dir, deletes
+
+    def test_yes_removes_without_prompting(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt with --yes"))
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 0
+        assert deletes == ["org/repo:Q4_K_M"]
+
+    def test_declining_the_prompt_keeps_the_model(self, tmp_path, monkeypatch, capsys):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: "n")
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == [] and "Left alone" in capsys.readouterr().out
+
+    def test_the_default_answer_is_no(self, tmp_path, monkeypatch):
+        """Empty input must not delete several gigabytes."""
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: "")
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == []
+
+    def test_without_a_terminal_it_requires_the_flag(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not prompt"))
+        assert cli.run_remove_model(make_remove_args(install_dir)) == 1
+        assert deletes == []
+
+    def test_an_unknown_model_is_rejected_before_anything_is_deleted(self, tmp_path, monkeypatch):
+        install_dir, deletes = self._setup(tmp_path, monkeypatch)
+        rc = cli.run_remove_model(make_remove_args(install_dir, model="org/nope:Q4_K_M", yes=True))
+        assert rc == 1 and deletes == []
+
+    def test_the_quarantine_reason_is_shown_before_deleting(self, tmp_path, monkeypatch, capsys):
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        model_ops.model_health.quarantine(
+            install_dir / "config", "org/repo:Q4_K_M", "ran out of memory 3 times"
+        )
+        cli.run_remove_model(make_remove_args(install_dir, yes=True))
+        assert "ran out of memory 3 times" in capsys.readouterr().out
+
+    def test_removal_clears_the_health_record(self, tmp_path, monkeypatch):
+        """A later re-pull of the same id must start clean rather than inherit a verdict reached
+        against a sizing that no longer exists."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        config_dir = install_dir / "config"
+        model_ops.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
+        cli.run_remove_model(make_remove_args(install_dir, yes=True))
+        assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is None
+
+    def test_a_failed_delete_keeps_the_records_and_says_why(self, tmp_path, monkeypatch, capsys):
+        """If the router couldn't be reached the files are still there, so forgetting the model
+        would leave it installed, unexplained and un-held-back."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
+        config_dir = install_dir / "config"
+        model_ops.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
+
+        rc = cli.run_remove_model(make_remove_args(install_dir, yes=True))
+
+        assert rc == 1
+        assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is not None
+        assert "wasn't reachable" in capsys.readouterr().out
 
 
 class TestRunListModels:
@@ -768,7 +1019,7 @@ class TestRunListModels:
                 "service": {},
             },
         )
-        monkeypatch.setattr(cli, "list_cached_models", lambda binary: ["org/repo:Q4_K_M", "org/other:Q8_0"])
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: ["org/repo:Q4_K_M", "org/other:Q8_0"])
         args = make_pull_args(install_dir)
 
         rc = cli.run_list_models(args)
@@ -786,7 +1037,7 @@ class TestRunListModels:
     def test_no_presets_path_marks_nothing_sized(self, tmp_path, monkeypatch, capsys):
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {"server_binary": "/fake/llama-server"}, "service": {}})
-        monkeypatch.setattr(cli, "list_cached_models", lambda binary: ["org/repo:Q4_K_M"])
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: ["org/repo:Q4_K_M"])
         args = make_pull_args(install_dir)
 
         rc = cli.run_list_models(args)
@@ -798,7 +1049,7 @@ class TestRunListModels:
     def test_no_cached_models_suggests_pull(self, tmp_path, monkeypatch, capsys):
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {"server_binary": "/fake/llama-server"}, "service": {}})
-        monkeypatch.setattr(cli, "list_cached_models", lambda binary: [])
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: [])
         args = make_pull_args(install_dir)
 
         rc = cli.run_list_models(args)
@@ -811,7 +1062,7 @@ class TestRunListModels:
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"service": {}})  # no llama_cpp section
         calls = []
-        monkeypatch.setattr(cli, "list_cached_models", lambda binary: calls.append(binary))
+        monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: calls.append(binary))
         args = make_pull_args(install_dir)
 
         rc = cli.run_list_models(args)
@@ -826,7 +1077,7 @@ class TestRunListModels:
         def raise_error(binary):
             raise cli.ModelPullError("--cache-list not supported by this build")
 
-        monkeypatch.setattr(cli, "list_cached_models", raise_error)
+        monkeypatch.setattr(model_ops, "list_cached_models", raise_error)
         args = make_pull_args(install_dir)
 
         with caplog.at_level(logging.ERROR, logger="aipotluck.cli"):
@@ -870,7 +1121,7 @@ class TestDeleteCachedModel:
         server, seen = self._serve()
         try:
             port = server.server_address[1]
-            ok = cli._delete_cached_model({"host": "127.0.0.1", "port": port}, "org/repo:Q4_K_M")
+            ok = model_ops.delete_cached_model({"host": "127.0.0.1", "port": port}, "org/repo:Q4_K_M")
         finally:
             server.shutdown()
             server.server_close()
@@ -883,7 +1134,7 @@ class TestDeleteCachedModel:
         assert path == "/models?model=org%2Frepo%3AQ4_K_M"
 
     def test_an_unreachable_router_reports_failure_rather_than_claiming_success(self):
-        assert cli._delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
+        assert model_ops.delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
 
 
 def _screen(rejected, reason="test reason"):
@@ -909,12 +1160,12 @@ class TestPullGate:
             "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
             "service": {},
         })
-        monkeypatch.setattr(cli, "pull_model", lambda *a, **kw: None)
-        monkeypatch.setattr(cli, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
-        monkeypatch.setattr(cli, "_reload_router_models", lambda llama_cfg: True)
-        monkeypatch.setattr(cli, "_benchmark_model", lambda *a, **kw: (screened, score))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "reload_router", lambda llama_cfg: True)
+        monkeypatch.setattr(model_ops, "measure", lambda *a, **kw: (screened, score, None))
         deletes = []
-        monkeypatch.setattr(cli, "_delete_cached_model",
+        monkeypatch.setattr(model_ops, "delete_cached_model",
                             lambda cfg, mid: deletes.append(mid) or True)
         return install_dir, deletes
 
@@ -936,6 +1187,41 @@ class TestPullGate:
         out = capsys.readouterr().out
         assert rc == 0 and deletes == []
         assert "LocalScore 412" in out
+
+    def test_a_model_with_no_room_for_context_is_rejected_without_benchmarking(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Sizing already knows the answer, so the benchmark must not run at all -- loading and
+        measuring a model to confirm what the memory budget settled is pure cost to the user."""
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k="q4_0", cache_type_v="q4_0",
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT,
+            rejection="this device has 4.00GB of memory and its 8.00GB of weights exceed the budget",
+        )
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        benchmarks = []
+        monkeypatch.setattr(model_ops, "measure",
+                            lambda *a, **kw: benchmarks.append(1) or (_screen(False), _score(412.0), None))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: unviable)
+
+        rc = cli.run_pull_model(make_pull_args(install_dir))
+
+        out = capsys.readouterr().out
+        assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
+        assert benchmarks == [], "sizing already decided; the benchmark is wasted work"
+        assert "exceed the budget" in out, "the reason must survive into the user-facing output"
+
+    def test_force_keeps_a_model_sizing_would_reject(self, tmp_path, monkeypatch):
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k=None, cache_type_v=None,
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT, rejection="no room",
+        )
+        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: unviable)
+        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
+        assert deletes == []
 
     def test_a_low_confidence_score_says_so(self, tmp_path, monkeypatch, capsys):
         """A device that moved 30% under its own measurement cannot support a precise number, and

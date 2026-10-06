@@ -54,6 +54,7 @@ from aipotluck.installer import (  # noqa: E402
     model_screen,
     model_perf_live,
     model_perf_store,
+    model_preflight,
     model_presets,
     newt_fetch,
 )
@@ -64,9 +65,12 @@ from aipotluck.installer.model_pull import (  # noqa: E402
     list_cached_models,
     pull_model,
 )
+from aipotluck.installer import model_sizing  # noqa: E402
 from aipotluck.installer.model_sizing import ModelSizingError, ensure_preset  # noqa: E402
+from aipotluck.installer.source_build import _total_memory_gb  # noqa: E402
 from aipotluck.installer.platform_detect import HostProfile, detect_host_profile  # noqa: E402
 from aipotluck.installer.service.base import get_service_manager  # noqa: E402
+from aipotluck.service import model_health, model_ops  # noqa: E402
 from aipotluck.service.runner import DEFAULT_HOST, DEFAULT_PORT  # noqa: E402
 
 log = logging.getLogger("aipotluck.cli")
@@ -156,6 +160,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "list", parents=[common],
         help="List models already downloaded locally (via llama-server's own --cache-list)",
+    )
+
+    remove = sub.add_parser(
+        "remove", parents=[common],
+        help="Delete a downloaded model and everything this client remembers about it",
+    )
+    remove.add_argument("model", help="Hugging Face repo[:quant] exactly as `list` shows it")
+    remove.add_argument(
+        "--yes", action="store_true",
+        help="Skip the confirmation prompt (required when there's no terminal to prompt on)",
     )
 
     benchmark = sub.add_parser(
@@ -482,176 +496,48 @@ def run_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _reload_router_models(llama_cfg: dict) -> bool:
-    """Best-effort: asks a currently-running router to re-scan the HF cache + --models-preset file
-    (`GET /models?reload=1`, confirmed against server-models.cpp) so a model `pull` just
-    downloaded/sized is visible immediately -- without this, a long-running router wouldn't notice
-    a new cache entry until its next restart, since cache scanning happens at startup/reload, not
-    per-request. Returns False (not an error -- the common case is simply "not logged in / service
-    not running right now") whenever the router can't be reached; the next service start picks up
-    everything from a full scan regardless, so nothing is lost by skipping this."""
-    host = llama_cfg.get("host", "127.0.0.1")
-    port = llama_cfg.get("port", 8080)
-    try:
-        with urllib.request.urlopen(f"http://{host}:{port}/models?reload=1", timeout=5):
-            return True
-    except (urllib.error.URLError, OSError):
-        return False
+def _print_screen_verdict(screen: dict) -> None:
+    print(f"  {'UNUSABLE -- ' if screen['rejected'] else 'usable -- '}{screen['reason']}")
 
 
-def _bench_binary(llama_cfg: dict) -> Path | None:
-    """Locates llama-bench, which ships beside llama-server in every prebuilt llama.cpp release
-    archive (fetch.py extracts the whole archive, it doesn't cherry-pick) and which source_build
-    now builds too.
-
-    It is looked up strictly as a SIBLING of the llama-server we actually serve with, never by
-    searching the install root for any copy. A score has to describe the engine that will serve
-    turns, so pairing a llama-bench from one build with a llama-server from another would quietly
-    measure the wrong thing -- a worse failure than reporting it missing."""
-    server_binary = llama_cfg.get("server_binary")
-    if not server_binary:
-        return None
-    candidate = Path(server_binary).parent / ("llama-bench.exe" if os.name == "nt" else "llama-bench")
-    return candidate if candidate.exists() else None
-
-
-def _warn_bench_missing(llama_cfg: dict) -> None:
-    """Says where we looked and what that absence actually implies.
-
-    The two cases need different advice. A source build makes llama-bench best-effort, so re-running
-    the installer really can produce it. A prebuilt install always ships it, so its absence means
-    `server_binary` is pointing somewhere that is not this install's own extraction -- and telling
-    that user to "re-run the installer to rebuild it" sends them after a rebuild that never happens
-    and cannot help."""
-    server_binary = llama_cfg.get("server_binary")
-    looked_in = Path(server_binary).parent if server_binary else "(no server binary recorded)"
-    if llama_cfg.get("built_from_source"):
-        log.warning(
-            "llama-bench isn't in %s, so this model can't be measured. This install was built from "
-            "source, where llama-bench is a best-effort extra target that can fail without failing "
-            "the build -- re-run the installer to try building it again.", looked_in,
-        )
-    else:
-        log.warning(
-            "llama-bench isn't in %s, so this model can't be measured -- but every prebuilt "
-            "llama.cpp archive ships it beside llama-server, so that directory is most likely a "
-            "stale or partial copy rather than this install's own. Look for leftover directories "
-            "under %s, remove them, and re-run the installer to re-resolve the binary.",
-            looked_in, llama_cfg.get("install_dir", "the install root"),
-        )
-
-
-def _print_screen_verdict(model_id: str, screened: "model_screen.ScreenResult") -> None:
-    if screened.rejected:
-        print(f"  UNUSABLE -- {screened.reason}")
-    else:
-        print(f"  usable -- {screened.reason}")
-
-
-def _print_score(result: "model_localscore.LocalScoreResult") -> None:
-    print(f"  LocalScore {result.score:,.0f} ({result.band})")
-    print(f"    {result.avg_prompt_tps:,.0f} tok/s prompt, {result.avg_gen_tps:.1f} tok/s generated, "
-          f"{result.avg_ttft_ms/1000:.1f}s to first token")
-    if result.confidence == model_localscore.CONFIDENCE_LOW:
-        print(f"    low confidence: this device varied {result.observed_spread:.0%} between "
+def _print_score(score: dict) -> None:
+    print(f"  LocalScore {score['localscore']:,.0f} ({score['band']})")
+    print(f"    {score['avg_prompt_tps']:,.0f} tok/s prompt, {score['avg_gen_tps']:.1f} tok/s "
+          f"generated, {score['avg_ttft_ms'] / 1000:.1f}s to first token")
+    if score["confidence"] == model_localscore.CONFIDENCE_LOW:
+        print(f"    low confidence: this device varied {score['observed_spread']:.0%} between "
               "repeats, so treat the number as approximate")
 
 
-def _delete_cached_model(llama_cfg: dict, model_id: str) -> bool:
-    """Removes a model's files through the running router's own `DELETE /models` (server.cpp:243 ->
-    server-models.cpp's del_router_models -> common_download_remove), which stops any running
-    instance and then clears the snapshot entry, its symlinks and the newly-orphaned blobs using
-    llama.cpp's own cache logic rather than a reimplementation of its layout here.
+def _print_sizing(sizing: dict) -> None:
+    print(f"  ctx_size={sizing['ctx_size']} parallel={sizing['parallel']} "
+          f"cache_type_k={sizing['cache_type_k']} cache_type_v={sizing['cache_type_v']}")
 
-    This is the only thing that actually enforces a refusal. The router auto-discovers everything
-    in the HF cache and `--no-models-autoload` is a global switch rather than a per-model one, so
-    merely withholding a preset would leave a refused model listed by /v1/models and selectable in
-    the web app's picker -- exactly the outcome the grade exists to prevent."""
-    host = llama_cfg.get("host", DEFAULT_HOST)
-    port = llama_cfg.get("port", DEFAULT_PORT)
-    url = f"http://{host}:{port}/models?model={urllib.parse.quote(model_id, safe='')}"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, method="DELETE"), timeout=60) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, OSError) as exc:
-        log.warning("Could not remove %s through the running router: %s", model_id, exc)
+
+def _confirm_oversized_pull(verdict: dict) -> bool:
+    """Consent to downloading a model whose weights don't fit in this machine's memory.
+
+    Defaults to no, and never prompts without a controlling terminal: a piped or scripted pull has
+    no one to answer, and the safe default there is to stop rather than spend the download. --force
+    is the documented way through either way."""
+    print()
+    print(f"WARNING: {verdict['detail']}")
+    print("Downloading it would spend the time and disk, and it still would not run here.")
+    if not sys.stdin.isatty():
+        print("Re-run with --force if you want it anyway.")
         return False
-
-
-def _benchmark_model(
-    llama_cfg: dict, presets_path: Path, model_id: str, *, budget_seconds: float
-) -> tuple["model_screen.ScreenResult | None", "model_localscore.LocalScoreResult | None"]:
-    """Screens a model for viability, then scores it if it survives.
-
-    Returns (screen, score). A None screen means no trustworthy measurement was possible at all --
-    a missing verdict, never a guessed one. A screen that rejected carries a None score, because
-    there is no point reporting how fast a model is that cannot serve a turn.
-    """
-    preset_args = model_presets.read_all(presets_path).get(model_id)
-    if not preset_args or not preset_args.get("ctx-size"):
-        log.warning(
-            "%s has no sized preset, so there's no operating point to measure at -- skipping.",
-            model_id,
-        )
-        return None, None
-
-    host = llama_cfg.get("host", DEFAULT_HOST)
-    port = llama_cfg.get("port", DEFAULT_PORT)
-    base_url = f"http://{host}:{port}"
-
-    # Free whatever the router holds -- not just this model. Under --models-max 1 it keeps one whole
-    # model resident and llama-bench is about to load its own copy on top; on a 16GB Jetson that was
-    # an outright allocation failure for models that benchmark fine on an idle box.
-    model_perf_live.free_router_memory(base_url)
-    if not model_perf.wait_until_idle():
-        log.warning(
-            "This machine is still busy, so a measurement would describe the contention rather "
-            "than the model -- skipping. Re-run `aipotluck-local-client benchmark %s` when it's "
-            "idle.", model_id,
-        )
-        return None, None
-
-    ctx_size = int(preset_args["ctx-size"])
-    bench = _bench_binary(llama_cfg)
-    if bench is None:
-        _warn_bench_missing(llama_cfg)
-        return None, None
-
-    common = dict(
-        cache_type_k=preset_args.get("cache-type-k"),
-        cache_type_v=preset_args.get("cache-type-v"),
-        gpu_layers=llama_cfg.get("gpu_layers"),
-    )
-
-    # The screen runs first and on its own budget: most answers are obvious, and a user about to be
-    # told "no" should not wait out a full measurement to hear it.
     try:
-        screened = model_screen.screen_model(
-            bench, model_id, ctx_size=ctx_size, budget_seconds=budget_seconds, **common
-        )
-    except (model_perf.ModelPerfError, ValueError) as exc:
-        log.warning("Could not screen %s on this device (%s) -- no verdict recorded.", model_id, exc)
-        return None, None
-    if screened.rejected:
-        return screened, None
+        answer = input("Download it anyway? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
 
-    started = time.monotonic()
-    try:
-        cost = model_localscore.probe_cost_model(
-            bench, model_id, budget_seconds=budget_seconds, **common
-        )
-    except (model_perf.ModelPerfError, ValueError) as exc:
-        log.warning("Could not score %s on this device (%s) -- no score recorded.", model_id, exc)
-        return screened, None
 
-    score = model_localscore.localscore(cost)
-    model_perf_store.write_record(
-        presets_path, model_id, score,
-        llama_config=llama_cfg, preset_args=preset_args,
-        engine=llama_cfg.get("tag"), ctx_size=ctx_size,
-        probe_seconds=time.monotonic() - started,
-    )
-    return screened, score
+def _llama_cfg_or_exit(args: argparse.Namespace) -> tuple[dict, Path]:
+    """The llama.cpp section plus the config dir, or a ModelOpError the caller turns into exit 1."""
+    _profile, lay = _profile_and_layout(args)
+    runtime_config = _load_runtime(_runtime_path(lay))
+    return model_ops.require_llama(runtime_config.get("llama_cpp")), lay.config_dir
 
 
 def run_pull_model(args: argparse.Namespace) -> int:
@@ -661,86 +547,68 @@ def run_pull_model(args: argparse.Namespace) -> int:
     There's no "active model" to set anymore -- llama-server's router mode (CUR-1965) serves
     whichever model a request's own "model" field names, autoloading on demand; `pull` just makes
     sure that works well (downloaded + correctly sized) the first time it's actually requested.
-    Independent of login state: pulling a model doesn't need (or touch) pairing."""
-    _profile, lay = _profile_and_layout(args)
-    runtime_path = _runtime_path(lay)
-    runtime_config = _load_runtime(runtime_path)
+    Independent of login state: pulling a model doesn't need (or touch) pairing.
 
-    llama_cfg = runtime_config.get("llama_cpp")
-    if not llama_cfg or not llama_cfg.get("server_binary"):
-        log.error("No llama.cpp install found at %s -- run the installer first.", runtime_path)
-        return 1
-
-    print(f"Pulling {args.model} -- this can take a while for a large quant.")
+    The work itself lives in model_ops, shared with the HTTP API. What stays here is the part a
+    terminal is for: asking the oversized-download question, and rendering the answer."""
     try:
-        pull_model(
-            Path(llama_cfg["server_binary"]),
-            args.model,
-            gpu_layers=llama_cfg.get("gpu_layers"),
-            timeout=args.timeout if args.timeout is not None else DEFAULT_TIMEOUT_SECONDS,
-        )
-    except ModelPullError as exc:
+        llama_cfg, config_dir = _llama_cfg_or_exit(args)
+    except model_ops.ModelOpError as exc:
         log.error("%s", exc)
         return 1
 
-    print("Sizing runtime parameters for this model...")
-    presets_path = llama_cfg.get("presets_path")
-    if not presets_path:
-        log.warning("No presets_path configured (re-run the installer to pick this up) -- skipping sizing.")
-    else:
-        try:
-            sizing = ensure_preset(
-                Path(llama_cfg["server_binary"]), Path(presets_path), args.model,
-                model_hf=args.model, gpu_layers=llama_cfg.get("gpu_layers"), force=True,
-            )
-        except ModelSizingError as exc:
-            log.warning(
-                "Automatic runtime sizing failed (%s) -- %s will run with llama-server's own "
-                "defaults until this is retried.", exc, args.model,
-            )
-        else:
-            # ensure_preset already persisted everything (the --models-preset INI section and its
-            # sibling tuning-reasons JSON) -- nothing for this CLI to write back into runtime.json.
-            # Writing a second copy here is exactly the "second summary that could drift" CLAUDE.md's
-            # "Runtime parameters" convention warns against; diagnostics.runtime_params reads the
-            # preset files directly (see model_presets.read_all/read_tuning).
-            print(
-                f"  ctx_size={sizing.ctx_size} parallel={sizing.parallel} "
-                f"cache_type_k={sizing.cache_type_k} cache_type_v={sizing.cache_type_v}"
-            )
+    # The preflight question is asked here rather than inside the operation, because only a CLI
+    # has someone to ask. The API answers it with a 409 and lets the caller decide.
+    allow_oversized = args.force
+    if not allow_oversized:
+        verdict = model_ops.check_size_before_download(args.model)
+        if verdict is not None and not verdict["fits"]:
+            if not _confirm_oversized_pull(verdict):
+                return 1
+            allow_oversized = True
 
-    screened = score = None
-    if presets_path and not args.skip_benchmark:
-        print("Checking this model can actually serve a turn here...")
-        screened, score = _benchmark_model(
-            llama_cfg, Path(presets_path), args.model, budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
+    print(f"Pulling {args.model} -- this can take a while for a large quant.")
+    try:
+        result = model_ops.pull(
+            llama_cfg, config_dir, args.model,
+            allow_oversized=allow_oversized, keep_rejected=args.force,
+            skip_benchmark=args.skip_benchmark, timeout=args.timeout,
+            progress=lambda _msg: None,
         )
-        if screened is not None:
-            _print_screen_verdict(args.model, screened)
-        if score is not None:
-            _print_score(score)
+    except model_ops.ModelOpError as exc:
+        log.error("%s", exc)
+        return 1
 
-    if screened is not None and screened.rejected and not args.force:
+    if result.get("warning"):
+        log.warning("%s", result["warning"])
+    if result.get("sizing"):
+        print("Sizing runtime parameters for this model...")
+        _print_sizing(result["sizing"])
+    if result.get("screen") or result.get("score") or result.get("measurement_skipped"):
+        print("Checking this model can actually serve a turn here...")
+    if result.get("measurement_skipped"):
+        log.warning("%s", result["measurement_skipped"])
+    if result.get("screen"):
+        _print_screen_verdict(result["screen"])
+    if result.get("score"):
+        _print_score(result["score"])
+
+    if result.get("rejected"):
         print()
-        print(f"{args.model} cannot serve a conversation on this device.")
-        removed = _delete_cached_model(llama_cfg, args.model)
-        if removed:
-            model_perf_store.forget(Path(presets_path), args.model)
+        print(f"{args.model} cannot serve a conversation on this device -- {result['rejection']}.")
+        if result.get("sizing_error"):
+            log.debug("%s", result["sizing_error"])
+        if result.get("removed"):
             print("It has been removed so it can't be picked in the chat model list.")
         else:
-            print(
-                "It is still on disk -- the service wasn't reachable to remove it. Start the "
-                f"service and run `aipotluck-local-client pull {args.model}` again, or keep it "
-                "anyway with --force."
-            )
+            print(result["removal_note"])
         print("Pull it again with --force if you want it regardless.")
         return 1
 
-    if _reload_router_models(llama_cfg):
-        print()
+    print()
+    if result.get("router_reloaded"):
         print(f"{args.model} is downloaded, sized, and live -- the router picked it up immediately.")
     else:
-        print()
         print(
             f"{args.model} is downloaded and sized. The service isn't reachable right now (not "
             "logged in, or not running) -- it'll pick this model up the next time it starts."
@@ -752,58 +620,113 @@ def run_list_models(args: argparse.Namespace) -> int:
     """Lists every model already cached locally (see model_pull.list_cached_models). Doesn't need
     the device logged in or the service running -- this only reads the local HF-hub-compatible
     cache directory via llama-server's own --cache-list, independent of pairing/service state."""
-    _profile, lay = _profile_and_layout(args)
-    runtime_path = _runtime_path(lay)
-    runtime_config = _load_runtime(runtime_path)
-
-    llama_cfg = runtime_config.get("llama_cpp")
-    if not llama_cfg or not llama_cfg.get("server_binary"):
-        log.error("No llama.cpp install found at %s -- run the installer first.", runtime_path)
-        return 1
-
     try:
-        models = list_cached_models(Path(llama_cfg["server_binary"]))
-    except ModelPullError as exc:
+        llama_cfg, config_dir = _llama_cfg_or_exit(args)
+        listing = model_ops.list_models(llama_cfg, config_dir)
+    except model_ops.ModelOpError as exc:
         log.error("%s", exc)
         return 1
 
+    models = listing["models"]
     if not models:
         print("No models cached locally yet -- pull one with `aipotluck-local-client pull <repo[:quant]>`.")
         return 0
 
     # Router mode (CUR-1965's follow-up): there's no single "active" model anymore -- any cached
-    # model can be requested at any time. "(sized)" instead marks whether `pull` (or the service's
-    # own startup backfill) has already computed a ctx_size/parallel/cache_type preset for it.
-    presets_path = llama_cfg.get("presets_path")
-    sized = model_presets.known_model_ids(Path(presets_path)) if presets_path else set()
-    graded = model_perf_store.read_all(Path(presets_path)).get("models", {}) if presets_path else {}
-
+    # model can be requested at any time. "not sized yet" instead marks whether `pull` (or the
+    # service's own startup backfill) has already computed a preset for it.
+    held_back = {m["id"]: m["held_back"] for m in models if m["held_back"]}
     print(f"{len(models)} model(s) cached locally:")
-    for target in models:
+    for entry in models:
         notes = []
-        if target not in sized:
+        if entry["held_back"]:
+            notes.append("HELD BACK -- out of memory")
+        if not entry["sized"]:
             notes.append("not sized yet")
-        record = graded.get(target)
-        if record is None:
+        score = entry["score"]
+        if score is None:
             label = f"{'--':>7}"
-            notes.append("not measured -- run `benchmark`")
+            # No "run `benchmark`" for a held-back model: benchmarking is usually what held it
+            # back, so the advice sends the user round the same loop.
+            if not entry["held_back"]:
+                notes.append("not measured -- run `benchmark`")
         else:
-            label = f"{record.get('localscore', 0):>7,.0f}"
-            band = record.get("band")
-            if band:
-                notes.append(band)
-            tps = record.get("avg_gen_tps")
+            label = f"{score.get('localscore', 0):>7,.0f}"
+            if score.get("band"):
+                notes.append(score["band"])
+            tps = score.get("avg_gen_tps")
             if isinstance(tps, (int, float)):
                 notes.append(f"{tps:.1f} tok/s generated")
-            if record.get("confidence") == model_localscore.CONFIDENCE_LOW:
+            if score.get("confidence") == model_localscore.CONFIDENCE_LOW:
                 notes.append("low confidence")
-            if presets_path and model_perf_store.is_stale(Path(presets_path), record, llama_config=llama_cfg):
+            if entry["stale"]:
                 notes.append("stale -- re-run `benchmark`")
         suffix = f"  ({', '.join(notes)})" if notes else ""
-        print(f"{label}  {target}{suffix}")
+        print(f"{label}  {entry['id']}{suffix}")
+
+    if held_back:
+        # These are still on disk and still selectable in the chat picker -- the router discovers
+        # the HF cache for itself. Saying so plainly matters: the alternative reading is that the
+        # service already dealt with it, and the user would be waiting for a turn that keeps
+        # failing.
+        print()
+        print("Held back, and not being retried:")
+        for model_id, record in sorted(held_back.items()):
+            print(f"  {model_id}")
+            print(f"    {record.get('quarantine_reason', 'repeated out-of-memory failures')}")
+        print()
+        print("They are still installed and can still be picked in the chat model list. Remove one")
+        print("with `aipotluck-local-client remove <model>`, or re-pull it to size it again and")
+        print("give it another go.")
+
     print()
     print("LocalScore (localscore.ai) measured on this device's own llama.cpp build, so it is not")
     print("comparable to scores published there -- that tool ships a much older engine.")
+    return 0
+
+
+def run_remove_model(args: argparse.Namespace) -> int:
+    """Deletes a cached model and everything this client remembers about it.
+
+    This is the user-confirmed half of a quarantine. The service holds a model back on its own
+    when it keeps running out of memory, but it never deletes one: that is several gigabytes the
+    user chose to download, and a background process is the wrong thing to make that call with
+    nobody present. So it reports, and this is where the decision gets made."""
+    try:
+        llama_cfg, config_dir = _llama_cfg_or_exit(args)
+    except model_ops.ModelOpError as exc:
+        log.error("%s", exc)
+        return 1
+
+    record = model_health.read_record(config_dir, args.model) or {}
+    if record.get("quarantine_reason"):
+        print(f"{args.model} was held back: {record['quarantine_reason']}.")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log.error(
+                "Removing %s deletes its downloaded weights. Re-run with --yes to confirm.",
+                args.model,
+            )
+            return 1
+        try:
+            answer = input(f"Delete {args.model} and its downloaded weights? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("Left alone.")
+            return 1
+
+    try:
+        model_ops.remove(llama_cfg, config_dir, args.model)
+    except model_ops.ModelOpError as exc:
+        if exc.code == "unknown_model":
+            log.error("%s isn't in the local cache -- `list` shows what is.", args.model)
+        else:
+            print(str(exc))
+        return 1
+
+    print(f"{args.model} has been removed.")
     return 0
 
 
@@ -811,63 +734,46 @@ def run_benchmark(args: argparse.Namespace) -> int:
     """Re-measures one model, or every cached model, without re-downloading anything. This is the
     way back from a grade that was skipped (a busy machine) or has gone stale (a llama.cpp upgrade,
     a GPU-layers change, a re-size)."""
-    _profile, lay = _profile_and_layout(args)
-    runtime_config = _load_runtime(_runtime_path(lay))
-
-    llama_cfg = runtime_config.get("llama_cpp")
-    if not llama_cfg or not llama_cfg.get("server_binary"):
-        log.error("No llama.cpp install found at %s -- run the installer first.", _runtime_path(lay))
-        return 1
-    presets_path = llama_cfg.get("presets_path")
-    if not presets_path:
-        log.error("No presets_path configured -- re-run the installer to pick this up.")
+    try:
+        llama_cfg, config_dir = _llama_cfg_or_exit(args)
+        model_ops.require_presets(llama_cfg)
+    except model_ops.ModelOpError as exc:
+        log.error("%s", exc)
         return 1
 
-    if args.model:
-        targets = [args.model]
-    else:
-        try:
-            targets = list_cached_models(Path(llama_cfg["server_binary"]))
-        except ModelPullError as exc:
-            log.error("%s", exc)
-            return 1
-        if not targets:
-            print("No models cached locally yet -- pull one first.")
-            return 0
+    try:
+        outcome = model_ops.benchmark(llama_cfg, config_dir, args.model)
+    except model_ops.ModelOpError as exc:
+        log.error("%s", exc)
+        return 1
 
-    failures = 0
-    for target in targets:
-        print(f"{target}:")
-        # Re-size before re-measuring. The grade is capped by the effective context -- the smaller
-        # of what the model was trained for and what this device's memory can actually serve -- so
-        # a stale ctx_size would silently cap the grade at whatever was true when the model was
-        # first pulled. Anything that moves that number (a llama.cpp upgrade, a GPU-layers change,
-        # RAM added or freed) should be picked up here rather than quietly ignored.
-        try:
-            sizing = ensure_preset(
-                Path(llama_cfg["server_binary"]), Path(presets_path), target,
-                model_hf=target, gpu_layers=llama_cfg.get("gpu_layers"), force=True,
-            )
-        except ModelSizingError as exc:
-            log.warning(
-                "Could not re-size %s (%s) -- grading against whatever preset it already had.",
-                target, exc,
-            )
-        else:
-            if sizing is not None:
-                print(f"  re-sized: ctx_size={sizing.ctx_size} cache_type_k={sizing.cache_type_k} "
-                      f"cache_type_v={sizing.cache_type_v}")
+    results = outcome["results"]
+    if not results:
+        print("No models cached locally yet -- pull one first.")
+        return 0
 
-        screened, score = _benchmark_model(
-            llama_cfg, Path(presets_path), target, budget_seconds=model_perf.PROBE_BUDGET_SECONDS,
-        )
-        if screened is None:
-            failures += 1
-        else:
-            _print_screen_verdict(target, screened)
-            if score is not None:
-                _print_score(score)
-    return 1 if failures and len(targets) == 1 else 0
+    for entry in results:
+        print(f"{entry['model']}:")
+        if entry.get("warning"):
+            log.warning("%s", entry["warning"])
+        sizing = entry.get("sizing")
+        if sizing:
+            print(f"  re-sized: ctx_size={sizing['ctx_size']} "
+                  f"cache_type_k={sizing['cache_type_k']} cache_type_v={sizing['cache_type_v']}")
+        if entry.get("held_back"):
+            print(f"  UNUSABLE -- {entry['rejection']}")
+            print("  It has been held back; it is still installed and still selectable in the")
+            print(f"  chat model list. Remove it with `aipotluck-local-client remove {entry['model']}`.")
+            continue
+        if entry.get("measurement_skipped"):
+            log.warning("%s", entry["measurement_skipped"])
+        if entry.get("screen"):
+            _print_screen_verdict(entry["screen"])
+        if entry.get("score"):
+            _print_score(entry["score"])
+
+    failures = sum(1 for entry in results if not entry["measured"])
+    return 1 if failures and len(results) == 1 else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -885,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_pull_model(args)
         if args.command == "list":
             return run_list_models(args)
+        if args.command == "remove":
+            return run_remove_model(args)
         if args.command == "benchmark":
             return run_benchmark(args)
     except SystemExit:

@@ -313,12 +313,14 @@ def run_install(args: argparse.Namespace) -> int:
             "config_dir": str(lay.config_dir),
             "log_dir": str(lay.log_dir),
         },
-        # Every install starts logged out -- no Pangolin credentials, so the service (runner.py)
+        # A FRESH install starts logged out -- no Pangolin credentials, so the service (runner.py)
         # holds both llama-server and newt back until `aipotluck-local-client login` sets this
         # true. This is what lets the public one-line installer (install.sh) take zero arguments:
-        # it never needs a tunnel id/secret/endpoint in hand to finish installing.
+        # it never needs a tunnel id/secret/endpoint in hand to finish installing. An install over
+        # an ALREADY-PAIRED device keeps its pairing -- see _carry_over_pairing below.
         "logged_in": False,
     }
+    _carry_over_pairing(lay.config_dir / "runtime.json", runtime_config)
 
     # Pre-fetch (HF only -- a --model-path file is already local) and pre-size the default model,
     # so a fresh install already has a correctly-sized router preset waiting rather than falling
@@ -388,6 +390,30 @@ def run_install(args: argparse.Namespace) -> int:
         log.warning("Service status is ambiguous: %s (%s)", status.state, status.detail)
 
     return 0
+
+
+def _carry_over_pairing(runtime_path: Path, runtime_config: dict) -> None:
+    """Keeps an already-paired device paired across a re-install.
+
+    The installer rebuilds runtime.json from scratch every run, which is right for the llama.cpp
+    section -- those paths and that tag describe what was just installed. It is wrong for the
+    pairing. `logged_in` and the `tunnel` section are the user's credentials, not install output,
+    and rebuilding without them silently unpairs the device: the running service keeps serving from
+    the config it already holds in memory, so nothing looks wrong until the next restart, which may
+    be days later and will look unrelated. Observed on a Jetson that had been re-installed to pick
+    up a newer build and went dark at its next restart.
+
+    Upgrading is the common reason to re-run this installer, so it must not cost a re-pairing."""
+    try:
+        existing = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(existing, dict):
+        return
+    if existing.get("logged_in") and isinstance(existing.get("tunnel"), dict):
+        runtime_config["logged_in"] = True
+        runtime_config["tunnel"] = existing["tunnel"]
+        log.info("Keeping this device's existing pairing (it was already logged in)")
 
 
 def _print_summary(
