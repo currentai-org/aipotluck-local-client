@@ -646,7 +646,10 @@ def run_list_models(args: argparse.Namespace) -> int:
         score = entry["score"]
         if score is None:
             label = f"{'--':>7}"
-            notes.append("not measured -- run `benchmark`")
+            # No "run `benchmark`" for a held-back model: benchmarking is usually what held it
+            # back, so the advice sends the user round the same loop.
+            if not entry["held_back"]:
+                notes.append("not measured -- run `benchmark`")
         else:
             label = f"{score.get('localscore', 0):>7,.0f}"
             if score.get("band"):
@@ -667,7 +670,7 @@ def run_list_models(args: argparse.Namespace) -> int:
         # service already dealt with it, and the user would be waiting for a turn that keeps
         # failing.
         print()
-        print("Held back after repeatedly running out of memory:")
+        print("Held back, and not being retried:")
         for model_id, record in sorted(held_back.items()):
             print(f"  {model_id}")
             print(f"    {record.get('quarantine_reason', 'repeated out-of-memory failures')}")

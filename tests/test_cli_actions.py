@@ -891,6 +891,29 @@ class TestQuarantineSurfacing:
         assert "still installed and can still be picked" in out
         assert "remove <model>" in out
 
+    def test_a_held_back_model_is_not_told_to_run_benchmark(self, tmp_path, monkeypatch, capsys):
+        """Benchmarking is usually what held it back -- a model that cannot be loaded is
+        discovered by exactly that command -- so the suggestion would send the user round the
+        same loop and watch it fail again."""
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.model_health.quarantine(
+            self._config_dir(install_dir), "org/repo:Q4_K_M", "it ran out of memory while loading",
+        )
+
+        cli.run_list_models(make_pull_args(install_dir))
+
+        out = capsys.readouterr().out
+        assert "HELD BACK" in out
+        assert "run `benchmark`" not in out
+
+    def test_an_unmeasured_model_that_is_fine_is_still_told_to_run_benchmark(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The other half of the pair -- the advice must not disappear for everyone."""
+        install_dir = self._setup(tmp_path, monkeypatch)
+        cli.run_list_models(make_pull_args(install_dir))
+        assert "run `benchmark`" in capsys.readouterr().out
+
     def test_nothing_is_said_when_nothing_is_held_back(self, tmp_path, monkeypatch, capsys):
         install_dir = self._setup(tmp_path, monkeypatch)
         cli.run_list_models(make_pull_args(install_dir))
