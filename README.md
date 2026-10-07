@@ -436,7 +436,9 @@ Every `pull` sizes the model it just downloaded -- `ctx_size`, `parallel`, and t
 applies per model (`aipotluck/installer/model_presets.py` owns that file's read/write). The same
 sizing routine also runs once at service startup for any cached model that doesn't have a preset
 yet (`runner.backfill_missing_presets`) -- recovers a deleted/hand-edited-away presets file, or a
-model that reached the cache some other way, without needing another explicit `pull`.
+model that reached the cache some other way, without needing another explicit `pull`. That runs as a
+background job (it shows in `GET /jobs`) once the service is already answering and the router is
+already up, so startup never waits on it; the router reloads when it finishes.
 
 To size a model, a short second `llama-server` spawn (fast -- the model's already cached, this is
 a local load, not a network fetch) at a small probe context loads just far enough to report its

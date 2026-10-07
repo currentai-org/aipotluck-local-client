@@ -380,7 +380,10 @@ purely for `status`/`/capabilities` (section 4.5 above).
 3. `runner.py`'s `backfill_missing_presets`, once on every service start, for any cached model
    that doesn't have a preset yet (`force=False` -- fills gaps, doesn't redo work). Recovers a
    deleted/hand-edited-away presets file, or a model that reached the cache some other way, without
-   needing another explicit `pull`.
+   needing another explicit `pull`. It runs as a background job (visible in `GET /jobs`), after
+   the HTTP server and the router are already up, because each probe loads a model and `status`
+   has to answer from the moment the service starts; the router reloads when it finishes. Until
+   then an unsized model is served on llama-server's own defaults.
 
 All three call the same function, so there is exactly one place a sizing decision gets persisted --
 never three call sites each writing their own copy that could drift from the others.
