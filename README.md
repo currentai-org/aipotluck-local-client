@@ -403,9 +403,9 @@ correctly sized *before* it's first requested, rather than paying a cold downloa
 stock-defaults sizing on that first real request:
 
 ```bash
-aipotluck-local-client pull bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M   # download + size + speed-check
+aipotluck-local-client pull bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M   # download + size
 aipotluck-local-client list                                              # what's cached, with grades
-aipotluck-local-client benchmark [model]                                 # re-measure speed only
+aipotluck-local-client benchmark [model]                                 # measure speed
 ```
 
 `pull` accepts any Hugging Face `repo` or `repo:quant` target and hands it straight to
@@ -485,7 +485,7 @@ it. Two more facts from that side shape the estimate: every reply is hard-capped
 and the prompt is **never truncated** (a typical turn is ~2k tokens, 8-10k once retrieval or
 web-search grounding fires, 32k+ with an attached file).
 
-`pull` therefore benchmarks what it just downloaded, with `llama-bench` at the *same* K/V cache
+`benchmark` therefore measures a model with `llama-bench` at the *same* K/V cache
 types and GPU-layer count the preset will actually serve at, and fits per-token cost as a straight
 line in KV-cache depth. The grade then answers the question users actually feel: **how much
 thinking and answer arrives before the stream is cut off**. `N_out` is the number of output tokens
@@ -540,8 +540,8 @@ Two details worth knowing, both of which came out of measuring real hardware rat
   33.9ms at 1024, measured on a CPU-only laptop), because generating at depth 0 does almost no
   attention work. Anchoring the fit there made it *optimistic* across the whole range the app
   actually uses -- the direction that promises turns which then time out.
-- **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and at pull time the
-  file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
+- **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and right after a
+  download the file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
   `posix_fadvise(DONTNEED)` drops it first and a real sequential read is timed instead.
 - **The safety factor is measured, not guessed.** Checked against real full turns, the fit
   under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
@@ -551,7 +551,8 @@ Two details worth knowing, both of which came out of measuring real hardware rat
   the grade would have promised something false. It is 1.5x (1.75x for the live-server fallback),
   which puts the same turn at ~141s.
 
-A refusal **deletes the model**, via a router's own `DELETE /models` (which reuses llama.cpp's
+A model `pull` rejects -- one sizing proves cannot load, or cannot hold a usable context -- **is
+deleted** (`pull --force` keeps it anyway), via a router's own `DELETE /models` (which reuses llama.cpp's
 cache logic to clear the snapshot, its symlinks and the orphaned blobs). Merely withholding a preset
 would not be enough: the router auto-discovers everything in the Hugging Face cache, so a refused
 model would still be listed by `/v1/models` and selectable in the chat UI.
@@ -564,8 +565,13 @@ also does not know about a model downloaded since it last reloaded, which is exa
 rejected pull needs gone. A fresh preset-free router has neither problem, starts in well under a
 second, and works whether or not the service is running. The service's router is still asked to
 unload the model first, then to reload once its preset section has been dropped. `remove` takes the
-same path. `pull --force` keeps it
-anyway, and `--skip-benchmark` skips the measurement entirely.
+same path.
+
+**`pull` does not benchmark.** It used to, and the measurement made every pull minutes longer than
+its download for a verdict nobody had asked for yet. A pull downloads and sizes; `benchmark`
+measures, on request, and `list` marks every model that has not been measured. A pull still rejects
+a model that sizing proves cannot load or cannot hold a usable context, since that verdict comes for
+free with the sizing probe. `--skip-benchmark` is still accepted and does nothing.
 
 Failing to measure never becomes a refusal -- a busy machine, a missing binary or a failed probe
 records no grade and keeps the model, because that says nothing about the model. Source-built
@@ -612,8 +618,8 @@ reach it.** Nothing here checks a token.
 | `DELETE` | `/models?model=<urlencoded>` | `200` | synchronous |
 | `GET` | `/jobs` / `/jobs/{id}` | `200`, or `404` | newest first |
 
-**Slow operations return a job; fast ones answer directly.** A pull downloads gigabytes, sizes,
-screens and scores -- comfortably past ten minutes on a Jetson, which no client will hold a
+**Slow operations return a job; fast ones answer directly.** A pull downloads gigabytes and sizes
+them, and a benchmark screens and scores -- either can run past ten minutes on a Jetson, which no client will hold a
 connection open for through a tunnel. So `POST` returns `202` with a job id immediately and you poll
 `/jobs/{id}`, where `state` moves `queued` → `running` → `succeeded`/`failed` and `progress` fills
 in as the work happens. `list` and `remove` finish in milliseconds and answer inline.

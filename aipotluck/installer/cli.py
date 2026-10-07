@@ -18,9 +18,9 @@ Usage:
     aipotluck-local-client login --credentials-file creds.json   # or read it from a file
     aipotluck-local-client logout   # unpairs; llama-server and the tunnel stop until you log in again
     aipotluck-local-client status   # asks the running service for its login/tunnel/llama-server state
-    aipotluck-local-client pull <hf-repo[:quant]>   # download + size + speed-check a model
+    aipotluck-local-client pull <hf-repo[:quant]>   # download + size a model
     aipotluck-local-client list     # list models already downloaded locally, with their grades
-    aipotluck-local-client benchmark [model]        # re-measure speed without re-downloading
+    aipotluck-local-client benchmark [model]        # measure speed without re-downloading
 
 llama-server itself runs in router mode (CUR-1965) -- one always-running process that serves
 whichever model an inference request's own "model" field names, loading/unloading instances on
@@ -150,12 +150,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     pull.add_argument(
         "--force", action="store_true",
-        help="Keep the model even if it benchmarks too slowly to finish a conversation turn",
+        help="Download it even if it looks too big for this device, and keep it even if sizing "
+             "finds it cannot serve a conversation here",
     )
-    pull.add_argument(
-        "--skip-benchmark", action="store_true",
-        help="Download and size only, without measuring speed (no grade is recorded)",
-    )
+    # A pull no longer benchmarks at all, so this does nothing -- it is still accepted so scripts
+    # written when it mattered keep working.
+    pull.add_argument("--skip-benchmark", action="store_true", help=argparse.SUPPRESS)
 
     sub.add_parser(
         "list", parents=[common],
@@ -572,8 +572,7 @@ def run_pull_model(args: argparse.Namespace) -> int:
         result = model_ops.pull(
             llama_cfg, config_dir, args.model,
             allow_oversized=allow_oversized, keep_rejected=args.force,
-            skip_benchmark=args.skip_benchmark, timeout=args.timeout,
-            progress=lambda _msg: None,
+            timeout=args.timeout, progress=lambda _msg: None,
         )
     except model_ops.ModelOpError as exc:
         log.error("%s", exc)
@@ -584,15 +583,6 @@ def run_pull_model(args: argparse.Namespace) -> int:
     if result.get("sizing"):
         print("Sizing runtime parameters for this model...")
         _print_sizing(result["sizing"])
-    if result.get("screen") or result.get("score") or result.get("measurement_skipped"):
-        print("Checking this model can actually serve a turn here...")
-    if result.get("measurement_skipped"):
-        log.warning("%s", result["measurement_skipped"])
-    if result.get("screen"):
-        _print_screen_verdict(result["screen"])
-    if result.get("score"):
-        _print_score(result["score"])
-
     if result.get("rejected"):
         print()
         print(f"{args.model} cannot serve a conversation on this device -- {result['rejection']}.")
@@ -613,6 +603,7 @@ def run_pull_model(args: argparse.Namespace) -> int:
             f"{args.model} is downloaded and sized. The service isn't reachable right now (not "
             "logged in, or not running) -- it'll pick this model up the next time it starts."
         )
+    print(f"Run `{CLI_SHIM_NAME} benchmark {args.model}` to measure how fast it runs here.")
     return 0
 
 

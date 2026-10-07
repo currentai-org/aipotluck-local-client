@@ -1191,9 +1191,10 @@ def _score(value=250.0, confidence="ok"):
 
 
 class TestPullGate:
-    """The screen gates the score, and a rejection deletes the model. Withholding a preset is not
-    enough on its own: the router auto-discovers the HF cache, so a refused model would still be
-    listed by /v1/models and selectable in the web app's picker."""
+    """Sizing gates a pull, and a rejection deletes the model. Withholding a preset is not enough on
+    its own: the router auto-discovers the HF cache, so a refused model would still be listed by
+    /v1/models and selectable in the web app's picker. A pull never benchmarks -- that waits for
+    an explicit `benchmark`."""
 
     def _setup(self, tmp_path, monkeypatch, screened, score):
         install_dir = tmp_path / "install"
@@ -1212,29 +1213,35 @@ class TestPullGate:
                             lambda cfg, mid: deletes.append(mid) or True)
         return install_dir, deletes
 
-    def test_a_rejected_model_is_deleted_and_the_pull_fails(self, tmp_path, monkeypatch, capsys):
+    def test_a_pull_never_benchmarks_and_says_how_to(self, tmp_path, monkeypatch, capsys):
+        """Measuring made every pull minutes longer than its download, for a verdict nobody had
+        asked for yet. Even a model the benchmark WOULD reject is kept: that verdict is the
+        benchmark's to give, when it is asked for."""
         install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
+        benchmarks = []
+        monkeypatch.setattr(model_ops, "measure",
+                            lambda *a, **kw: benchmarks.append(1) or (_screen(True), None, None))
+
         rc = cli.run_pull_model(make_pull_args(install_dir))
-        out = capsys.readouterr().out
-        assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
-        assert "UNUSABLE" in out and "--force" in out
+
+        assert rc == 0 and benchmarks == [] and deletes == []
+        assert "benchmark org/repo:Q4_K_M" in capsys.readouterr().out
+
+    def test_the_old_skip_benchmark_flag_is_still_accepted(self):
+        """Scripts written when it mattered must not start failing to parse."""
+        args = cli.build_arg_parser().parse_args(["pull", "org/repo:Q4_K_M", "--skip-benchmark"])
+        assert args.model == "org/repo:Q4_K_M"
 
     def test_a_rejected_models_preset_is_dropped_with_it(self, tmp_path, monkeypatch):
-        install_dir, _deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k=None, cache_type_v=None,
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT, rejection="no room",
+        )
+        install_dir, _deletes = self._setup(tmp_path, monkeypatch, None, None)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: unviable)
         cli.run_pull_model(make_pull_args(install_dir))
         assert cli.model_presets.read_all(tmp_path / "presets.ini") == {}
-
-    def test_force_keeps_a_rejected_model(self, tmp_path, monkeypatch):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
-        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
-        assert deletes == []
-
-    def test_a_usable_model_reports_its_score(self, tmp_path, monkeypatch, capsys):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-        out = capsys.readouterr().out
-        assert rc == 0 and deletes == []
-        assert "LocalScore 412" in out
 
     def test_a_model_with_no_room_for_context_is_rejected_without_benchmarking(
         self, tmp_path, monkeypatch, capsys
@@ -1271,16 +1278,33 @@ class TestPullGate:
         assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
         assert deletes == []
 
+
+class TestRunBenchmark:
+    """Where a model's speed verdict is shown now that pull no longer measures."""
+
+    def _setup(self, tmp_path, monkeypatch, screened, score):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "32768"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "measure", lambda *a, **kw: (screened, score, None))
+        return install_dir
+
+    def test_a_usable_model_reports_its_score(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        rc = cli.run_benchmark(Namespace(install_dir=install_dir, system=False, verbose=False,
+                                         model="org/repo:Q4_K_M"))
+        assert rc == 0
+        assert "LocalScore 412" in capsys.readouterr().out
+
     def test_a_low_confidence_score_says_so(self, tmp_path, monkeypatch, capsys):
         """A device that moved 30% under its own measurement cannot support a precise number, and
         the output has to admit that rather than printing it as though it could."""
-        install_dir, _ = self._setup(tmp_path, monkeypatch, _screen(False), _score(confidence="low"))
-        cli.run_pull_model(make_pull_args(install_dir))
+        install_dir = self._setup(tmp_path, monkeypatch, _screen(False), _score(confidence="low"))
+        cli.run_benchmark(Namespace(install_dir=install_dir, system=False, verbose=False,
+                                    model="org/repo:Q4_K_M"))
         assert "low confidence" in capsys.readouterr().out
-
-    def test_an_unmeasurable_model_is_kept_rather_than_rejected_on_no_evidence(self, tmp_path, monkeypatch):
-        """Failing to measure says nothing about the model; deleting someone's download on the
-        strength of a failed probe would be worse than the problem this feature solves."""
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, None, None)
-        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
-        assert deletes == []

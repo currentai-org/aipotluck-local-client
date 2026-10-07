@@ -388,17 +388,23 @@ def check_size_before_download(model_id: str) -> dict[str, Any] | None:
 def pull(
     llama_cfg: dict, config_dir: Path, model_id: str, *,
     allow_oversized: bool = False, keep_rejected: bool = False,
-    skip_benchmark: bool = False, timeout: float | None = None,
-    budget_seconds: float | None = None, progress: Progress = _noop,
+    timeout: float | None = None, progress: Progress = _noop,
 ) -> dict[str, Any]:
-    """Download a model, size it, check it can serve a turn, and score it.
+    """Download a model and size it.
+
+    It is deliberately NOT benchmarked here. Measuring used to be part of every pull, and it made
+    the pull minutes longer than the download for a verdict the user had not asked for yet;
+    `benchmark` does it on request, and `list` says which models have not been measured. Sizing
+    stays, because the router needs a preset before the model's first turn, and a model sizing
+    proves cannot load or cannot hold a usable context is still rejected here -- that verdict
+    comes for free with the sizing probe.
 
     The two overrides are deliberately separate, because they answer different questions at
     different costs. `allow_oversized` says "download it even though the weights do not fit this
     machine" -- a decision made before spending anything. `keep_rejected` says "keep it even though
-    it cannot serve a turn here" -- a decision made after measuring. A single flag covering both
-    would mean a caller who only wanted to override the cheap pre-check silently also disabled the
-    verdict that was actually measured."""
+    sizing found it cannot serve a turn here" -- a decision made after loading it. A single flag
+    covering both would mean a caller who only wanted to override the cheap pre-check silently also
+    disabled the verdict that was actually measured."""
     llama_cfg = require_llama(llama_cfg)
     result: dict[str, Any] = {
         "model": model_id, "allow_oversized": allow_oversized, "keep_rejected": keep_rejected,
@@ -467,23 +473,6 @@ def pull(
             code=sizing.rejection_code or model_sizing.REJECT_NO_ROOM_FOR_CONTEXT,
             reason=sizing.rejection or "this device cannot give it a usable context",
         )
-
-    if not skip_benchmark:
-        progress(f"checking {model_id} can serve a turn")
-        screened, score, skipped = measure(
-            llama_cfg, presets_path, model_id,
-            budget_seconds=budget_seconds or model_perf.PROBE_BUDGET_SECONDS,
-            progress=progress,
-        )
-        result["screen"] = screen_to_dict(screened) if screened else None
-        result["score"] = score_to_dict(score) if score else None
-        if skipped:
-            result["measurement_skipped"] = skipped
-        if screened is not None and screened.rejected and not keep_rejected:
-            return _reject(
-                llama_cfg, presets_path, config_dir, model_id, result,
-                code=screened.reason_code or model_screen.REJECT_TOO_SLOW, reason=screened.reason,
-            )
 
     result["rejected"] = False
     result["router_reloaded"] = reload_router(llama_cfg)

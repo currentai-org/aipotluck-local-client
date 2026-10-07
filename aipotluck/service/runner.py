@@ -387,14 +387,13 @@ class _StatusHandler(BaseHTTPRequestHandler):
                     return
 
             keep_rejected = bool(body.get("keep_rejected")) or force
-            skip_benchmark = bool(body.get("skip_benchmark"))
             timeout = body.get("timeout")
 
             def _pull(job):
                 return model_ops.pull(
                     llama_cfg, config_dir, model_id,
                     allow_oversized=True,  # already decided above, with the caller's answer
-                    keep_rejected=keep_rejected, skip_benchmark=skip_benchmark,
+                    keep_rejected=keep_rejected,
                     timeout=float(timeout) if timeout is not None else None,
                     progress=self.runner.jobs.progress_callback(job),
                 )
