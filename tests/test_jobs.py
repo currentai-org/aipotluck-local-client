@@ -136,3 +136,25 @@ class TestListingAndRetention:
 
     def test_an_unknown_job_id_is_none_rather_than_an_error(self, runner):
         assert runner.get("nope") is None
+
+
+class TestDownloadProgress:
+    def test_the_latest_byte_count_replaces_the_last_rather_than_piling_up(self):
+        """Updates arrive several times a second; a list of them would grow by thousands of
+        entries over a large pull and make every poll of the job heavier."""
+        runner = jobs_module.JobRunner()
+        job = runner.submit("pull", "org/m:Q4_K_M", lambda job: {})
+        report = runner.download_callback(job)
+
+        report(10, None)
+        report(500, 1000)
+
+        snapshot = job.to_dict()
+        assert snapshot["download"]["received_bytes"] == 500
+        assert snapshot["download"]["total_bytes"] == 1000
+        assert snapshot["progress"] == []
+
+    def test_a_job_that_never_downloads_reports_none(self):
+        runner = jobs_module.JobRunner()
+        job = runner.submit("benchmark", None, lambda job: {})
+        assert job.to_dict()["download"] is None

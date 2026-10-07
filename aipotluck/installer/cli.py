@@ -64,6 +64,7 @@ from aipotluck.installer.model_pull import (  # noqa: E402
     ModelPullError,
     list_cached_models,
     pull_model,
+    terminal_progress,
 )
 from aipotluck.installer import model_sizing  # noqa: E402
 from aipotluck.installer.model_sizing import ModelSizingError, ensure_preset  # noqa: E402
@@ -141,7 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pull.add_argument(
         "model",
         help="Hugging Face repo[:quant], e.g. bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M "
-             "-- passed straight through to llama-server's own -hf downloader",
+             "-- passed straight through to llama-server's own downloader",
     )
     pull.add_argument(
         "--timeout", type=float, default=None,
@@ -541,7 +542,7 @@ def _llama_cfg_or_exit(args: argparse.Namespace) -> tuple[dict, Path]:
 
 
 def run_pull_model(args: argparse.Namespace) -> int:
-    """Downloads `args.model` via llama-server's own -hf downloader (see model_pull.py), sizes it
+    """Downloads `args.model` via llama-server's own downloader (see model_pull.py), sizes it
     (aipotluck.installer.model_sizing -- ctx_size/parallel/cache_type_k/-v, written into the
     router's --models-preset INI file), then asks a running router to pick both up immediately.
     There's no "active model" to set anymore -- llama-server's router mode (CUR-1965) serves
@@ -573,6 +574,7 @@ def run_pull_model(args: argparse.Namespace) -> int:
             llama_cfg, config_dir, args.model,
             allow_oversized=allow_oversized, keep_rejected=args.force,
             timeout=args.timeout, progress=lambda _msg: None,
+            download_progress=terminal_progress(),
         )
     except model_ops.ModelOpError as exc:
         log.error("%s", exc)

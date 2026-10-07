@@ -408,16 +408,19 @@ aipotluck-local-client list                                              # what'
 aipotluck-local-client benchmark [model]                                 # measure speed
 ```
 
-`pull` accepts any Hugging Face `repo` or `repo:quant` target and hands it straight to
-`llama-server`'s own `-hf` downloader rather than re-implementing Hugging Face's GGUF-resolution
-logic (matching a quant string to the right file, split-GGUF handling, etc). It blocks until the
-model has actually finished downloading *and* loading successfully (a real `/health` check on a
-throwaway port, not just "the download finished"), sizes it (see below), then -- rather than
-restarting the whole service the way `login`/`logout` do -- best-effort asks a running router to
-`GET /models?reload=1` so the new model and its sizing are live immediately. Independent of login
+`pull` accepts any Hugging Face `repo` or `repo:quant` target and hands it to llama-server's own
+downloader rather than re-implementing Hugging Face's GGUF-resolution logic (matching a quant string
+to the right file, split-GGUF handling, etc). It asks a short-lived scratch router for it
+(`POST /models`, `aipotluck/installer/cache_router.py`), which reports progress in bytes across
+every file the model needs -- shown as a progress line on the terminal, and as `download` on an API
+job. llama.cpp reports a download of a repo that doesn't exist as finished, so `pull` only counts it
+as done once the model is really in the cache, and otherwise quotes llama-server's own error. It
+then sizes the model (see below), which loads it, and -- rather than restarting the whole service
+the way `login`/`logout` do -- best-effort asks a running router to `GET /models?reload=1` so the new
+model and its sizing are live immediately. Independent of login
 state -- pulling a model doesn't need pairing.
 
-`list` reads the same on-disk cache `-hf` writes into and `pull` reads from -- a real Hugging
+`list` reads the same on-disk cache llama.cpp downloads into and `pull` reads from -- a real Hugging
 Face Hub cache layout (`$LLAMA_CACHE` / `$HF_HUB_CACHE` / `$HUGGINGFACE_HUB_CACHE` /
 `$HF_HOME/hub` / `$XDG_CACHE_HOME/huggingface/hub` / `~/.cache/huggingface/hub`, in that order --
 see `vendor/llama.cpp/common/hf-cache.cpp`) -- via `llama-server`'s own `--cache-list` flag, for
@@ -622,7 +625,9 @@ reach it.** Nothing here checks a token.
 them, and a benchmark screens and scores -- either can run past ten minutes on a Jetson, which no client will hold a
 connection open for through a tunnel. So `POST` returns `202` with a job id immediately and you poll
 `/jobs/{id}`, where `state` moves `queued` → `running` → `succeeded`/`failed` and `progress` fills
-in as the work happens. `list` and `remove` finish in milliseconds and answer inline.
+in as the work happens. While a pull downloads, `download` holds the latest
+`{"received_bytes", "total_bytes", "updated_at"}` (`total_bytes` is `null` until llama.cpp knows it),
+overwritten in place rather than appended. `list` and `remove` finish in milliseconds and answer inline.
 
 **Jobs run one at a time, deliberately.** A benchmark taken while something else is loading a model
 measures the contention rather than the model, and two models resident at once was an outright

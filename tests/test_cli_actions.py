@@ -777,7 +777,8 @@ class TestRunPullModel:
 
         assert seen_kwargs["timeout"] == 45.0
 
-    def test_gpu_layers_forwarded_to_both_pull_and_sizing(self, tmp_path, monkeypatch):
+    def test_gpu_layers_forwarded_to_sizing(self, tmp_path, monkeypatch):
+        """The download no longer loads the model, so only sizing -- which does -- needs it."""
         install_dir = tmp_path / "install"
         write_runtime(
             install_dir,
@@ -788,8 +789,7 @@ class TestRunPullModel:
                 "service": {},
             },
         )
-        pull_kwargs = {}
-        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pull_kwargs.update(kw))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
         ensure_preset_kwargs = {}
         monkeypatch.setattr(
             model_ops.model_sizing, "ensure_preset",
@@ -799,7 +799,6 @@ class TestRunPullModel:
 
         cli.run_pull_model(args)
 
-        assert pull_kwargs["gpu_layers"] == "all"
         assert ensure_preset_kwargs["gpu_layers"] == "all"
 
     def test_no_presets_path_skips_sizing_but_still_succeeds(self, tmp_path, monkeypatch, caplog):

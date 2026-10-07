@@ -389,8 +389,10 @@ def pull(
     llama_cfg: dict, config_dir: Path, model_id: str, *,
     allow_oversized: bool = False, keep_rejected: bool = False,
     timeout: float | None = None, progress: Progress = _noop,
+    download_progress: "cache_router.DownloadProgress | None" = None,
 ) -> dict[str, Any]:
-    """Download a model and size it.
+    """Download a model and size it. `download_progress(received_bytes, total_bytes_or_None)` is
+    called as the download runs; `progress` gets a message per step.
 
     It is deliberately NOT benchmarked here. Measuring used to be part of every pull, and it made
     the pull minutes longer than the download for a verdict the user had not asked for yet;
@@ -422,8 +424,8 @@ def pull(
     try:
         pull_model(
             Path(llama_cfg["server_binary"]), model_id,
-            gpu_layers=llama_cfg.get("gpu_layers"),
             timeout=timeout if timeout is not None else DEFAULT_PULL_TIMEOUT_SECONDS,
+            on_progress=download_progress,
         )
     except ModelPullError as exc:
         raise ModelOpError(str(exc), code="download_failed", status=502) from exc

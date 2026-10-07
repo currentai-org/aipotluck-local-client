@@ -1,20 +1,14 @@
-"""aipotluck.installer.model_pull -- the one-shot "spawn, poll /health, terminate" orchestration
-around llama-server's own -hf downloader.
+"""aipotluck.installer.model_pull -- `--cache-list` parsing, and the thin wrapper `pull_model`
+puts around cache_router's download (whose own real-subprocess tests are in test_cache_router.py).
 
-Deliberately NOT mocked: subprocess spawning, real HTTP health polling, and process termination
-are exactly the kind of thing that's easy to get wrong (a pipe-buffer deadlock, a health check
-that never actually proves the process is gone, a timeout that doesn't actually time out) and
-easy to get *looking* right with a mock that just returns what the test expects. A tiny real
-stand-in script plays the part of llama-server instead: a real subprocess, a real socket, a real
-/health response, so these tests prove the orchestration against real process/network behavior.
+Deliberately NOT mocked: subprocess spawning. A tiny real stand-in script plays the part of
+llama-server instead, so these prove the parsing against a real process's real output.
 """
 
 from __future__ import annotations
 
-import socket
 import stat
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
@@ -81,96 +75,53 @@ def fake_server_binary(tmp_path: Path) -> Path:
     return script
 
 
-def _port_is_open(host: str, port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
-        return sock.connect_ex((host, port)) == 0
-
-
-class TestFreePort:
-    def test_returns_a_bindable_port(self):
-        port = model_pull._free_port("127.0.0.1")
-        # If it were still held, a fresh bind on the same port would fail.
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", port))
-
-
-class TestCheckHealth:
-    def test_false_when_nothing_is_listening(self):
-        port = model_pull._free_port("127.0.0.1")
-        assert model_pull._check_health("127.0.0.1", port) is False
-
-
 class TestPullModel:
-    def test_succeeds_when_health_comes_up(self, fake_server_binary):
-        # No --delay: the fake server is healthy almost immediately, so pull_model should return
-        # well before its own timeout.
-        model_pull.pull_model(fake_server_binary, "org/repo:Q4_K_M", timeout=15)
+    def test_a_download_failure_becomes_a_model_pull_error_with_the_reason(self, monkeypatch):
+        def fail(binary, target, **kw):
+            raise model_pull.cache_router.CacheRouterError("nothing was downloaded for org/nope")
 
-    def test_raises_when_process_exits_before_healthy(self, fake_server_binary, monkeypatch):
-        # Simulates a bad repo/quant string: llama-server would exit non-zero rather than ever
-        # serving /health. Injected via a monkeypatched cmd rather than a real bad HF target, so
-        # this test needs no network access.
-        real_popen = model_pull.subprocess.Popen
+        monkeypatch.setattr(model_pull.cache_router, "download", fail)
+        with pytest.raises(model_pull.ModelPullError, match="nothing was downloaded for org/nope"):
+            model_pull.pull_model(Path("/fake/llama-server"), "org/nope")
 
-        def popen_with_fail_flag(cmd, *args, **kwargs):
-            return real_popen(cmd + ["--fail"], *args, **kwargs)
+    def test_progress_reaches_the_download(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(model_pull.cache_router, "download", lambda binary, target, **kw: seen.update(kw))
+        report = lambda received, total: None  # noqa: E731
+        model_pull.pull_model(Path("/fake/llama-server"), "org/repo", timeout=5, on_progress=report)
+        assert seen == {"timeout": 5, "on_progress": report}
 
-        monkeypatch.setattr(model_pull.subprocess, "Popen", popen_with_fail_flag)
 
-        with pytest.raises(model_pull.ModelPullError, match="exited"):
-            model_pull.pull_model(fake_server_binary, "org/bad-repo", timeout=15)
+class TestTerminalProgress:
+    class _Stream:
+        def __init__(self, tty):
+            self.tty, self.written = tty, []
 
-    def test_raises_on_timeout_and_still_cleans_up_the_process(self, fake_server_binary, monkeypatch):
-        real_popen = model_pull.subprocess.Popen
+        def isatty(self):
+            return self.tty
 
-        def popen_with_long_delay(cmd, *args, **kwargs):
-            return real_popen(cmd + ["--delay", "30"], *args, **kwargs)
+        def write(self, text):
+            self.written.append(text)
 
-        monkeypatch.setattr(model_pull.subprocess, "Popen", popen_with_long_delay)
+        def flush(self):
+            pass
 
-        with pytest.raises(model_pull.ModelPullError, match="Timed out"):
-            model_pull.pull_model(fake_server_binary, "org/slow-repo", timeout=1)
+    def test_a_tty_gets_one_line_redrawn_in_place(self):
+        stream = self._Stream(tty=True)
+        report = model_pull.terminal_progress(stream, min_interval=0)
+        report(50_000_000, 100_000_000)
+        report(100_000_000, 100_000_000)
+        assert stream.written[0].startswith("\r") and "50.0%" in stream.written[0]
+        assert stream.written[-1].endswith("\n") and "100.0%" in stream.written[-1]
 
-    def test_terminates_the_process_on_success(self, fake_server_binary, monkeypatch):
-        port_holder: list[int] = []
-        real_free_port = model_pull._free_port
-
-        def recording_free_port(host):
-            port = real_free_port(host)
-            port_holder.append(port)
-            return port
-
-        monkeypatch.setattr(model_pull, "_free_port", recording_free_port)
-
-        model_pull.pull_model(fake_server_binary, "org/repo", timeout=15)
-
-        # The port pull_model used must not still be listening once it returns -- proves the
-        # subprocess was actually terminated, not just that pull_model stopped waiting on it.
-        port = port_holder[0]
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _port_is_open("127.0.0.1", port):
-            time.sleep(0.1)
-        assert not _port_is_open("127.0.0.1", port)
-
-    def test_raises_when_binary_missing(self, tmp_path):
-        with pytest.raises(model_pull.ModelPullError, match="not found"):
-            model_pull.pull_model(tmp_path / "does-not-exist", "org/repo")
-
-    def test_passes_ctx_size_and_gpu_layers_through(self, fake_server_binary, monkeypatch):
-        seen_cmds = []
-        real_popen = model_pull.subprocess.Popen
-
-        def recording_popen(cmd, *args, **kwargs):
-            seen_cmds.append(cmd)
-            return real_popen(cmd, *args, **kwargs)
-
-        monkeypatch.setattr(model_pull.subprocess, "Popen", recording_popen)
-
-        model_pull.pull_model(fake_server_binary, "org/repo", ctx_size=2048, gpu_layers="auto", timeout=15)
-
-        assert "--ctx-size" in seen_cmds[0] and "2048" in seen_cmds[0]
-        assert "--gpu-layers" in seen_cmds[0] and "auto" in seen_cmds[0]
+    def test_a_pipe_gets_no_carriage_returns(self, caplog):
+        stream = self._Stream(tty=False)
+        report = model_pull.terminal_progress(stream)
+        with caplog.at_level("INFO", logger="aipotluck.installer.model_pull"):
+            for received in range(0, 101, 5):
+                report(received * 1_000_000, 100_000_000)
+        assert stream.written == []
+        assert [r.getMessage().split()[1] for r in caplog.records] == [f"{d}%" for d in range(0, 101, 10)]
 
 
 class TestListCachedModels:

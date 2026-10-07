@@ -53,6 +53,9 @@ class Job:
     started_at: str | None = None
     finished_at: str | None = None
     progress: list[dict[str, str]] = field(default_factory=list)
+    # The latest byte count of a download in progress, overwritten rather than appended: updates
+    # arrive several times a second, and `progress` is a history of steps, not a ticker.
+    download: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     error_code: str | None = None
@@ -67,6 +70,7 @@ class Job:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "progress": list(self.progress),
+            "download": dict(self.download) if self.download else None,
             "result": self.result,
             "error": self.error,
             "error_code": self.error_code,
@@ -167,3 +171,11 @@ class JobRunner:
 
     def progress_callback(self, job: Job) -> Callable[[str], None]:
         return lambda message: self._record_progress(job, message)
+
+    def download_callback(self, job: Job) -> Callable[[int, "int | None"], None]:
+        """For a pull: `job.download` becomes {"received_bytes", "total_bytes", "updated_at"},
+        with total_bytes None until llama.cpp knows it."""
+        def report(received: int, total: int | None) -> None:
+            with self._lock:
+                job.download = {"received_bytes": received, "total_bytes": total, "updated_at": _now()}
+        return report

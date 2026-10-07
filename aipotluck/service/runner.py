@@ -396,6 +396,7 @@ class _StatusHandler(BaseHTTPRequestHandler):
                     keep_rejected=keep_rejected,
                     timeout=float(timeout) if timeout is not None else None,
                     progress=self.runner.jobs.progress_callback(job),
+                    download_progress=self.runner.jobs.download_callback(job),
                 )
 
             job = self.runner.jobs.submit("pull", model_id, _pull)
