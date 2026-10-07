@@ -939,9 +939,30 @@ class TestRunRemoveModel:
         })
         monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: list(cached))
         deletes = []
-        monkeypatch.setattr(model_ops, "delete_cached_model",
-                            lambda cfg, mid: deletes.append(mid) or deletes_ok)
+
+        def delete(cfg, mid):
+            deletes.append(mid)
+            if not deletes_ok:
+                raise model_ops.ModelOpError(
+                    f"Could not remove {mid}: model name={mid} is not removable (not from cache)",
+                    code="delete_failed", status=502,
+                )
+
+        monkeypatch.setattr(model_ops, "delete_cached_model", delete)
+        monkeypatch.setattr(model_ops, "reload_router", lambda cfg: True)
         return install_dir, deletes
+
+    def test_a_removed_models_preset_goes_with_it(self, tmp_path, monkeypatch):
+        """Otherwise the router keeps a section for a model it can no longer serve, and `status`
+        keeps explaining the sizing of something that isn't there."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 0
+        assert cli.model_presets.read_all(tmp_path / "presets.ini") == {}
+
+    def test_a_failed_delete_keeps_the_preset(self, tmp_path, monkeypatch):
+        install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 1
+        assert "org/repo:Q4_K_M" in cli.model_presets.read_all(tmp_path / "presets.ini")
 
     def test_yes_removes_without_prompting(self, tmp_path, monkeypatch):
         install_dir, deletes = self._setup(tmp_path, monkeypatch)
@@ -993,9 +1014,12 @@ class TestRunRemoveModel:
         cli.run_remove_model(make_remove_args(install_dir, yes=True))
         assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is None
 
-    def test_a_failed_delete_keeps_the_records_and_says_why(self, tmp_path, monkeypatch, capsys):
-        """If the router couldn't be reached the files are still there, so forgetting the model
-        would leave it installed, unexplained and un-held-back."""
+    def test_a_failed_delete_keeps_the_records_and_passes_on_llama_cpps_reason(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The files are still there, so forgetting the model would leave it installed, unexplained
+        and un-held-back. And the reason is llama.cpp's own -- not a guess that the service wasn't
+        reachable, which is what this used to say even when the router had answered."""
         install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
         config_dir = install_dir / "config"
         model_ops.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
@@ -1004,7 +1028,9 @@ class TestRunRemoveModel:
 
         assert rc == 1
         assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is not None
-        assert "wasn't reachable" in capsys.readouterr().out
+        out = capsys.readouterr()
+        assert "not removable (not from cache)" in out.out + out.err
+        assert "wasn't reachable" not in out.out + out.err
 
 
 class TestRunListModels:
@@ -1088,24 +1114,20 @@ class TestRunListModels:
 
 
 class TestDeleteCachedModel:
-    """Real HTTP: proves the exact request llama.cpp's router expects, since this is the only thing
-    that actually removes a refused model. The route is `DELETE /models?model=<id>`
-    (vendor/llama.cpp/tools/server/server.cpp's `ctx_http.del("/models", ...)` ->
-    server-models.cpp's `del_router_models`, which reads the `model` QUERY parameter -- not a JSON
-    body -- and calls common_download_remove to clear the snapshot, its symlinks and the orphaned
-    blobs). Getting the method or the parameter shape wrong would silently leave the model in place
-    while the CLI reported it removed."""
+    """The service's own router is asked to unload the model before the files go, and the deletion
+    itself goes to a scratch router (cache_router's own tests cover that half)."""
 
-    def _serve(self, status=200):
+    def _serve_main_router(self):
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         seen = []
 
         class Handler(BaseHTTPRequestHandler):
-            def do_DELETE(self):
-                seen.append((self.command, self.path))
-                self.send_response(status)
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.path, json.loads(body)))
+                self.send_response(200)
                 self.send_header("Content-Length", "2")
                 self.end_headers()
                 self.wfile.write(b"{}")
@@ -1117,24 +1139,43 @@ class TestDeleteCachedModel:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return server, seen
 
-    def test_sends_a_delete_with_the_model_as_a_url_encoded_query_parameter(self):
-        server, seen = self._serve()
+    def test_unloads_from_the_service_router_before_deleting(self, monkeypatch):
+        server, seen = self._serve_main_router()
+        order = []
+        monkeypatch.setattr(
+            model_ops.cache_router, "delete",
+            lambda binary, mid: order.append(("delete", list(seen))),
+        )
         try:
-            port = server.server_address[1]
-            ok = model_ops.delete_cached_model({"host": "127.0.0.1", "port": port}, "org/repo:Q4_K_M")
+            model_ops.delete_cached_model(
+                {"host": "127.0.0.1", "port": server.server_address[1],
+                 "server_binary": "/fake/llama-server"},
+                "org/repo:Q4_K_M",
+            )
         finally:
             server.shutdown()
             server.server_close()
+        assert order == [("delete", [("/models/unload", {"model": "org/repo:Q4_K_M"})])]
 
-        assert ok is True
-        assert len(seen) == 1
-        method, path = seen[0]
-        assert method == "DELETE"
-        # The id contains both "/" and ":", so it has to survive encoding intact.
-        assert path == "/models?model=org%2Frepo%3AQ4_K_M"
+    def test_a_service_that_is_not_running_does_not_stop_the_delete(self, monkeypatch):
+        deletes = []
+        monkeypatch.setattr(model_ops.cache_router, "delete", lambda binary, mid: deletes.append(mid))
+        model_ops.delete_cached_model(
+            {"host": "127.0.0.1", "port": 1, "server_binary": "/fake/llama-server"}, "org/repo:Q4_K_M",
+        )
+        assert deletes == ["org/repo:Q4_K_M"]
 
-    def test_an_unreachable_router_reports_failure_rather_than_claiming_success(self):
-        assert model_ops.delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
+    def test_a_refusal_is_reported_with_llama_cpps_reason(self, monkeypatch):
+        def refuse(binary, mid):
+            raise model_ops.cache_router.CacheRouterError("model name=x is not found")
+
+        monkeypatch.setattr(model_ops.cache_router, "delete", refuse)
+        with pytest.raises(model_ops.ModelOpError) as excinfo:
+            model_ops.delete_cached_model(
+                {"host": "127.0.0.1", "port": 1, "server_binary": "/fake/llama-server"}, "x",
+            )
+        assert excinfo.value.code == "delete_failed"
+        assert "model name=x is not found" in str(excinfo.value)
 
 
 def _screen(rejected, reason="test reason"):
@@ -1175,6 +1216,11 @@ class TestPullGate:
         out = capsys.readouterr().out
         assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
         assert "UNUSABLE" in out and "--force" in out
+
+    def test_a_rejected_models_preset_is_dropped_with_it(self, tmp_path, monkeypatch):
+        install_dir, _deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
+        cli.run_pull_model(make_pull_args(install_dir))
+        assert cli.model_presets.read_all(tmp_path / "presets.ini") == {}
 
     def test_force_keeps_a_rejected_model(self, tmp_path, monkeypatch):
         install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)

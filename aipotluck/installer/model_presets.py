@@ -113,3 +113,21 @@ def write_tuning(ini_path: Path, model_id: str, tuning: dict[str, str]) -> None:
     data: dict[str, Any] = read_tuning(ini_path)
     data[model_id] = tuning
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def remove_preset(ini_path: Path, model_id: str) -> bool:
+    """Drops model_id's section and its tuning reasons, for a model whose files are gone. Left
+    behind, a section names a model the router can no longer serve, and `status` would keep
+    explaining the sizing of something that isn't there. Every other section is preserved, the
+    same as write_preset. Returns whether there was a section to drop."""
+    removed = False
+    if ini_path.exists():
+        parser = _read(ini_path)
+        if parser.remove_section(model_id):
+            with ini_path.open("w", encoding="utf-8") as fh:
+                parser.write(fh)
+            removed = True
+    tuning = read_tuning(ini_path)
+    if tuning.pop(model_id, None) is not None:
+        _tuning_path(ini_path).write_text(json.dumps(tuning, indent=2), encoding="utf-8")
+    return removed

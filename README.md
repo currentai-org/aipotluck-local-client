@@ -551,10 +551,20 @@ Two details worth knowing, both of which came out of measuring real hardware rat
   the grade would have promised something false. It is 1.5x (1.75x for the live-server fallback),
   which puts the same turn at ~141s.
 
-A refusal **deletes the model**, via the router's own `DELETE /models` (which reuses llama.cpp's
+A refusal **deletes the model**, via a router's own `DELETE /models` (which reuses llama.cpp's
 cache logic to clear the snapshot, its symlinks and the orphaned blobs). Merely withholding a preset
 would not be enough: the router auto-discovers everything in the Hugging Face cache, so a refused
-model would still be listed by `/v1/models` and selectable in the chat UI. `pull --force` keeps it
+model would still be listed by `/v1/models` and selectable in the chat UI.
+
+That delete goes to a short-lived scratch router started with no presets file
+(`aipotluck/installer/cache_router.py`), not to the service's own. The service's router refuses to
+delete any model named in `--models-preset` -- every model this project sizes -- and a reload does
+not lift that, because llama.cpp re-reads a model's preset on reload but not where it came from. It
+also does not know about a model downloaded since it last reloaded, which is exactly the one a
+rejected pull needs gone. A fresh preset-free router has neither problem, starts in well under a
+second, and works whether or not the service is running. The service's router is still asked to
+unload the model first, then to reload once its preset section has been dropped. `remove` takes the
+same path. `pull --force` keeps it
 anyway, and `--skip-benchmark` skips the measurement entirely.
 
 Failing to measure never becomes a refusal -- a busy machine, a missing binary or a failed probe

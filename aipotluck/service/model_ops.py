@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from aipotluck.installer import (
+    cache_router,
     llama_errors,
     model_localscore,
     model_perf,
@@ -148,23 +149,40 @@ def reload_router(llama_cfg: dict) -> bool:
         return False
 
 
-def delete_cached_model(llama_cfg: dict, model_id: str) -> bool:
-    """Removes a model's files through the running router's own `DELETE /models` (server.cpp:243 ->
-    server-models.cpp's del_router_models -> common_download_remove), which stops any running
-    instance and then clears the snapshot entry, its symlinks and the newly-orphaned blobs using
-    llama.cpp's own cache logic rather than a reimplementation of its layout here.
+def delete_cached_model(llama_cfg: dict, model_id: str) -> None:
+    """Removes a model's files from the HF cache, raising ModelOpError with llama.cpp's own reason
+    if it can't.
 
-    This is the only thing that actually enforces a refusal. The router auto-discovers everything
-    in the HF cache and `--no-models-autoload` is a global switch rather than a per-model one, so
-    merely withholding a preset would leave a refused model listed by /v1/models and selectable in
-    the web app's picker -- exactly the outcome the grade exists to prevent."""
-    url = f"{base_url(llama_cfg)}/models?model={urllib.parse.quote(model_id, safe='')}"
+    The deletion itself runs through a scratch router (see cache_router's docstring for why the
+    service's own router cannot do it). The service's router is still asked to unload the model
+    first, because a copy it is serving would otherwise keep running from the deleted files -- or,
+    on Windows, keep them open so they cannot be deleted at all. That request is best-effort: a
+    service that isn't running has nothing loaded.
+
+    Deleting is the only thing that actually enforces a refusal. The router auto-discovers
+    everything in the HF cache and `--no-models-autoload` is a global switch rather than a
+    per-model one, so merely withholding a preset would leave a refused model listed by /v1/models
+    and selectable in the web app's picker -- exactly the outcome the grade exists to prevent."""
+    model_perf_live.unload_model(base_url(llama_cfg), model_id, timeout=30.0)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method="DELETE"), timeout=60) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, OSError) as exc:
-        log.warning("Could not remove %s through the running router: %s", model_id, exc)
-        return False
+        cache_router.delete(Path(llama_cfg["server_binary"]), model_id)
+    except cache_router.CacheRouterError as exc:
+        log.warning("Could not remove %s: %s", model_id, exc)
+        raise ModelOpError(
+            f"Could not remove {model_id}: {exc}", code="delete_failed", status=502,
+        ) from exc
+
+
+def _forget_model(llama_cfg: dict, config_dir: Path, model_id: str) -> None:
+    """Everything this client remembers about a model whose files are gone: its preset and the
+    reasons behind it, its grade, its health record. Then the router reloads, so it stops listing
+    a model it can no longer serve."""
+    presets_path = llama_cfg.get("presets_path")
+    if presets_path:
+        model_presets.remove_preset(Path(presets_path), model_id)
+        model_perf_store.forget(Path(presets_path), model_id)
+    model_health.forget(config_dir, model_id)
+    reload_router(llama_cfg)
 
 
 # --------------------------------------------------------------------------
@@ -480,19 +498,19 @@ def _reject(
 
     Deleting is what actually enforces it: the router auto-discovers the HF cache, so a model
     merely left without a preset stays listed by /v1/models and pickable in the chat UI."""
-    removed = delete_cached_model(llama_cfg, model_id)
-    if removed:
-        model_perf_store.forget(presets_path, model_id)
-        model_health.forget(config_dir, model_id)
+    try:
+        delete_cached_model(llama_cfg, model_id)
+    except ModelOpError as exc:
+        removed, note = False, f"It is still on disk -- {exc} Remove it with `remove`, or keep it anyway with force."
+    else:
+        _forget_model(llama_cfg, config_dir, model_id)
+        removed, note = True, None
     result.update({
         "rejected": True,
         "rejection_code": code,
         "rejection": reason,
         "removed": removed,
-        "removal_note": None if removed else (
-            "It is still on disk -- the service wasn't reachable to remove it. Start the service "
-            "and pull it again, or keep it anyway with force."
-        ),
+        "removal_note": note,
     })
     return result
 
@@ -576,17 +594,8 @@ def remove(llama_cfg: dict, config_dir: Path, model_id: str) -> dict[str, Any]:
         )
 
     record = model_health.read_record(config_dir, model_id) or {}
-    if not delete_cached_model(llama_cfg, model_id):
-        raise ModelOpError(
-            "Could not remove it -- the service wasn't reachable. Removal goes through the "
-            "running router, which also stops any instance of the model that is still loaded.",
-            code="delete_failed", status=503,
-        )
-
-    presets_path = llama_cfg.get("presets_path")
-    if presets_path:
-        model_perf_store.forget(Path(presets_path), model_id)
-    model_health.forget(config_dir, model_id)
+    delete_cached_model(llama_cfg, model_id)
+    _forget_model(llama_cfg, config_dir, model_id)
     return {
         "model": model_id,
         "removed": True,
