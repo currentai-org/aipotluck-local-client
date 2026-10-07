@@ -155,3 +155,22 @@ class TestTuning:
         model_presets.write_tuning(ini_path, "org/a:Q4_K_M", {"ctx_size": "reason"})
         assert (tmp_path / "presets.tuning.json").exists()
         assert not ini_path.exists()  # writing tuning must not create/touch the .ini itself
+
+
+class TestRemovePreset:
+    def test_drops_the_section_and_its_tuning_and_nothing_else(self, tmp_path: Path):
+        ini = tmp_path / "presets.ini"
+        model_presets.write_preset(ini, "org/a:Q4_K_M", {"ctx-size": "4096"})
+        model_presets.write_preset(ini, "org/b:Q4_K_M", {"ctx-size": "8192"})
+        model_presets.write_tuning(ini, "org/a:Q4_K_M", {"ctx_size": "why a"})
+        model_presets.write_tuning(ini, "org/b:Q4_K_M", {"ctx_size": "why b"})
+
+        assert model_presets.remove_preset(ini, "org/a:Q4_K_M") is True
+
+        assert model_presets.read_all(ini) == {"org/b:Q4_K_M": {"ctx-size": "8192"}}
+        assert model_presets.read_tuning(ini) == {"org/b:Q4_K_M": {"ctx_size": "why b"}}
+
+    def test_returns_false_and_writes_nothing_when_there_was_no_section(self, tmp_path: Path):
+        ini = tmp_path / "presets.ini"
+        assert model_presets.remove_preset(ini, "org/a:Q4_K_M") is False
+        assert not ini.exists()

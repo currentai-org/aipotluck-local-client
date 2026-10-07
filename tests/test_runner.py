@@ -34,6 +34,10 @@ class _FakeSupervisor:
     def stop(self, timeout: float = 20.0):
         self.stopped = True
 
+    def info(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(running=self.started)
+
 
 class TestLoadRuntimeConfig:
     def test_missing_file_returns_empty_dict(self, tmp_path, caplog):
@@ -173,6 +177,52 @@ class TestBackfillMissingPresets:
         monkeypatch.setattr(runner.model_pull, "list_cached_models", raise_pull_error)
         # Must not raise.
         runner.backfill_missing_presets({"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"})
+
+
+class TestEnsurePresetsFile:
+    def test_creates_an_empty_file_where_none_exists(self, tmp_path):
+        """llama-server will not start in router mode without it -- confirmed against b10989."""
+        presets = tmp_path / "config" / "llama_presets.ini"
+        runner.ensure_presets_file({"presets_path": str(presets)})
+        assert presets.read_text(encoding="utf-8") == ""
+
+    def test_never_touches_an_existing_file(self, tmp_path):
+        presets = tmp_path / "llama_presets.ini"
+        presets.write_text("[org/a:Q4]\nctx-size = 4096\n", encoding="utf-8")
+        runner.ensure_presets_file({"presets_path": str(presets)})
+        assert presets.read_text(encoding="utf-8") == "[org/a:Q4]\nctx-size = 4096\n"
+
+    def test_no_presets_path_is_a_no_op(self):
+        runner.ensure_presets_file({})
+
+
+class TestBackfillJob:
+    def _stub(self, monkeypatch, missing, ensure_preset):
+        monkeypatch.setattr(runner, "models_missing_presets", lambda cfg: list(missing))
+        monkeypatch.setattr(runner.model_sizing, "ensure_preset", ensure_preset)
+        order = []
+        monkeypatch.setattr(runner.model_perf_live, "free_router_memory", lambda url: order.append("free"))
+        monkeypatch.setattr(runner.model_ops, "reload_router", lambda cfg: order.append("reload") or True)
+        return order
+
+    def test_frees_the_router_before_each_probe_and_reloads_once_at_the_end(self, monkeypatch):
+        """The router is already serving by the time this runs, so a probe would otherwise share
+        memory with whatever it holds -- and new presets do nothing until the router reloads."""
+        order = []
+        self_order = self._stub(monkeypatch, ["org/a:Q4", "org/b:Q8"],
+                                lambda *a, **kw: order.append(("size", kw["model_hf"])))
+        summary = runner.backfill_missing_presets({"server_binary": "/x", "presets_path": "/p"})
+        assert summary == {"sized": ["org/a:Q4", "org/b:Q8"], "failed": {}, "router_reloaded": True}
+        assert self_order == ["free", "free", "reload"]
+
+    def test_a_failure_is_reported_in_the_summary_not_raised(self, monkeypatch):
+        def ensure_preset(*a, **kw):
+            raise runner.model_sizing.ModelSizingError("probe failed")
+
+        order = self._stub(monkeypatch, ["org/a:Q4"], ensure_preset)
+        summary = runner.backfill_missing_presets({"server_binary": "/x", "presets_path": "/p"})
+        assert summary == {"sized": [], "failed": {"org/a:Q4": "probe failed"}, "router_reloaded": False}
+        assert "reload" not in order
 
 
 class TestRuntimeParamsWiring:
@@ -421,6 +471,68 @@ class TestAipotluckServiceRunnerStartStop:
             assert svc.supervisor.started
             assert isinstance(svc.newt_supervisor, _FakeSupervisor)
             assert svc.newt_supervisor.started
+        finally:
+            svc.stop(timeout=2)
+
+    def _logged_in_config(self, tmp_path):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        binary = tmp_path / "llama-server"
+        binary.write_text("#!/bin/sh\n")
+        (config_dir / "runtime.json").write_text(
+            json.dumps({
+                "logged_in": True,
+                "llama_cpp": {"server_binary": str(binary), "presets_path": str(tmp_path / "p.ini")},
+            }),
+            encoding="utf-8",
+        )
+        return config_dir
+
+    def test_status_answers_while_a_model_is_still_being_sized(self, tmp_path, monkeypatch):
+        """Sizing loads each model, which takes seconds to minutes. `status` and the model list
+        must work from the moment the service starts, and the router must already be up."""
+        import threading
+        import time
+
+        config_dir = self._logged_in_config(tmp_path)
+        monkeypatch.setattr(runner, "LlamaSupervisor", _FakeSupervisor)
+        monkeypatch.setattr(runner, "models_missing_presets", lambda cfg: ["org/unsized:Q4"])
+        monkeypatch.setattr(runner.model_perf_live, "free_router_memory", lambda url: [])
+        monkeypatch.setattr(runner.model_ops, "reload_router", lambda cfg: True)
+        probing, release = threading.Event(), threading.Event()
+
+        def slow_probe(*a, **kw):
+            probing.set()
+            release.wait(timeout=30)
+
+        monkeypatch.setattr(runner.model_sizing, "ensure_preset", slow_probe)
+
+        svc = runner.AipotluckServiceRunner(host="127.0.0.1", port=0, config_dir=config_dir, log_dir=None)
+        try:
+            started = time.monotonic()
+            svc.start()
+            assert time.monotonic() - started < 5
+            assert probing.wait(timeout=5), "the backfill never started"
+            assert svc.supervisor.started
+
+            port = svc._server.server_address[1]
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as resp:
+                assert resp.status == 200
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/jobs", timeout=5) as resp:
+                listed = json.loads(resp.read())["jobs"]
+            assert [(j["kind"], j["state"]) for j in listed] == [("backfill", "running")]
+        finally:
+            release.set()
+            svc.stop(timeout=2)
+
+    def test_no_backfill_job_when_every_model_has_a_preset(self, tmp_path, monkeypatch):
+        config_dir = self._logged_in_config(tmp_path)
+        monkeypatch.setattr(runner, "LlamaSupervisor", _FakeSupervisor)
+        monkeypatch.setattr(runner, "models_missing_presets", lambda cfg: [])
+        svc = runner.AipotluckServiceRunner(host="127.0.0.1", port=0, config_dir=config_dir, log_dir=None)
+        try:
+            svc.start()
+            assert svc.jobs.list() == []
         finally:
             svc.stop(timeout=2)
 

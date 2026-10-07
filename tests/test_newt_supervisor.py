@@ -215,6 +215,10 @@ FAKE_NEWT_SCRIPT = textwrap.dedent(
     if argv_log:
         with open(argv_log, "w", encoding="utf-8") as fh:
             fh.write(" ".join(sys.argv[1:]))
+    env_log = os.environ.get("FAKE_NEWT_ENV_LOG")
+    if env_log:
+        with open(env_log, "w", encoding="utf-8") as fh:
+            fh.write(os.environ.get("NEWT_SECRET", ""))
     time.sleep(30)
     """
 )
@@ -250,6 +254,30 @@ class TestSpawnProcessHealthFileWiring:
 
         assert "--health-file" in content
         assert str(log_dir / _HEALTH_FILENAME) in content
+
+    def test_secret_is_passed_in_the_environment_and_never_on_the_command_line(self, tmp_path):
+        fake_newt = self._make_fake_newt(tmp_path)
+        argv_log = tmp_path / "argv.txt"
+        env_log = tmp_path / "env.txt"
+        supervisor = NewtSupervisor(
+            fake_newt, tunnel_id="the-id", tunnel_secret="s3cr3t-value", tunnel_endpoint="e",
+            log_dir=tmp_path / "logs",
+            env={**os.environ, "FAKE_NEWT_ARGV_LOG": str(argv_log), "FAKE_NEWT_ENV_LOG": str(env_log)},
+        )
+        try:
+            supervisor._spawn_process()
+            deadline = time.monotonic() + 5
+            while not (argv_log.exists() and env_log.exists()) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            argv = argv_log.read_text(encoding="utf-8")
+            secret_from_env = env_log.read_text(encoding="utf-8")
+        finally:
+            supervisor._terminate_process(timeout=5)
+
+        assert "s3cr3t-value" not in argv
+        assert "--secret" not in argv
+        assert "--id the-id" in argv
+        assert secret_from_env == "s3cr3t-value"
 
     def test_stale_health_file_is_removed_before_a_fresh_spawn(self, tmp_path):
         fake_newt = self._make_fake_newt(tmp_path)

@@ -6,31 +6,28 @@ whatever `-hf`/`--model` it's configured with the first time it actually starts 
 service/runner.py's build_llama_server_args). This module exists so a user can trigger that
 download ahead of time -- before pairing, or to switch models without waiting through a cold
 start -- without reinventing Hugging Face's GGUF-resolution logic (matching a `repo:quant`
-shorthand to the right file, split-GGUF handling, etc.). It reuses llama-server's own `-hf`
-downloader for that, and only orchestrates around it: spawn on a private ephemeral port, poll
-`/health` until the model has actually finished downloading AND loading, then terminate -- the
-same "spawn, poll, terminate" shape service/llama_supervisor.py uses for the long-running
-service, just run to completion once instead of supervised forever.
+shorthand to the right file, split-GGUF handling, etc.). The download itself goes through
+llama-server's own router API on a scratch router (see cache_router), which is what reports
+progress in bytes.
 """
 
 from __future__ import annotations
 
-import http.client
 import logging
 import re
-import socket
 import subprocess
+import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+from typing import TextIO
+
+from aipotluck.installer import cache_router
 
 log = logging.getLogger("aipotluck.installer.model_pull")
 
 # A multi-GB quant over a slow connection can genuinely take a while -- this is a ceiling against
 # a hung download, not a realistic expectation of how long every pull takes.
 DEFAULT_TIMEOUT_SECONDS = 1800
-HEALTH_POLL_INTERVAL_SECONDS = 2
 LIST_TIMEOUT_SECONDS = 30
 
 _CACHE_LIST_LINE_RE = re.compile(r"^\s*\d+\.\s+(\S.*\S|\S)\s*$")
@@ -40,78 +37,54 @@ class ModelPullError(RuntimeError):
     pass
 
 
-def _free_port(host: str) -> int:
-    """Ask the OS for an unused port, the same trick tests/test_runner.py's own `port=0` relies
-    on -- but llama-server takes a literal port number on its command line, so we have to resolve
-    one ourselves rather than letting the OS pick at bind time the way our own http.server does."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return sock.getsockname()[1]
-
-
-def _check_health(host: str, port: int) -> bool:
-    try:
-        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=3) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, http.client.HTTPException, OSError):
-        return False
-
-
 def pull_model(
     server_binary: Path,
     hf_target: str,
     *,
-    host: str = "127.0.0.1",
-    ctx_size: int | None = None,
-    gpu_layers: str | int | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    on_progress: cache_router.DownloadProgress | None = None,
 ) -> None:
-    """Downloads (or confirms already-cached) `hf_target` -- a Hugging Face `repo` or
-    `repo:quant`, passed straight through to llama-server's own `-hf` flag -- blocking until
-    llama-server reports healthy (downloaded AND successfully loaded) or `timeout` elapses.
+    """Downloads `hf_target` -- a Hugging Face `repo` or `repo:quant` -- into the local cache, or
+    returns at once if it is already there. `on_progress(received_bytes, total_bytes_or_None)` is
+    called as bytes arrive. Raises ModelPullError on any failure; never returns partial success.
 
-    llama-server's own download progress is left going straight to this process's stdout/stderr
-    (not captured) -- deliberately: a multi-GB download with no visible progress reads as a hang,
-    and capturing it into a pipe risks deadlocking the child if it ever outpaces a pipe buffer
-    nobody is draining. Raises ModelPullError on any failure; never returns partial success.
-    """
-    if not server_binary.exists():
-        raise ModelPullError(f"llama-server binary not found at {server_binary}")
-
-    port = _free_port(host)
-    cmd = [str(server_binary), "-hf", hf_target, "--host", host, "--port", str(port)]
-    if ctx_size:
-        cmd += ["--ctx-size", str(ctx_size)]
-    if gpu_layers is not None:
-        cmd += ["--gpu-layers", str(gpu_layers)]
-
-    log.info("Pulling %s via %s (this can take a while for a large quant)", hf_target, server_binary)
-    proc = subprocess.Popen(cmd)
+    It no longer loads the model to prove it works, as it did when the download ran through a
+    plain `llama-server -hf`: sizing loads it straight afterwards anyway, and reports a model that
+    cannot load far more precisely than a failed health check could."""
+    log.info("Pulling %s (this can take a while for a large quant)", hf_target)
     try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            exit_code = proc.poll()
-            if exit_code is not None:
-                raise ModelPullError(
-                    f"llama-server exited (code={exit_code}) before becoming healthy while pulling "
-                    f"{hf_target!r} -- see the output above for the real reason (a bad repo/quant "
-                    "string is the most common one)."
-                )
-            if _check_health(host, port):
-                log.info("%s downloaded and loads successfully", hf_target)
+        cache_router.download(server_binary, hf_target, timeout=timeout, on_progress=on_progress)
+    except cache_router.CacheRouterError as exc:
+        raise ModelPullError(f"Could not download {hf_target!r}: {exc}") from exc
+
+
+def terminal_progress(stream: TextIO | None = None, *, min_interval: float = 0.5) -> cache_router.DownloadProgress:
+    """A progress callback for a person watching a terminal: one line redrawn in place on a TTY,
+    and an occasional plain line otherwise (a log file or a pipe gets no carriage returns)."""
+    out = stream or sys.stderr
+    interactive = out.isatty()
+    state = {"last": 0.0, "last_decile": -1}
+
+    def report(received: int, total: int | None) -> None:
+        now = time.monotonic()
+        done = total is not None and received >= total
+        if interactive:
+            if not done and now - state["last"] < min_interval:
                 return
-            time.sleep(HEALTH_POLL_INTERVAL_SECONDS)
-        raise ModelPullError(
-            f"Timed out after {timeout:.0f}s waiting for {hf_target!r} to finish downloading/loading."
-        )
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            state["last"] = now
+            if total:
+                line = f"  downloading: {received / total:6.1%}  ({received / 1e6:,.1f} / {total / 1e6:,.1f} MB)"
+            else:
+                line = f"  downloading: {received / 1e6:,.1f} MB"
+            out.write("\r" + line + ("\n" if done else ""))
+            out.flush()
+            return
+        decile = int(received * 10 / total) if total else -1
+        if decile > state["last_decile"]:
+            state["last_decile"] = decile
+            log.info("Downloaded %d%% (%.1f / %.1f MB)", decile * 10, received / 1e6, total / 1e6)
+
+    return report
 
 
 def list_cached_models(server_binary: Path) -> list[str]:
@@ -123,10 +96,10 @@ def list_cached_models(server_binary: Path) -> list[str]:
     get_cache_directory()), and already does its own filtering of multi-part/mmproj/draft-model
     files down to one entry per real model. Reusing it here keeps this in lockstep with whatever
     that resolution logic does, rather than re-implementing HF-cache-layout parsing a second time
-    (the same reasoning pull_model above gives for reusing `-hf` instead of a custom downloader).
+    (the same reasoning pull_model above gives for reusing llama.cpp's own downloader).
 
     `--cache-list` exits immediately after printing (no server ever starts), so this is a plain
-    blocking subprocess call, not the spawn/poll/terminate dance `pull_model` needs.
+    blocking subprocess call.
     """
     if not server_binary.exists():
         raise ModelPullError(f"llama-server binary not found at {server_binary}")

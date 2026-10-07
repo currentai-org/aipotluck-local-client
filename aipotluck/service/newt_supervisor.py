@@ -32,6 +32,7 @@ the log-tail's role is now specifically that override, not an independent positi
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -60,6 +61,12 @@ _LOG_TAIL_BYTES = 16 * 1024
 # exact byte content isn't documented as a stability guarantee.
 _HEALTH_FILE_OK_CONTENT = "ok"
 _HEALTH_FILENAME = "newt-health.ok"
+
+# newt reads its secret from this environment variable as well as from `--secret`, and the
+# environment wins over its own config file (both confirmed against newt 1.18.1's -show-config).
+# The difference matters: any local user can read another process's argv with `ps`, but only the
+# same user or root can read its environment.
+_SECRET_ENV_VAR = "NEWT_SECRET"
 
 
 @dataclass
@@ -208,16 +215,16 @@ class NewtSupervisor:
         log.info("Newt supervisor loop exiting")
 
     def _spawn_process(self) -> None:
+        # The secret goes in the environment, never on the command line -- see _SECRET_ENV_VAR.
         cmd = [
             str(self.newt_binary),
             "--id", self.tunnel_id,
-            "--secret", self.tunnel_secret,
             "--endpoint", self.tunnel_endpoint,
         ]
-        # Never log the secret.
+        env = {**(self.env if self.env is not None else os.environ), _SECRET_ENV_VAR: self.tunnel_secret}
         log.info(
-            "Starting newt: %s --id %s --secret *** --endpoint %s",
-            self.newt_binary, self.tunnel_id, self.tunnel_endpoint,
+            "Starting newt: %s --id %s --endpoint %s (secret passed via %s)",
+            self.newt_binary, self.tunnel_id, self.tunnel_endpoint, _SECRET_ENV_VAR,
         )
 
         stdout_target = subprocess.DEVNULL
@@ -240,7 +247,7 @@ class NewtSupervisor:
             cmd,
             stdout=stdout_target,
             stderr=stderr_target,
-            env=self.env,
+            env=env,
         )
         with self._lock:
             self._proc = proc

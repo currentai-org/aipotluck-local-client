@@ -41,7 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from aipotluck import diagnostics  # noqa: E402
 from aipotluck.diagnostics import runtime_params  # noqa: E402, F401 -- re-exported, see below
-from aipotluck.installer import model_pull, model_presets, model_sizing  # noqa: E402
+from aipotluck.installer import model_perf_live, model_pull, model_presets, model_sizing  # noqa: E402
 from aipotluck.service.llama_supervisor import LlamaSupervisor  # noqa: E402
 from aipotluck.service import jobs as jobs_module  # noqa: E402
 from aipotluck.service import model_health, model_ops  # noqa: E402
@@ -112,6 +112,21 @@ def build_llama_server_args(llama_cfg: dict) -> list[str]:
     return args
 
 
+def ensure_presets_file(llama_cfg: dict) -> None:
+    """llama-server refuses to start at all when its `--models-preset` file doesn't exist
+    ("preset file does not exist"), and nothing guarantees one does: the installer only creates it
+    as a side effect of sizing the default model, so an install that skipped or failed that step
+    left the router crash-looping. An empty file is a valid preset file with no sections."""
+    presets_path = llama_cfg.get("presets_path")
+    if not presets_path:
+        return
+    try:
+        Path(presets_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(presets_path).touch(exist_ok=True)
+    except OSError as exc:
+        log.error("Could not create the presets file %s: %s", presets_path, exc)
+
+
 def build_supervisor(runtime_config: dict, log_dir: Path | None) -> LlamaSupervisor | None:
     llama_cfg = runtime_config.get("llama_cpp")
     if not llama_cfg:
@@ -132,40 +147,61 @@ def build_supervisor(runtime_config: dict, log_dir: Path | None) -> LlamaSupervi
     )
 
 
-def backfill_missing_presets(llama_cfg: dict) -> None:
-    """Called once on service start, before the router is spawned: ensures every model already in
-    the HF cache has a `--models-preset` section (CUR-1965's "on pull OR on startup if it's found
-    to be missing"). In the common case (every model was sized by `pull`, which always writes one)
-    this is a cheap no-op -- one `--cache-list` call plus one INI read. It only does real work to
-    recover from a deleted/hand-edited-away presets file, or a model that reached the cache some
-    other way. Never raises -- a sizing failure here must not stop the service from starting;
-    llama-server's router falls back to its own defaults for any model with no preset section."""
+def models_missing_presets(llama_cfg: dict) -> list[str]:
+    """Every model in the HF cache with no `--models-preset` section yet. Cheap -- one
+    `--cache-list` call plus one INI read -- and empty in the common case, since `pull` always
+    writes one. Never raises: a listing failure means nothing to backfill, not a broken service."""
     server_binary_str = llama_cfg.get("server_binary")
     presets_path_str = llama_cfg.get("presets_path")
     if not server_binary_str or not presets_path_str:
-        return
-    server_binary = Path(server_binary_str)
-    presets_path = Path(presets_path_str)
-
+        return []
     try:
-        cached = model_pull.list_cached_models(server_binary)
+        cached = model_pull.list_cached_models(Path(server_binary_str))
     except model_pull.ModelPullError as exc:
         log.warning("Could not list cached models for preset backfill: %s", exc)
-        return
+        return []
+    known = model_presets.known_model_ids(Path(presets_path_str))
+    return [model_id for model_id in cached if model_id not in known]
 
-    known = model_presets.known_model_ids(presets_path)
-    missing = [model_id for model_id in cached if model_id not in known]
+
+def backfill_missing_presets(llama_cfg: dict, *, progress=lambda _message: None) -> dict:
+    """Sizes every cached model that has no `--models-preset` section (CUR-1965's "on pull OR on
+    startup if it's found to be missing") -- recovering from a deleted/hand-edited-away presets
+    file, or a model that reached the cache some other way -- then reloads the router so the new
+    presets take effect.
+
+    This runs as a background job after the service is up, never on the startup path: each sizing
+    probe loads the model, which takes seconds to minutes, and `status` and the model list have to
+    answer from the moment the service starts. The price is a short window in which the router
+    serves an unsized model on llama-server's own defaults -- the same thing it does for any model
+    that has no preset. As in `pull`, the router is emptied before each probe, so the probe is not
+    competing with a resident model for the same memory.
+
+    Never raises -- a sizing failure here leaves that model on llama-server's defaults, and is
+    reported in the returned summary rather than deleting anything."""
+    missing = models_missing_presets(llama_cfg)
+    summary: dict = {"sized": [], "failed": {}, "router_reloaded": False}
     if not missing:
-        return
+        return summary
 
+    server_binary = Path(llama_cfg["server_binary"])
+    presets_path = Path(llama_cfg["presets_path"])
     log.info("Backfilling missing runtime-sizing presets for %d cached model(s): %s", len(missing), missing)
     for model_id in missing:
+        progress(f"sizing {model_id}")
+        model_perf_live.free_router_memory(model_ops.base_url(llama_cfg))
         try:
             model_sizing.ensure_preset(
                 server_binary, presets_path, model_id, model_hf=model_id, gpu_layers=llama_cfg.get("gpu_layers")
             )
         except model_sizing.ModelSizingError as exc:
             log.warning("Could not size cached model %r (%s) -- it will use llama-server's own defaults", model_id, exc)
+            summary["failed"][model_id] = str(exc)
+        else:
+            summary["sized"].append(model_id)
+    if summary["sized"]:
+        summary["router_reloaded"] = model_ops.reload_router(llama_cfg)
+    return summary
 
 
 def build_health_watcher(
@@ -387,16 +423,16 @@ class _StatusHandler(BaseHTTPRequestHandler):
                     return
 
             keep_rejected = bool(body.get("keep_rejected")) or force
-            skip_benchmark = bool(body.get("skip_benchmark"))
             timeout = body.get("timeout")
 
             def _pull(job):
                 return model_ops.pull(
                     llama_cfg, config_dir, model_id,
                     allow_oversized=True,  # already decided above, with the caller's answer
-                    keep_rejected=keep_rejected, skip_benchmark=skip_benchmark,
+                    keep_rejected=keep_rejected,
                     timeout=float(timeout) if timeout is not None else None,
                     progress=self.runner.jobs.progress_callback(job),
+                    download_progress=self.runner.jobs.download_callback(job),
                 )
 
             job = self.runner.jobs.submit("pull", model_id, _pull)
@@ -466,7 +502,29 @@ class AipotluckServiceRunner:
         self._stopped = threading.Event()
 
     def start(self) -> None:
+        """Returns as soon as everything is started, not finished: the HTTP server is bound first,
+        so `status` answers from the very start, and nothing that can take seconds (spawning the
+        router, connecting the tunnel, sizing models) runs on this thread."""
         self.runtime_config = load_runtime_config(self.config_dir)
+
+        runner = self
+
+        class BoundHandler(_StatusHandler):
+            pass
+
+        BoundHandler.runner = runner
+
+        self._server = ThreadingHTTPServer((self.host, self.port), BoundHandler)
+        log.info("aipotluck service listening on http://%s:%s", self.host, self.port)
+
+        # Started regardless of login state: model management is independent of pairing, the
+        # same way `pull` and `list` are on the CLI.
+        self.jobs.start()
+
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever, name="aipotluck-http", daemon=True
+        )
+        self._server_thread.start()
 
         # Every fresh install is logged out (aipotluck.installer.install writes "logged_in": false and no
         # "tunnel" section) -- hold both llama-server and newt back entirely until `python -m
@@ -474,7 +532,7 @@ class AipotluckServiceRunner:
         # one-line installer take zero arguments: it never needs credentials in hand to finish.
         if self.runtime_config.get("logged_in"):
             llama_cfg = self.runtime_config.get("llama_cpp") or {}
-            backfill_missing_presets(llama_cfg)
+            ensure_presets_file(llama_cfg)
 
             self.supervisor = build_supervisor(self.runtime_config, self.log_dir)
             if self.supervisor:
@@ -496,30 +554,22 @@ class AipotluckServiceRunner:
             if self.health_watcher:
                 log.info("Starting model health watcher")
                 self.health_watcher.start()
+
+            # Queued behind nothing at startup, and ahead of any pull or benchmark that arrives
+            # while it runs -- the same one-at-a-time queue, so a probe never shares memory with
+            # one of theirs. It shows up in GET /jobs like any other job.
+            if models_missing_presets(llama_cfg):
+                self.jobs.submit(
+                    "backfill", None,
+                    lambda job: backfill_missing_presets(
+                        llama_cfg, progress=self.jobs.progress_callback(job)
+                    ),
+                )
         else:
             log.info(
                 "Device is logged out -- llama-server and the tunnel will not start until you run "
                 "`aipotluck-local-client login`."
             )
-
-        runner = self
-
-        class BoundHandler(_StatusHandler):
-            pass
-
-        BoundHandler.runner = runner
-
-        self._server = ThreadingHTTPServer((self.host, self.port), BoundHandler)
-        log.info("aipotluck service listening on http://%s:%s", self.host, self.port)
-
-        # Started regardless of login state: model management is independent of pairing, the
-        # same way `pull` and `list` are on the CLI.
-        self.jobs.start()
-
-        self._server_thread = threading.Thread(
-            target=self._server.serve_forever, name="aipotluck-http", daemon=True
-        )
-        self._server_thread.start()
 
     def wait(self) -> None:
         """Block the calling thread until stop() has fully completed."""

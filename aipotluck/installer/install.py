@@ -333,7 +333,7 @@ def run_install(args: argparse.Namespace) -> int:
         try:
             if model_hf:
                 log.info("Pre-fetching the default model (%s) -- this can take a while for a large quant", model_hf)
-                model_pull.pull_model(server_bin, model_hf)
+                model_pull.pull_model(server_bin, model_hf, on_progress=model_pull.terminal_progress())
             log.info("Sizing the default model (%s)", model_id)
             model_sizing.ensure_preset(
                 server_bin, presets_path, model_id,

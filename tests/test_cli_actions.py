@@ -589,7 +589,9 @@ class TestReloadRouterModels:
 
     def test_defaults_to_localhost_8080_when_unset(self, monkeypatch):
         # Must not raise with an empty llama_cfg -- falls back to llama-server's own conventional
-        # default host/port rather than crashing on a missing key.
+        # default host/port rather than crashing on a missing key. The real default is the point
+        # here, so lift conftest's port guard -- urlopen is faked below, so nothing is reached.
+        monkeypatch.undo()
         seen_urls = []
 
         def fake_urlopen(url, timeout):
@@ -775,7 +777,8 @@ class TestRunPullModel:
 
         assert seen_kwargs["timeout"] == 45.0
 
-    def test_gpu_layers_forwarded_to_both_pull_and_sizing(self, tmp_path, monkeypatch):
+    def test_gpu_layers_forwarded_to_sizing(self, tmp_path, monkeypatch):
+        """The download no longer loads the model, so only sizing -- which does -- needs it."""
         install_dir = tmp_path / "install"
         write_runtime(
             install_dir,
@@ -786,8 +789,7 @@ class TestRunPullModel:
                 "service": {},
             },
         )
-        pull_kwargs = {}
-        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: pull_kwargs.update(kw))
+        monkeypatch.setattr(model_ops, "pull_model", lambda *a, **kw: None)
         ensure_preset_kwargs = {}
         monkeypatch.setattr(
             model_ops.model_sizing, "ensure_preset",
@@ -797,7 +799,6 @@ class TestRunPullModel:
 
         cli.run_pull_model(args)
 
-        assert pull_kwargs["gpu_layers"] == "all"
         assert ensure_preset_kwargs["gpu_layers"] == "all"
 
     def test_no_presets_path_skips_sizing_but_still_succeeds(self, tmp_path, monkeypatch, caplog):
@@ -939,9 +940,30 @@ class TestRunRemoveModel:
         })
         monkeypatch.setattr(model_ops, "list_cached_models", lambda binary: list(cached))
         deletes = []
-        monkeypatch.setattr(model_ops, "delete_cached_model",
-                            lambda cfg, mid: deletes.append(mid) or deletes_ok)
+
+        def delete(cfg, mid):
+            deletes.append(mid)
+            if not deletes_ok:
+                raise model_ops.ModelOpError(
+                    f"Could not remove {mid}: model name={mid} is not removable (not from cache)",
+                    code="delete_failed", status=502,
+                )
+
+        monkeypatch.setattr(model_ops, "delete_cached_model", delete)
+        monkeypatch.setattr(model_ops, "reload_router", lambda cfg: True)
         return install_dir, deletes
+
+    def test_a_removed_models_preset_goes_with_it(self, tmp_path, monkeypatch):
+        """Otherwise the router keeps a section for a model it can no longer serve, and `status`
+        keeps explaining the sizing of something that isn't there."""
+        install_dir, _ = self._setup(tmp_path, monkeypatch)
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 0
+        assert cli.model_presets.read_all(tmp_path / "presets.ini") == {}
+
+    def test_a_failed_delete_keeps_the_preset(self, tmp_path, monkeypatch):
+        install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
+        assert cli.run_remove_model(make_remove_args(install_dir, yes=True)) == 1
+        assert "org/repo:Q4_K_M" in cli.model_presets.read_all(tmp_path / "presets.ini")
 
     def test_yes_removes_without_prompting(self, tmp_path, monkeypatch):
         install_dir, deletes = self._setup(tmp_path, monkeypatch)
@@ -993,9 +1015,12 @@ class TestRunRemoveModel:
         cli.run_remove_model(make_remove_args(install_dir, yes=True))
         assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is None
 
-    def test_a_failed_delete_keeps_the_records_and_says_why(self, tmp_path, monkeypatch, capsys):
-        """If the router couldn't be reached the files are still there, so forgetting the model
-        would leave it installed, unexplained and un-held-back."""
+    def test_a_failed_delete_keeps_the_records_and_passes_on_llama_cpps_reason(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The files are still there, so forgetting the model would leave it installed, unexplained
+        and un-held-back. And the reason is llama.cpp's own -- not a guess that the service wasn't
+        reachable, which is what this used to say even when the router had answered."""
         install_dir, _ = self._setup(tmp_path, monkeypatch, deletes_ok=False)
         config_dir = install_dir / "config"
         model_ops.model_health.quarantine(config_dir, "org/repo:Q4_K_M", "three strikes")
@@ -1004,7 +1029,9 @@ class TestRunRemoveModel:
 
         assert rc == 1
         assert model_ops.model_health.read_record(config_dir, "org/repo:Q4_K_M") is not None
-        assert "wasn't reachable" in capsys.readouterr().out
+        out = capsys.readouterr()
+        assert "not removable (not from cache)" in out.out + out.err
+        assert "wasn't reachable" not in out.out + out.err
 
 
 class TestRunListModels:
@@ -1088,24 +1115,20 @@ class TestRunListModels:
 
 
 class TestDeleteCachedModel:
-    """Real HTTP: proves the exact request llama.cpp's router expects, since this is the only thing
-    that actually removes a refused model. The route is `DELETE /models?model=<id>`
-    (vendor/llama.cpp/tools/server/server.cpp's `ctx_http.del("/models", ...)` ->
-    server-models.cpp's `del_router_models`, which reads the `model` QUERY parameter -- not a JSON
-    body -- and calls common_download_remove to clear the snapshot, its symlinks and the orphaned
-    blobs). Getting the method or the parameter shape wrong would silently leave the model in place
-    while the CLI reported it removed."""
+    """The service's own router is asked to unload the model before the files go, and the deletion
+    itself goes to a scratch router (cache_router's own tests cover that half)."""
 
-    def _serve(self, status=200):
+    def _serve_main_router(self):
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         seen = []
 
         class Handler(BaseHTTPRequestHandler):
-            def do_DELETE(self):
-                seen.append((self.command, self.path))
-                self.send_response(status)
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.path, json.loads(body)))
+                self.send_response(200)
                 self.send_header("Content-Length", "2")
                 self.end_headers()
                 self.wfile.write(b"{}")
@@ -1117,24 +1140,43 @@ class TestDeleteCachedModel:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return server, seen
 
-    def test_sends_a_delete_with_the_model_as_a_url_encoded_query_parameter(self):
-        server, seen = self._serve()
+    def test_unloads_from_the_service_router_before_deleting(self, monkeypatch):
+        server, seen = self._serve_main_router()
+        order = []
+        monkeypatch.setattr(
+            model_ops.cache_router, "delete",
+            lambda binary, mid: order.append(("delete", list(seen))),
+        )
         try:
-            port = server.server_address[1]
-            ok = model_ops.delete_cached_model({"host": "127.0.0.1", "port": port}, "org/repo:Q4_K_M")
+            model_ops.delete_cached_model(
+                {"host": "127.0.0.1", "port": server.server_address[1],
+                 "server_binary": "/fake/llama-server"},
+                "org/repo:Q4_K_M",
+            )
         finally:
             server.shutdown()
             server.server_close()
+        assert order == [("delete", [("/models/unload", {"model": "org/repo:Q4_K_M"})])]
 
-        assert ok is True
-        assert len(seen) == 1
-        method, path = seen[0]
-        assert method == "DELETE"
-        # The id contains both "/" and ":", so it has to survive encoding intact.
-        assert path == "/models?model=org%2Frepo%3AQ4_K_M"
+    def test_a_service_that_is_not_running_does_not_stop_the_delete(self, monkeypatch):
+        deletes = []
+        monkeypatch.setattr(model_ops.cache_router, "delete", lambda binary, mid: deletes.append(mid))
+        model_ops.delete_cached_model(
+            {"host": "127.0.0.1", "port": 1, "server_binary": "/fake/llama-server"}, "org/repo:Q4_K_M",
+        )
+        assert deletes == ["org/repo:Q4_K_M"]
 
-    def test_an_unreachable_router_reports_failure_rather_than_claiming_success(self):
-        assert model_ops.delete_cached_model({"host": "127.0.0.1", "port": 1}, "org/repo:Q4_K_M") is False
+    def test_a_refusal_is_reported_with_llama_cpps_reason(self, monkeypatch):
+        def refuse(binary, mid):
+            raise model_ops.cache_router.CacheRouterError("model name=x is not found")
+
+        monkeypatch.setattr(model_ops.cache_router, "delete", refuse)
+        with pytest.raises(model_ops.ModelOpError) as excinfo:
+            model_ops.delete_cached_model(
+                {"host": "127.0.0.1", "port": 1, "server_binary": "/fake/llama-server"}, "x",
+            )
+        assert excinfo.value.code == "delete_failed"
+        assert "model name=x is not found" in str(excinfo.value)
 
 
 def _screen(rejected, reason="test reason"):
@@ -1148,9 +1190,10 @@ def _score(value=250.0, confidence="ok"):
 
 
 class TestPullGate:
-    """The screen gates the score, and a rejection deletes the model. Withholding a preset is not
-    enough on its own: the router auto-discovers the HF cache, so a refused model would still be
-    listed by /v1/models and selectable in the web app's picker."""
+    """Sizing gates a pull, and a rejection deletes the model. Withholding a preset is not enough on
+    its own: the router auto-discovers the HF cache, so a refused model would still be listed by
+    /v1/models and selectable in the web app's picker. A pull never benchmarks -- that waits for
+    an explicit `benchmark`."""
 
     def _setup(self, tmp_path, monkeypatch, screened, score):
         install_dir = tmp_path / "install"
@@ -1169,24 +1212,35 @@ class TestPullGate:
                             lambda cfg, mid: deletes.append(mid) or True)
         return install_dir, deletes
 
-    def test_a_rejected_model_is_deleted_and_the_pull_fails(self, tmp_path, monkeypatch, capsys):
+    def test_a_pull_never_benchmarks_and_says_how_to(self, tmp_path, monkeypatch, capsys):
+        """Measuring made every pull minutes longer than its download, for a verdict nobody had
+        asked for yet. Even a model the benchmark WOULD reject is kept: that verdict is the
+        benchmark's to give, when it is asked for."""
         install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
-        rc = cli.run_pull_model(make_pull_args(install_dir))
-        out = capsys.readouterr().out
-        assert rc == 1 and deletes == ["org/repo:Q4_K_M"]
-        assert "UNUSABLE" in out and "--force" in out
+        benchmarks = []
+        monkeypatch.setattr(model_ops, "measure",
+                            lambda *a, **kw: benchmarks.append(1) or (_screen(True), None, None))
 
-    def test_force_keeps_a_rejected_model(self, tmp_path, monkeypatch):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(True), None)
-        assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
-        assert deletes == []
-
-    def test_a_usable_model_reports_its_score(self, tmp_path, monkeypatch, capsys):
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
         rc = cli.run_pull_model(make_pull_args(install_dir))
-        out = capsys.readouterr().out
-        assert rc == 0 and deletes == []
-        assert "LocalScore 412" in out
+
+        assert rc == 0 and benchmarks == [] and deletes == []
+        assert "benchmark org/repo:Q4_K_M" in capsys.readouterr().out
+
+    def test_the_old_skip_benchmark_flag_is_still_accepted(self):
+        """Scripts written when it mattered must not start failing to parse."""
+        args = cli.build_arg_parser().parse_args(["pull", "org/repo:Q4_K_M", "--skip-benchmark"])
+        assert args.model == "org/repo:Q4_K_M"
+
+    def test_a_rejected_models_preset_is_dropped_with_it(self, tmp_path, monkeypatch):
+        unviable = SizingResult(
+            ctx_size=512, parallel=1, cache_type_k=None, cache_type_v=None,
+            tuning={"ctx_size": "test reason"}, viable=False,
+            rejection_code=model_sizing.REJECT_NO_ROOM_FOR_CONTEXT, rejection="no room",
+        )
+        install_dir, _deletes = self._setup(tmp_path, monkeypatch, None, None)
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: unviable)
+        cli.run_pull_model(make_pull_args(install_dir))
+        assert cli.model_presets.read_all(tmp_path / "presets.ini") == {}
 
     def test_a_model_with_no_room_for_context_is_rejected_without_benchmarking(
         self, tmp_path, monkeypatch, capsys
@@ -1223,16 +1277,33 @@ class TestPullGate:
         assert cli.run_pull_model(make_pull_args(install_dir, force=True)) == 0
         assert deletes == []
 
+
+class TestRunBenchmark:
+    """Where a model's speed verdict is shown now that pull no longer measures."""
+
+    def _setup(self, tmp_path, monkeypatch, screened, score):
+        install_dir = tmp_path / "install"
+        presets_path = tmp_path / "presets.ini"
+        cli.model_presets.write_preset(presets_path, "org/repo:Q4_K_M", {"ctx-size": "32768"})
+        write_runtime(install_dir, {
+            "llama_cpp": {"server_binary": "/fake/llama-server", "presets_path": str(presets_path)},
+            "service": {},
+        })
+        monkeypatch.setattr(model_ops.model_sizing, "ensure_preset", lambda *a, **kw: _FAKE_SIZING)
+        monkeypatch.setattr(model_ops, "measure", lambda *a, **kw: (screened, score, None))
+        return install_dir
+
+    def test_a_usable_model_reports_its_score(self, tmp_path, monkeypatch, capsys):
+        install_dir = self._setup(tmp_path, monkeypatch, _screen(False), _score(412.0))
+        rc = cli.run_benchmark(Namespace(install_dir=install_dir, system=False, verbose=False,
+                                         model="org/repo:Q4_K_M"))
+        assert rc == 0
+        assert "LocalScore 412" in capsys.readouterr().out
+
     def test_a_low_confidence_score_says_so(self, tmp_path, monkeypatch, capsys):
         """A device that moved 30% under its own measurement cannot support a precise number, and
         the output has to admit that rather than printing it as though it could."""
-        install_dir, _ = self._setup(tmp_path, monkeypatch, _screen(False), _score(confidence="low"))
-        cli.run_pull_model(make_pull_args(install_dir))
+        install_dir = self._setup(tmp_path, monkeypatch, _screen(False), _score(confidence="low"))
+        cli.run_benchmark(Namespace(install_dir=install_dir, system=False, verbose=False,
+                                    model="org/repo:Q4_K_M"))
         assert "low confidence" in capsys.readouterr().out
-
-    def test_an_unmeasurable_model_is_kept_rather_than_rejected_on_no_evidence(self, tmp_path, monkeypatch):
-        """Failing to measure says nothing about the model; deleting someone's download on the
-        strength of a failed probe would be worse than the problem this feature solves."""
-        install_dir, deletes = self._setup(tmp_path, monkeypatch, None, None)
-        assert cli.run_pull_model(make_pull_args(install_dir)) == 0
-        assert deletes == []
