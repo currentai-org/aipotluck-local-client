@@ -589,7 +589,9 @@ class TestReloadRouterModels:
 
     def test_defaults_to_localhost_8080_when_unset(self, monkeypatch):
         # Must not raise with an empty llama_cfg -- falls back to llama-server's own conventional
-        # default host/port rather than crashing on a missing key.
+        # default host/port rather than crashing on a missing key. The real default is the point
+        # here, so lift conftest's port guard -- urlopen is faked below, so nothing is reached.
+        monkeypatch.undo()
         seen_urls = []
 
         def fake_urlopen(url, timeout):

@@ -96,6 +96,17 @@ class RouterStub:
         self._server.server_close()
 
 
+@pytest.fixture(autouse=True)
+def _never_reach_the_developers_router(monkeypatch):
+    """model_ops falls back to llama-server's default port when a test's llama_cfg names none --
+    which on a developer's machine is their own live router. Tests reached it that way: pull's
+    pre-probe "free the router" unloads whatever it is serving, and every removal reloads it. Port 1
+    refuses the connection immediately, which every caller already treats as "nothing running"."""
+    from aipotluck.service import model_ops
+
+    monkeypatch.setattr(model_ops, "DEFAULT_PORT", 1)
+
+
 @pytest.fixture
 def router_stub():
     """The RouterStub class itself, so a test can construct one with its own cost model."""
