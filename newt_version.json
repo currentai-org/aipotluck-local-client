@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned fosrl/newt release (Pangolin's tunnel client, CUR-1266). Bump deliberately, same way llama_version.json is bumped. sha256s computed by us at pin time -- newt's GitHub releases publish no checksums file. UNLIKE llama.cpp, these assets are single raw binaries, not tar.gz/zip archives -- no extraction step, just download + verify + chmod +x. Only linux-x64/linux-arm64 checksums have actually been downloaded and verified (this pin's local-dev/test target); darwin/windows entries are the real published filenames/URLs but their sha256 is a placeholder that MUST be verified (download once, compute sha256, replace) before relying on them -- see aipotluck/installer/newt_fetch.py's own warning on an unverified entry.",
+  "_comment": "Pinned fosrl/newt release (Pangolin's tunnel client, CUR-1266). Bump deliberately, same way llama_version.json is bumped. sha256s computed by us at pin time -- newt's GitHub releases publish no checksums file. UNLIKE llama.cpp, these assets are single raw binaries, not tar.gz/zip archives -- no extraction step, just download + verify + chmod +x. linux-x64/linux-arm64 and macos-arm64/macos-x64 checksums have been downloaded and verified (the macOS pair on a real Apple-silicon Mac, macOS 27, and cross-checked against the digests GitHub publishes for the 1.18.1 assets; newt_darwin_arm64 also run and paired end to end there); the windows entry is the real published filename/URL but its sha256 is a placeholder that MUST be verified (download once, compute sha256, replace) before relying on it -- see aipotluck/installer/newt_fetch.py's own warning on an unverified entry.",
   "tag": "1.18.1",
   "release_base_url": "https://github.com/fosrl/newt/releases/download",
   "assets": {
@@ -13,11 +13,11 @@
     },
     "macos-x64": {
       "file": "newt_darwin_amd64",
-      "sha256": "UNVERIFIED_DOWNLOAD_AND_COMPUTE_BEFORE_USE"
+      "sha256": "9ddc85d3244cce9b96ce52a09e075df887f79343b5200cffb49bf1c459421ecc"
     },
     "macos-arm64": {
       "file": "newt_darwin_arm64",
-      "sha256": "UNVERIFIED_DOWNLOAD_AND_COMPUTE_BEFORE_USE"
+      "sha256": "841c2ef858035a4fb01ffa619e1a56914fa5c3900cf9678e6a9758c9b9449da1"
     },
     "windows-x64": {
       "file": "newt_windows_amd64.exe",
