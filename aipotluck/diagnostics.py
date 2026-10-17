@@ -122,16 +122,8 @@ def _cpu_info() -> dict[str, Any]:
 
 
 def _total_memory_gb() -> float | None:
-    path = Path("/proc/meminfo")
-    if not path.exists():
-        return None
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) / (1024**2)
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    # The same reading model_sizing budgets against, so `diagnostics` can never disagree with it.
+    return source_build._total_memory_gb()
 
 
 def _disk_info(reference_path: Path) -> dict[str, Any]:

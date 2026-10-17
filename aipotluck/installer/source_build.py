@@ -263,16 +263,37 @@ def _total_memory_gb() -> float | None:
     """Installed physical RAM -- a stable hardware fact, unlike _available_memory_gb() above,
     which fluctuates with whatever else is running. aipotluck.installer.model_sizing budgets
     against this deliberately, not a live "available now" snapshot -- see that module's own
-    docstring for why."""
+    docstring for why.
+
+    Linux reads /proc/meminfo's MemTotal; macOS (no /proc) reads the `hw.memsize` sysctl, in
+    bytes. None when neither is available (Windows today), which model_sizing treats as "no
+    memory budget" rather than guessing one."""
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as fh:
             for line in fh:
                 if line.startswith("MemTotal:"):
                     kb = int(line.split()[1])
                     return kb / (1024**2)
+    except FileNotFoundError:
+        pass
     except (OSError, ValueError, IndexError):
         return None
-    return None
+    return _sysctl_memsize_gb()
+
+
+def _sysctl_memsize_gb() -> float | None:
+    """Total RAM on macOS via `sysctl -n hw.memsize`. On Apple silicon this is the unified memory
+    the GPU (Metal) shares, i.e. the same pool model weights and KV cache are loaded into."""
+    sysctl = shutil.which("sysctl") or ("/usr/sbin/sysctl" if Path("/usr/sbin/sysctl").exists() else None)
+    if sysctl is None:
+        return None
+    try:
+        out = subprocess.run([sysctl, "-n", "hw.memsize"], capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        return int(out.stdout.strip()) / (1024**3)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def _init_vendor_submodule(repo_root: Path, vendor_dir: Path) -> None:

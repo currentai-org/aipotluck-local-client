@@ -203,6 +203,57 @@ class TestRecommendedJobs:
         assert sb.recommended_jobs(want_cuda=True) >= 1
 
 
+class TestTotalMemory:
+    """model_sizing's memory budget (CUR-1965) is 80% of this reading. On a host with no
+    /proc/meminfo -- every Mac -- it used to be None, which silently turned the budget off. The
+    macOS path is exercised against a stand-in `sysctl` script, not a mock of subprocess."""
+
+    @staticmethod
+    def _no_proc_meminfo(monkeypatch):
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if str(path) == "/proc/meminfo":
+                raise FileNotFoundError(path)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+
+    @staticmethod
+    def _fake_sysctl(tmp_path, monkeypatch, body: str) -> Path:
+        script = tmp_path / "sysctl"
+        script.write_text("#!/bin/sh\n" + body + "\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        monkeypatch.setattr(sb.shutil, "which", lambda name: str(script) if name == "sysctl" else None)
+        return script
+
+    def test_reads_hw_memsize_in_bytes_when_there_is_no_proc_meminfo(self, tmp_path, monkeypatch):
+        self._no_proc_meminfo(monkeypatch)
+        self._fake_sysctl(tmp_path, monkeypatch, '[ "$1 $2" = "-n hw.memsize" ] && echo 68719476736 || exit 1')
+        assert sb._total_memory_gb() == 64.0
+
+    def test_a_failing_sysctl_is_unknown_memory_not_a_guess(self, tmp_path, monkeypatch):
+        self._no_proc_meminfo(monkeypatch)
+        self._fake_sysctl(tmp_path, monkeypatch, "echo 'unknown oid' >&2; exit 1")
+        assert sb._total_memory_gb() is None
+
+    def test_unparseable_sysctl_output_is_unknown_memory_not_a_crash(self, tmp_path, monkeypatch):
+        self._no_proc_meminfo(monkeypatch)
+        self._fake_sysctl(tmp_path, monkeypatch, "echo not-a-number")
+        assert sb._total_memory_gb() is None
+
+    def test_no_proc_meminfo_and_no_sysctl_is_unknown_memory(self, monkeypatch):
+        self._no_proc_meminfo(monkeypatch)
+        monkeypatch.setattr(sb.shutil, "which", lambda name: None)
+        monkeypatch.setattr(sb.Path, "exists", lambda self: False)
+        assert sb._total_memory_gb() is None
+
+    @pytest.mark.skipif(not Path("/proc/meminfo").exists(), reason="Linux only")
+    def test_linux_still_reads_proc_meminfo_and_never_runs_sysctl(self, monkeypatch):
+        monkeypatch.setattr(sb, "_sysctl_memsize_gb", lambda: pytest.fail("sysctl used on Linux"))
+        assert (sb._total_memory_gb() or 0) > 0
+
+
 class TestEnsureSourceCheckedOut:
     """vendor/llama.cpp is ~174MB and is only needed when a host actually compiles llama.cpp, which
     most hosts never do -- so install.sh clones without it and this is where it gets fetched."""
