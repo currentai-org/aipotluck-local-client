@@ -96,6 +96,53 @@ class RouterStub:
         self._server.server_close()
 
 
+class PairingServerStub:
+    """Plays aipotluck.org's one-click pairing poll (`GET /chat/api/v2/local-inference/pairings/<id>`)
+    over real HTTP, so pairing.py's urllib, status and JSON handling run for real.
+
+    `responses` is a script of (status, body) answers, one per poll, in order; the last one repeats
+    once the script runs out. A body that is a str is sent as-is (for a non-JSON answer); anything
+    else is sent as JSON. `requests` records each path polled.
+    """
+
+    def __init__(self, responses: list[tuple[int, object]]):
+        self.responses = list(responses)
+        self.requests: list[str] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests.append(self.path)
+                index = min(len(outer.requests), len(outer.responses)) - 1
+                status, body = outer.responses[index]
+                raw = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html" if isinstance(body, str) else "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.base_url = f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def __enter__(self):
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def pairing_server():
+    """The PairingServerStub class itself, so a test can construct one with its own script."""
+    return PairingServerStub
+
+
 @pytest.fixture(autouse=True)
 def _never_reach_the_developers_router(monkeypatch):
     """model_ops falls back to llama-server's default port when a test's llama_cfg names none --

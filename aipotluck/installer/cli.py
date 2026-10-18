@@ -14,8 +14,8 @@ below is the fallback for a `--no-service` install (which skips the shim) or a c
 doesn't reach yet.
 
 Usage:
-    aipotluck-local-client login    # prompts for the pairing JSON (paste it from Settings)
-    aipotluck-local-client login --credentials-file creds.json   # or read it from a file
+    aipotluck-local-client login    # one-click: opens aipotluck.org in a browser to approve this device
+    aipotluck-local-client login --credentials-file creds.json   # or the JSON copied from Settings
     aipotluck-local-client logout   # unpairs; llama-server and the tunnel stop until you log in again
     aipotluck-local-client status   # asks the running service for its login/tunnel/llama-server state
     aipotluck-local-client pull <hf-repo[:quant]>   # download + size a model
@@ -32,7 +32,6 @@ this CLI to set anymore; `pull` just makes sure a model is downloaded and correc
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import logging
 import os
@@ -57,6 +56,7 @@ from aipotluck.installer import (  # noqa: E402
     model_preflight,
     model_presets,
     newt_fetch,
+    pairing,
 )
 from aipotluck.installer.cli_shim import CLI_SHIM_NAME  # noqa: E402
 from aipotluck.installer.model_pull import (  # noqa: E402
@@ -113,20 +113,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", parents=[common], help="Pair this device with a managed tunnel endpoint")
+    login = sub.add_parser(
+        "login", parents=[common],
+        help="Pair this device with a managed tunnel endpoint (one-click in a browser by default)",
+    )
     login.add_argument(
         "--credentials-file", type=Path, default=None,
         help="Read the pairing JSON ({tunnelId, tunnelSecret, tunnelEndpoint}) from this file instead "
-             "of pasting it -- the same JSON Settings -> Local Inference's Copy button copies. Mutually "
-             "exclusive with --tunnel-id/--tunnel-secret/--tunnel-endpoint.",
+             "of pairing in a browser -- the same JSON Settings -> Local Inference's Copy button copies. "
+             "Mutually exclusive with --tunnel-id/--tunnel-secret/--tunnel-endpoint.",
     )
     login.add_argument(
         "--tunnel-id", default=None,
-        help="Skip the prompt (scripting only); must be given with the other two --tunnel-* flags, "
-             "and not with --credentials-file",
+        help="Skip browser pairing (scripting only); must be given with the other two --tunnel-* "
+             "flags, and not with --credentials-file",
     )
-    login.add_argument("--tunnel-secret", default=None, help="Skip the prompt (scripting only)")
-    login.add_argument("--tunnel-endpoint", default=None, help="Skip the prompt (scripting only)")
+    login.add_argument("--tunnel-secret", default=None, help="Skip browser pairing (scripting only)")
+    login.add_argument("--tunnel-endpoint", default=None, help="Skip browser pairing (scripting only)")
+    login.add_argument(
+        "--server-url", default=None,
+        help=f"The AI Potluck server to pair with in a browser (default ${pairing.SERVER_URL_ENV}, else "
+             f"{pairing.DEFAULT_SERVER_URL}); http only for localhost, e.g. a dev server. Unused with "
+             "--credentials-file or the --tunnel-* flags.",
+    )
 
     sub.add_parser(
         "logout", parents=[common],
@@ -249,6 +258,12 @@ def _parse_credentials_json(raw: str) -> tuple[str, str, str]:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise CredentialsError(f"That's not valid JSON ({exc}).") from exc
+    return _credentials_from_dict(data)
+
+
+def _credentials_from_dict(data: object) -> tuple[str, str, str]:
+    """The checks _parse_credentials_json applies once the JSON is parsed, shared with one-click
+    pairing's `installArgs` (pairing.py), which is the same object arriving over HTTP."""
     if not isinstance(data, dict):
         raise CredentialsError("Expected a JSON object with tunnelId/tunnelSecret/tunnelEndpoint.")
 
@@ -263,96 +278,24 @@ def _parse_credentials_json(raw: str) -> tuple[str, str, str]:
     return data["tunnelId"], data["tunnelSecret"], data["tunnelEndpoint"]
 
 
-def _read_hidden_line_with_feedback(prompt: str) -> str:
-    """Like getpass.getpass, but echoes one '.' per character received instead of nothing at all.
-    A silent prompt gave a paste no visible effect until Enter was pressed, which read as "did that
-    even work?" -- the dots are just paste-landed feedback, not a strength meter, so a fixed
-    placeholder character is fine even though it says nothing about length.
+def _one_click_credentials(server_url_flag: str | None) -> tuple[str, str, str]:
+    """`login` with no credential flags: pair through the browser (pairing.py). Raises PairingError
+    or CredentialsError with a message fit to show as-is; Ctrl-C propagates to run_login."""
+    server_url = pairing.resolve_server_url(server_url_flag)
+    pairing_id = pairing.new_pairing_id()
+    url = pairing.pairing_url(server_url, pairing_id, pairing.device_name())
 
-    Needs raw per-keystroke access to the terminal, which only a real interactive tty can give, so
-    this falls back to plain getpass.getpass whenever stdin isn't one -- piped input, a redirected
-    file, or (as in this module's own test suite) a monkeypatched getpass.getpass under pytest's
-    captured, non-tty stdin.
-    """
-    if not sys.stdin.isatty():
-        return getpass.getpass(prompt)
-
-    print(prompt, end="", flush=True)
-    try:
-        chars = _read_hidden_chars_windows() if sys.platform == "win32" else _read_hidden_chars_unix()
-    finally:
-        print()  # move past the dots onto their own line, matching getpass's own trailing newline
-    return "".join(chars)
-
-
-def _read_hidden_chars_unix() -> list[str]:
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    chars: list[str] = []
-    try:
-        tty.setraw(fd)
-        while True:
-            ch = sys.stdin.read(1)
-            if ch in ("\r", "\n", ""):
-                break
-            if ch == "\x03":
-                raise KeyboardInterrupt
-            if ch in ("\x7f", "\x08"):  # backspace/delete
-                if chars:
-                    chars.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-                continue
-            chars.append(ch)
-            sys.stdout.write(".")
-            sys.stdout.flush()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return chars
-
-
-def _read_hidden_chars_windows() -> list[str]:
-    import msvcrt  # type: ignore[import-not-found]
-
-    chars: list[str] = []
-    while True:
-        ch = msvcrt.getwch()
-        if ch in ("\r", "\n"):
-            break
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        if ch == "\x08":  # backspace
-            if chars:
-                chars.pop()
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
-            continue
-        chars.append(ch)
-        sys.stdout.write(".")
-        sys.stdout.flush()
-    return chars
-
-
-def _prompt_credentials_json() -> tuple[str, str, str]:
-    print("Pair this device with a managed tunnel endpoint.")
-    print("Paste the JSON from Settings -> Local Inference -> Add a managed server (its Copy button")
-    print("copies exactly this), then press Enter. Dots below confirm characters are being received.")
+    print("Pair this device with your AI Potluck account.")
+    if pairing.open_in_browser(url):
+        print("Opened this link in your browser. If nothing appeared, open it yourself on any device")
+        print("where you're signed in to AI Potluck:")
+    else:
+        print("Open this link in a browser on any device where you're signed in to AI Potluck:")
     print()
-    while True:
-        # Hidden, not plain input(): the pasted blob contains the tunnel secret, so it must not
-        # echo to the terminal (or land in a screen recording/over-the-shoulder view) any more than
-        # a bare secret prompt would have -- only the dot-per-character feedback is new.
-        raw = _read_hidden_line_with_feedback("Credentials JSON: ").strip()
-        if not raw:
-            print("  (required, try again)")
-            continue
-        try:
-            return _parse_credentials_json(raw)
-        except CredentialsError as exc:
-            print(f"  {exc} Try again.")
+    print(f"    {url}")
+    print()
+    print("Waiting for you to approve it there (Ctrl-C to cancel)...")
+    return _credentials_from_dict(pairing.wait_for_install_args(server_url, pairing_id))
 
 
 def run_login(args: argparse.Namespace) -> int:
@@ -361,8 +304,24 @@ def run_login(args: argparse.Namespace) -> int:
         log.error("Pass --credentials-file or --tunnel-id/--tunnel-secret/--tunnel-endpoint, not both.")
         return 1
     if any(flags_given) and not all(flags_given):
-        log.error("Pass all three of --tunnel-id/--tunnel-secret/--tunnel-endpoint, or none to be prompted.")
+        log.error("Pass all three of --tunnel-id/--tunnel-secret/--tunnel-endpoint, or none to pair in a browser.")
         return 1
+
+    # Everything that can fail runs before credentials are collected, not after: one-click pairing
+    # provisions a server in the person's account the moment they approve it, and the server hands
+    # its credentials over once, so a missing install or a failed newt download found only then
+    # would leave that server behind with no device able to use it.
+    profile, lay = _profile_and_layout(args)
+    runtime_path = _runtime_path(lay)
+    runtime_config = _load_runtime(runtime_path)
+
+    newt_manifest = newt_fetch.load_newt_manifest(REPO_ROOT / "newt_version.json")
+    newt_asset_key, newt_asset_entry = newt_fetch.resolve_newt_asset(newt_manifest, profile)
+    log.info("Resolved newt asset: %s (%s)", newt_asset_key, newt_asset_entry["file"])
+    newt_binary = newt_fetch.download_newt_binary(
+        newt_manifest, newt_asset_entry, lay.install_root / "newt" / newt_manifest["tag"]
+    )
+    log.info("newt binary: %s", newt_binary)
 
     if all(flags_given):
         tunnel_id, tunnel_secret, tunnel_endpoint = args.tunnel_id, args.tunnel_secret, args.tunnel_endpoint
@@ -378,19 +337,15 @@ def run_login(args: argparse.Namespace) -> int:
             log.error("%s (in %s)", exc, args.credentials_file)
             return 1
     else:
-        tunnel_id, tunnel_secret, tunnel_endpoint = _prompt_credentials_json()
-
-    profile, lay = _profile_and_layout(args)
-    runtime_path = _runtime_path(lay)
-    runtime_config = _load_runtime(runtime_path)
-
-    newt_manifest = newt_fetch.load_newt_manifest(REPO_ROOT / "newt_version.json")
-    newt_asset_key, newt_asset_entry = newt_fetch.resolve_newt_asset(newt_manifest, profile)
-    log.info("Resolved newt asset: %s (%s)", newt_asset_key, newt_asset_entry["file"])
-    newt_binary = newt_fetch.download_newt_binary(
-        newt_manifest, newt_asset_entry, lay.install_root / "newt" / newt_manifest["tag"]
-    )
-    log.info("newt binary: %s", newt_binary)
+        try:
+            tunnel_id, tunnel_secret, tunnel_endpoint = _one_click_credentials(args.server_url)
+        except (pairing.PairingError, CredentialsError) as exc:
+            log.error("%s", exc)
+            return 1
+        except KeyboardInterrupt:
+            print()
+            log.error("Pairing cancelled; nothing was changed.")
+            return 130
 
     runtime_config["tunnel"] = {
         "provider": "pangolin",

@@ -3,7 +3,8 @@
 Every OS/network/service-manager boundary is mocked: detect_host_profile (no real GPU probing),
 newt_fetch (no real download), get_service_manager (no real systemd/launchd), and
 urllib.request.urlopen (no real HTTP). Only runtime.json's actual read/write path is real,
-rooted under tmp_path via `--install-dir`.
+rooted under tmp_path via `--install-dir`. The one exception is one-click login's poll, which runs
+against conftest.py's PairingServerStub on 127.0.0.1, with the browser and hostname stubbed.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import logging
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -41,6 +43,7 @@ def make_args(install_dir: Path, **overrides) -> Namespace:
         tunnel_secret=None,
         tunnel_endpoint=None,
         credentials_file=None,
+        server_url=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -148,24 +151,6 @@ class TestRunLogin:
 
         assert rc == 0
 
-    def test_prompts_for_credentials_json_when_no_flags_given(
-        self, tmp_path, fake_service_manager, fake_newt_fetch, monkeypatch
-    ):
-        install_dir = tmp_path / "install"
-        runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
-        monkeypatch.setattr(
-            cli, "_prompt_credentials_json", lambda: ("prompted-id", "prompted-secret", "prompted-url")
-        )
-        args = make_args(install_dir)  # tunnel_* and credentials_file all left at their None default
-
-        rc = cli.run_login(args)
-
-        assert rc == 0
-        saved = json.loads(runtime_path.read_text())
-        assert saved["tunnel"]["id"] == "prompted-id"
-        assert saved["tunnel"]["secret"] == "prompted-secret"
-        assert saved["tunnel"]["endpoint"] == "prompted-url"
-
     def test_credentials_file_is_read_and_used(self, tmp_path, fake_service_manager, fake_newt_fetch):
         install_dir = tmp_path / "install"
         runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
@@ -184,7 +169,9 @@ class TestRunLogin:
         assert saved["tunnel"]["secret"] == "file-secret"
         assert saved["tunnel"]["endpoint"] == "file-url"
 
-    def test_credentials_file_with_invalid_json_is_rejected(self, tmp_path, fake_service_manager, caplog):
+    def test_credentials_file_with_invalid_json_is_rejected(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, caplog
+    ):
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
         creds_path = tmp_path / "creds.json"
@@ -197,7 +184,7 @@ class TestRunLogin:
         assert rc == 1
         assert any("not valid JSON" in rec.message for rec in caplog.records)
 
-    def test_missing_credentials_file_is_rejected(self, tmp_path, fake_service_manager):
+    def test_missing_credentials_file_is_rejected(self, tmp_path, fake_service_manager, fake_newt_fetch):
         install_dir = tmp_path / "install"
         write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
         args = make_args(install_dir, credentials_file=tmp_path / "does-not-exist.json")
@@ -216,6 +203,151 @@ class TestRunLogin:
 
         assert rc == 1
         fake_service_manager.stop.assert_not_called()
+
+
+ONE_CLICK_CREDENTIALS = {
+    "id": "endpoint-1",
+    "label": "test-box",
+    "installArgs": {"tunnelId": "oc-id", "tunnelSecret": "oc-secret", "tunnelEndpoint": "https://tunnel.example"},
+}
+
+
+@pytest.fixture
+def one_click(monkeypatch):
+    """Stubs what one-click login reaches outside the poll: the browser (records the URL it was
+    asked to open), the hostname, and the poll interval (zero, so a scripted run takes no time)."""
+    opened: list[str] = []
+    monkeypatch.setattr(cli.pairing, "open_in_browser", lambda url: opened.append(url) or True)
+    monkeypatch.setattr(cli.pairing, "device_name", lambda: "test-box")
+    real_wait = cli.pairing.wait_for_install_args
+    monkeypatch.setattr(
+        cli.pairing, "wait_for_install_args",
+        lambda server_url, pairing_id: real_wait(server_url, pairing_id, interval_seconds=0),
+    )
+    return opened
+
+
+class TestRunLoginOneClick:
+    def test_no_flags_pairs_in_the_browser_and_writes_the_credentials_the_poll_returns(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click, pairing_server
+    ):
+        install_dir = tmp_path / "install"
+        runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
+
+        with pairing_server([(200, {}), (200, {}), (200, ONE_CLICK_CREDENTIALS)]) as server:
+            rc = cli.run_login(make_args(install_dir, server_url=server.base_url))
+
+        assert rc == 0
+        saved = json.loads(runtime_path.read_text())
+        assert saved["logged_in"] is True
+        assert (saved["tunnel"]["id"], saved["tunnel"]["secret"], saved["tunnel"]["endpoint"]) == (
+            "oc-id", "oc-secret", "https://tunnel.example",
+        )
+        fake_service_manager.start.assert_called_once()
+
+        # The browser was sent to the pairing page for the same id the CLI then polled, named for
+        # this machine.
+        assert len(one_click) == 1
+        query = parse_qs(urlsplit(one_click[0]).query)
+        assert urlsplit(one_click[0]).path == "/chat/local-inference/pair"
+        assert query["name"] == ["test-box"]
+        assert set(server.requests) == {f"/chat/api/v2/local-inference/pairings/{query['id'][0]}"}
+
+    def test_prints_the_link_so_a_headless_box_can_be_paired_from_another_device(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click, pairing_server, capsys
+    ):
+        write_runtime(tmp_path / "install", {"llama_cpp": {}, "service": {}, "logged_in": False})
+        with pairing_server([(200, ONE_CLICK_CREDENTIALS)]) as server:
+            cli.run_login(make_args(tmp_path / "install", server_url=server.base_url))
+
+        assert one_click[0] in capsys.readouterr().out
+
+    def test_a_server_without_one_click_fails_and_leaves_the_device_logged_out(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click, pairing_server, caplog
+    ):
+        install_dir = tmp_path / "install"
+        runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
+
+        with pairing_server([(404, {"message": "Not found"})]) as server:
+            with caplog.at_level(logging.ERROR, logger="aipotluck.cli"):
+                rc = cli.run_login(make_args(install_dir, server_url=server.base_url))
+
+        assert rc == 1
+        assert json.loads(runtime_path.read_text())["logged_in"] is False
+        fake_service_manager.start.assert_not_called()
+        assert any("credentials-file" in rec.message for rec in caplog.records)
+
+    def test_bad_install_args_from_the_server_are_rejected_and_nothing_is_written(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click, pairing_server
+    ):
+        install_dir = tmp_path / "install"
+        runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
+        bad = {"id": "e", "label": "l", "installArgs": {"tunnelId": "i", "tunnelSecret": ""}}
+
+        with pairing_server([(200, bad)]) as server:
+            rc = cli.run_login(make_args(install_dir, server_url=server.base_url))
+
+        assert rc == 1
+        assert "tunnel" not in json.loads(runtime_path.read_text())
+
+    def test_ctrl_c_while_waiting_cancels_and_changes_nothing(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click, monkeypatch
+    ):
+        install_dir = tmp_path / "install"
+        runtime_path = write_runtime(install_dir, {"llama_cpp": {}, "service": {}, "logged_in": False})
+
+        def _interrupted(server_url, pairing_id):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli.pairing, "wait_for_install_args", _interrupted)
+
+        rc = cli.run_login(make_args(install_dir, server_url="https://www.aipotluck.org"))
+
+        assert rc == 130
+        assert json.loads(runtime_path.read_text())["logged_in"] is False
+        fake_service_manager.start.assert_not_called()
+
+    def test_a_missing_install_stops_before_the_browser_opens(self, tmp_path, fake_newt_fetch, one_click):
+        # Approving in the browser provisions a server in the person's account; doing that for a
+        # device that can't store the result would strand it.
+        with pytest.raises(SystemExit):
+            cli.run_login(make_args(tmp_path / "never-installed", server_url="https://www.aipotluck.org"))
+        assert one_click == []
+
+    def test_a_failed_newt_download_stops_before_the_browser_opens(
+        self, tmp_path, fake_service_manager, one_click, monkeypatch
+    ):
+        write_runtime(tmp_path / "install", {"llama_cpp": {}, "service": {}, "logged_in": False})
+        monkeypatch.setattr(cli.newt_fetch, "load_newt_manifest", lambda path: {"tag": "1.17.0", "assets": {}})
+        monkeypatch.setattr(cli.newt_fetch, "resolve_newt_asset", lambda m, p: ("linux-x64", {"file": "newt"}))
+
+        def _download_fails(*_args):
+            raise RuntimeError("checksum mismatch")
+
+        monkeypatch.setattr(cli.newt_fetch, "download_newt_binary", _download_fails)
+
+        with pytest.raises(RuntimeError):
+            cli.run_login(make_args(tmp_path / "install", server_url="https://www.aipotluck.org"))
+        assert one_click == []
+
+    def test_manual_flags_never_open_the_browser(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click
+    ):
+        write_runtime(tmp_path / "install", {"llama_cpp": {}, "service": {}, "logged_in": False})
+        args = make_args(tmp_path / "install", tunnel_id="tid", tunnel_secret="s", tunnel_endpoint="e")
+
+        assert cli.run_login(args) == 0
+        assert one_click == []
+
+    def test_plain_http_server_url_is_refused_before_anything_is_opened(
+        self, tmp_path, fake_service_manager, fake_newt_fetch, one_click
+    ):
+        write_runtime(tmp_path / "install", {"llama_cpp": {}, "service": {}, "logged_in": False})
+
+        rc = cli.run_login(make_args(tmp_path / "install", server_url="http://www.aipotluck.org"))
+
+        assert rc == 1
+        assert one_click == []
 
 
 class TestParseCredentialsJson:
@@ -245,51 +377,6 @@ class TestParseCredentialsJson:
         raw = json.dumps({"tunnelId": 12345, "tunnelSecret": "s", "tunnelEndpoint": "e"})
         with pytest.raises(cli.CredentialsError, match="tunnelId"):
             cli._parse_credentials_json(raw)
-
-
-class TestPromptCredentialsJson:
-    def test_returns_parsed_credentials_on_first_valid_paste(self, monkeypatch):
-        raw = json.dumps({"tunnelId": "i", "tunnelSecret": "s", "tunnelEndpoint": "e"})
-        monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt_text: raw)
-
-        assert cli._prompt_credentials_json() == ("i", "s", "e")
-
-    def test_retries_on_empty_paste(self, monkeypatch, capsys):
-        raw = json.dumps({"tunnelId": "i", "tunnelSecret": "s", "tunnelEndpoint": "e"})
-        answers = iter(["", "   ", raw])
-        monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt_text: next(answers))
-
-        result = cli._prompt_credentials_json()
-
-        assert result == ("i", "s", "e")
-        assert capsys.readouterr().out.count("(required, try again)") == 2
-
-    def test_retries_on_invalid_json(self, monkeypatch, capsys):
-        valid = json.dumps({"tunnelId": "i", "tunnelSecret": "s", "tunnelEndpoint": "e"})
-        answers = iter(["not json at all", valid])
-        monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt_text: next(answers))
-
-        result = cli._prompt_credentials_json()
-
-        assert result == ("i", "s", "e")
-        assert "Try again" in capsys.readouterr().out
-
-    def test_never_echoes_input(self, monkeypatch):
-        # The whole point of using getpass here is that the secret embedded in the pasted JSON is
-        # never echoed -- assert the prompt path goes through getpass.getpass, not the plain
-        # echoing `input()` builtin.
-        calls = []
-        raw = json.dumps({"tunnelId": "i", "tunnelSecret": "s", "tunnelEndpoint": "e"})
-        monkeypatch.setattr(cli.getpass, "getpass", lambda prompt_text: calls.append(prompt_text) or raw)
-
-        def _fail_if_called(*_args):
-            raise AssertionError("must not use input() -- it would echo the secret")
-
-        monkeypatch.setattr(cli, "input", _fail_if_called, raising=False)
-
-        cli._prompt_credentials_json()
-
-        assert len(calls) == 1
 
 
 class TestRunLogout:

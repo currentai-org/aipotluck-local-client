@@ -71,12 +71,18 @@ class TestLoginTunnelFlags:
         )
         assert (args.tunnel_id, args.tunnel_secret, args.tunnel_endpoint) == ("abc", "def", "http://x")
 
-    def test_tunnel_flags_default_to_none_for_interactive_prompt(self):
+    def test_tunnel_flags_default_to_none_for_one_click_pairing(self):
         parser = build_arg_parser()
         args = parser.parse_args(["login"])
         assert args.tunnel_id is None
         assert args.tunnel_secret is None
         assert args.tunnel_endpoint is None
+
+    def test_server_url_parses_and_defaults_to_none(self):
+        parser = build_arg_parser()
+        assert parser.parse_args(["login"]).server_url is None
+        args = parser.parse_args(["login", "--server-url", "http://localhost:5199"])
+        assert args.server_url == "http://localhost:5199"
 
     def test_logout_and_status_have_no_tunnel_flags(self):
         parser = build_arg_parser()
