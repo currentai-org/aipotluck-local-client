@@ -334,21 +334,32 @@ below) that runs the thin login/logout/status CLI
 (`aipotluck/installer/cli.py`) against whatever device is installed here:
 
 ```bash
-aipotluck-local-client login     # prompts for the pairing JSON -- paste it, press Enter
+aipotluck-local-client login     # opens aipotluck.org in your browser -- approve the device there
 aipotluck-local-client status    # asks the running service for its login/tunnel/llama-server state
 aipotluck-local-client logout    # unpairs; llama-server and the tunnel stop until you log in again
 ```
 
-Get the pairing JSON from **Settings -> Local Inference -> Add a managed server** on
-aipotluck.org -- click "Pair", then its **Copy** button puts
-`{"tunnelId": "...", "tunnelSecret": "...", "tunnelEndpoint": "..."}` on your clipboard (shown
-once; it isn't retrievable again after that). Paste that straight into the `login` prompt. Two
-alternatives to pasting: `login --credentials-file creds.json` reads the same JSON shape from a
-file, and `login --tunnel-id X --tunnel-secret Y --tunnel-endpoint Z` accepts the three values as
-separate flags for scripting (all three or none). All three forms are mutually exclusive, and
-every flag here is given after the subcommand (`login --tunnel-id ...`), not before
-(`--install-dir` and the other shared flags below are the same way; see cli.py's own comment on
-why).
+`login` with no flags pairs in one click. It makes up a random pairing id, opens
+`https://www.aipotluck.org/chat/local-inference/pair?id=...&name=<this machine's hostname>`
+in your browser, and waits (up to 10 minutes) while you approve it there, signing in first if
+you need to. The page then says "Pairing completed, you can close this window", and `login`
+picks up the credentials and finishes on its own. The link is always printed too: on a machine
+with no browser (an SSH session, a headless board) open it on any device where you're signed in.
+The device shows up under **Settings -> Local Inference** named after this machine's hostname.
+
+`--server-url` (or `AIPOTLUCK_SERVER_URL`) pairs with another AI Potluck server, e.g.
+`--server-url http://localhost:5199` for a local dev server. Plain `http` is refused for anything
+but `localhost`/`127.0.0.1`, because the credentials come back in that response.
+
+Manual pairing still works and skips the browser entirely. Get the pairing JSON from
+**Settings -> Local Inference -> Add a managed server** on aipotluck.org: click "Pair", then its
+**Copy** button puts `{"tunnelId": "...", "tunnelSecret": "...", "tunnelEndpoint": "..."}` on
+your clipboard (shown once; it isn't retrievable again after that). Then either
+`login --credentials-file creds.json` reads that JSON from a file, or
+`login --tunnel-id X --tunnel-secret Y --tunnel-endpoint Z` takes the three values as separate
+flags for scripting (all three or none). The two manual forms are mutually exclusive, and every
+flag here is given after the subcommand (`login --tunnel-id ...`), not before (`--install-dir`
+and the other shared flags below are the same way; see cli.py's own comment on why).
 
 Logging in/out edits `runtime.json`'s `tunnel` section and `logged_in` flag,
 downloads the pinned `newt` binary the first time (cached after that), and
