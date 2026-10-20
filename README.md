@@ -22,6 +22,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale.
 | x86_64 laptop | Ubuntu 24.04 | CPU | prebuilt `linux-x64-cpu` asset | confirmed |
 | NVIDIA Jetson Orin Nano 8GB (Developer Kit Super) | JetPack 6.2.3 (Ubuntu 22.04, glibc 2.35) | CUDA (SM 8.7) | our own binary cache (`linux-arm64-cuda-sm87`) | confirmed -- cache-hit installs in ~5s |
 | NVIDIA Jetson Orin NX 16GB (Developer Kit) | JetPack 6.x / L4T R36.5.0 (Ubuntu 22.04, glibc 2.35) | CUDA (SM 8.7) | our own binary cache (`linux-arm64-cuda-sm87`) -- same cache entry as the Orin Nano above, since both report the same compute capability | confirmed -- cache-hit installs, real GPU-accelerated inference verified |
+| Mac Mini M5 Pro 64GB | MacOS Golden Gate 27.0 | Metal | prebuilt `macox-arm64-metal` asset | confirmed |
+| Macbook Air M1 | MacOS Tahoe 26.6.2 | Metal | prebuilt `macox-arm64-metal` asset | confirmed |
 
 Everything else in "Status" just below is implemented against documented OS
 conventions but not run on real hardware yet.
