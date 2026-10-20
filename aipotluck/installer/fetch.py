@@ -34,19 +34,36 @@ def load_version_manifest(path: Path) -> dict[str, Any]:
 
 def resolve_asset(manifest: dict[str, Any], profile: HostProfile) -> tuple[str, dict[str, Any]]:
     """Return (asset_key, asset_entry), falling back to the CPU asset for
-    this OS/arch if the requested backend has no manifest entry."""
+    this OS/arch if the requested backend has no manifest entry.
+
+    A key listed under the manifest's `aliases` resolves to the asset it names, and the returned
+    key is that asset's own, so an alias and its target install into the same directory. Today
+    that's macos-arm64-cpu -> macos-arm64-metal: upstream's one Apple-silicon build has Metal and
+    serves a CPU request too."""
     assets = manifest["assets"]
+    aliases = manifest.get("aliases", {})
+
+    def lookup(candidate: str) -> str | None:
+        if candidate in assets:
+            return candidate
+        target = aliases.get(candidate)
+        return target if isinstance(target, str) and target in assets else None
+
     key = profile.asset_key
-    if key in assets:
-        return key, assets[key]
+    resolved = lookup(key)
+    if resolved:
+        if resolved != key:
+            log.info("backend=%s uses the %s asset (%s is an alias for it)", profile.backend, resolved, key)
+        return resolved, assets[resolved]
 
     cpu_key = f"{profile.os_name}-{profile.arch}-cpu"
-    if cpu_key in assets:
+    resolved = lookup(cpu_key)
+    if resolved:
         log.warning(
             "No asset for backend=%s (key=%s); falling back to CPU asset (%s)",
-            profile.backend, key, cpu_key,
+            profile.backend, key, resolved,
         )
-        return cpu_key, assets[cpu_key]
+        return resolved, assets[resolved]
 
     raise VersionManifestError(
         f"No release asset available for {key!r} and no CPU fallback "

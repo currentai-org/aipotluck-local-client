@@ -60,5 +60,9 @@
     "apt_packages_note": "libssl-dev is easy to miss and does NOT fail the cmake configure step -- llama.cpp's HTTPS support (LLAMA_OPENSSL, needed for the -hf model downloader and --cache-list our pull/list commands depend on) does a plain, non-REQUIRED find_package(OpenSSL) and silently compiles without HTTPS if the dev headers aren't present, so a build can succeed and only fail later at runtime with 'HTTPS is not supported'. source_build.py checks for the header before ever starting cmake, specifically to avoid burning a 30-90 minute build on a binary with this silently missing.",
     "min_free_disk_gb": 6,
     "default_build_timeout_seconds": 5400
+  },
+  "aliases": {
+    "_comment": "Keys with no download of their own that resolve to another asset (fetch.resolve_asset). macos-arm64-cpu: upstream publishes one Apple-silicon build, with Metal, and it serves a request for the CPU backend too, so `--backend cpu` on an arm64 Mac installs it rather than failing.",
+    "macos-arm64-cpu": "macos-arm64-metal"
   }
 }

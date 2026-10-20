@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from aipotluck.installer import fetch
+from aipotluck.installer.platform_detect import HostProfile
 
 
 def _make_binary(directory, stem="llama-server"):
@@ -87,3 +88,27 @@ class TestFindBinary:
         real = _make_binary(tmp_path / "llama-b10989", stem="llama-bench")
         _make_binary(tmp_path / "llama-b10989.bak-1790802474", stem="llama-bench")
         assert fetch.find_binary(tmp_path, "llama-bench") == real
+
+
+class TestResolveAssetAliases:
+    MANIFEST = {
+        "assets": {
+            "macos-arm64-metal": {"file": "macos-arm64.tar.gz"},
+            "linux-x64-cpu": {"file": "x64.tar.gz"},
+        },
+        "aliases": {"_comment": "ignored", "macos-arm64-cpu": "macos-arm64-metal", "linux-x64-cuda": "missing"},
+    }
+
+    def test_an_aliased_key_resolves_to_its_target_and_returns_the_targets_own_key(self):
+        profile = HostProfile(os_name="macos", arch="arm64", backend="cpu")
+        assert fetch.resolve_asset(self.MANIFEST, profile) == ("macos-arm64-metal", {"file": "macos-arm64.tar.gz"})
+
+    def test_an_alias_whose_target_is_missing_is_ignored_and_the_cpu_fallback_still_applies(self):
+        profile = HostProfile(os_name="linux", arch="x64", backend="cuda")
+        assert fetch.resolve_asset(self.MANIFEST, profile)[0] == "linux-x64-cpu"
+
+    def test_a_manifest_with_no_aliases_section_behaves_as_before(self):
+        manifest = {"assets": {"linux-x64-cpu": {"file": "x64.tar.gz"}}}
+        profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
+        assert fetch.resolve_asset(manifest, profile)[0] == "linux-x64-cpu"
+

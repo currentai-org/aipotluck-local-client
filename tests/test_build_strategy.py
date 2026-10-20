@@ -56,6 +56,16 @@ class TestMacsGetThePrebuiltUpstreamAsset:
         assert strategy.asset_key == "macos-arm64-metal"
         assert strategy.asset_entry["file"].endswith("-bin-macos-arm64.tar.gz")
 
+    def test_explicit_cpu_backend_on_apple_silicon_installs_the_same_metal_build(self, monkeypatch):
+        # --backend cpu: no macos-arm64-cpu download exists, and the Metal build serves CPU too.
+        monkeypatch.setattr(bs, "detect_glibc_version", lambda: None)
+        profile = HostProfile(os_name="macos", arch="arm64", backend=detect_gpu_backend("macos", "arm64", "cpu"))
+
+        strategy = bs.resolve_install_strategy(profile, REAL_MANIFEST)
+
+        assert strategy.use_source_build is False
+        assert strategy.asset_key == "macos-arm64-metal"
+
     def test_intel_mac_stays_on_the_cpu_asset(self, monkeypatch):
         monkeypatch.setattr(bs, "detect_glibc_version", lambda: None)
         profile = HostProfile(os_name="macos", arch="x64", backend=detect_gpu_backend("macos", "x64"))
