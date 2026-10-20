@@ -111,8 +111,9 @@ aipotluck-local-client/
 - GPU backend probe (best-effort, non-fatal if inconclusive):
   - NVIDIA: `nvidia-smi` present → cuda asset
   - AMD: `rocminfo` / `/dev/kfd` → rocm asset (Linux only for now)
-  - Apple Silicon: Metal is built into the `macos-arm64` asset already (no
-    separate variant) — nothing to detect, just pick macos-arm64.
+  - Apple Silicon: Metal is built into upstream's `macos-arm64` asset already (no
+    separate variant) — nothing to detect. The backend is reported as `metal` and the
+    manifest key is `macos-arm64-metal`; Intel Macs stay `cpu` (`macos-x64-cpu`).
   - Vulkan: generic fallback for non-NVIDIA/AMD GPU Linux/Windows if desired.
   - Default/no GPU detected → plain CPU asset (`ubuntu-x64`, `win-cpu-x64`,
     `macos-*`). CPU asset ships multiple `libggml-cpu-<isa>.so` variants and

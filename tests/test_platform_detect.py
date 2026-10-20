@@ -50,9 +50,13 @@ class TestDetectGpuBackend:
         monkeypatch.setattr(pd, "_has_cmd", lambda name: False)
         assert pd.detect_gpu_backend("linux", "x64", "cuda") == "cuda"
 
-    def test_macos_is_always_cpu(self):
-        # Metal is baked into the macos asset itself -- no separate GPU variant to detect.
-        assert pd.detect_gpu_backend("macos", "arm64", "auto") == "cpu"
+    def test_apple_silicon_mac_is_metal(self):
+        # Upstream's one macos-arm64 asset is the Metal build -- nothing to probe, but the backend
+        # says what the binary uses rather than "cpu".
+        assert pd.detect_gpu_backend("macos", "arm64", "auto") == "metal"
+
+    def test_intel_mac_stays_cpu(self):
+        assert pd.detect_gpu_backend("macos", "x64", "auto") == "cpu"
 
     def test_windows_is_always_cpu_for_now(self):
         assert pd.detect_gpu_backend("windows", "x64", "auto") == "cpu"

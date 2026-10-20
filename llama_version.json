@@ -29,7 +29,7 @@
       "file": "llama-b10989-bin-ubuntu-rocm-10.0-x64.tar.gz",
       "sha256": "523bb4d09a0380d6c6330b212ac58b19efde095912f5f26620fa10adc0fa1eb0"
     },
-    "macos-arm64-cpu": {
+    "macos-arm64-metal": {
       "file": "llama-b10989-bin-macos-arm64.tar.gz",
       "sha256": "4b4932fcdd49c9601e48498ef5ba6b77af78bbb38282abbfcc3899eaee155a42"
     },

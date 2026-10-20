@@ -7,8 +7,13 @@ combination rather than re-testing the probes themselves (that's test_platform_d
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from aipotluck.installer import build_strategy as bs
-from aipotluck.installer.platform_detect import HostProfile
+from aipotluck.installer.platform_detect import HostProfile, detect_gpu_backend
+
+REAL_MANIFEST = json.loads((Path(__file__).resolve().parent.parent / "llama_version.json").read_text())
 
 MANIFEST = {
     "assets": {
@@ -32,6 +37,33 @@ class TestPrebuiltIsUsedWhenCompatible:
         profile = HostProfile(os_name="linux", arch="arm64", backend="cpu")
         strategy = bs.resolve_install_strategy(profile, MANIFEST)
         assert strategy.use_source_build is False
+
+
+class TestMacsGetThePrebuiltUpstreamAsset:
+    """Against the real llama_version.json, so detection and the manifest's keys must agree: a
+    renamed key on one side only would send a Mac to a source build (non-cpu backend, no asset) or
+    to a missing CPU fallback."""
+
+    def test_apple_silicon_detects_metal_and_gets_upstreams_macos_arm64_build_not_a_source_build(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(bs, "detect_glibc_version", lambda: None)  # macOS has no glibc
+        profile = HostProfile(os_name="macos", arch="arm64", backend=detect_gpu_backend("macos", "arm64"))
+
+        strategy = bs.resolve_install_strategy(profile, REAL_MANIFEST)
+
+        assert strategy.use_source_build is False
+        assert strategy.asset_key == "macos-arm64-metal"
+        assert strategy.asset_entry["file"].endswith("-bin-macos-arm64.tar.gz")
+
+    def test_intel_mac_stays_on_the_cpu_asset(self, monkeypatch):
+        monkeypatch.setattr(bs, "detect_glibc_version", lambda: None)
+        profile = HostProfile(os_name="macos", arch="x64", backend=detect_gpu_backend("macos", "x64"))
+
+        strategy = bs.resolve_install_strategy(profile, REAL_MANIFEST)
+
+        assert strategy.use_source_build is False
+        assert strategy.asset_key == "macos-x64-cpu"
 
 
 class TestSourceBuildForcedByMissingAsset:

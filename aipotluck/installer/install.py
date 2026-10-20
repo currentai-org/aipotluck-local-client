@@ -62,8 +62,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         default="auto",
-        choices=["auto", "cpu", "cuda", "vulkan", "rocm"],
-        help="GPU backend to use (default: auto-detect, falls back to cpu)",
+        choices=["auto", "cpu", "cuda", "vulkan", "rocm", "metal"],
+        help="GPU backend to use (default: auto-detect, falls back to cpu; Apple-silicon Macs are metal)",
     )
     parser.add_argument(
         "--install-dir", type=Path, default=None,

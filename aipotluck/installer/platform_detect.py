@@ -22,7 +22,7 @@ class UnsupportedPlatformError(RuntimeError):
 class HostProfile:
     os_name: str      # "linux" | "macos" | "windows"
     arch: str         # "x64" | "arm64"
-    backend: str      # "cpu" | "cuda" | "vulkan" | "rocm"
+    backend: str      # "cpu" | "cuda" | "vulkan" | "rocm" | "metal"
 
     @property
     def asset_key(self) -> str:
@@ -64,7 +64,7 @@ def _cmd_ok(args: list[str]) -> bool:
 
 
 def detect_gpu_backend(os_name: str, arch: str, requested: str = "auto") -> str:
-    """Return one of "cpu" | "cuda" | "vulkan" | "rocm".
+    """Return one of "cpu" | "cuda" | "vulkan" | "rocm" | "metal".
 
     requested: "auto" to probe, or an explicit override which is returned
     as-is (validated later against the asset manifest).
@@ -73,8 +73,13 @@ def detect_gpu_backend(os_name: str, arch: str, requested: str = "auto") -> str:
         return requested
 
     if os_name == "macos":
-        # Metal is baked into the standard macOS asset; nothing to pick.
-        return "cpu"
+        # Nothing to probe: upstream's one Apple-silicon release asset (llama-<tag>-bin-macos-arm64)
+        # is built with Metal, so an arm64 Mac gets Metal from the same download. Named "metal" so
+        # the asset key, `status` and the installer's summary say what the binary actually uses,
+        # rather than "cpu" (which is what this returned before, and what misled a reader into
+        # thinking a Mac ran inference on the CPU). Intel Macs stay "cpu": their asset is the
+        # plain CPU build as far as this project has verified.
+        return "metal" if arch == "arm64" else "cpu"
 
     if os_name == "windows":
         # GPU asset variants for Windows are not wired into the manifest
