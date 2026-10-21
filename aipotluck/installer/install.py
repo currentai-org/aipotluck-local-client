@@ -388,8 +388,14 @@ def run_install(args: argparse.Namespace) -> int:
     shim_path = install_cli_shim(profile, python_exe, args.system)
 
     if service_installed and not args.no_start:
-        service_mgr.start(SERVICE_NAME, system_scope=args.system)
-        log.info("Started %s service", SERVICE_NAME)
+        try:
+            service_mgr.start(SERVICE_NAME, system_scope=args.system)
+            log.info("Started %s service", SERVICE_NAME)
+        except RuntimeError as exc:
+            # Registered but not running now (Windows: the logon task can't be started from a
+            # session with no desktop). It will start at the next sign-in; the summary below shows
+            # its real state rather than a "Started" that didn't happen.
+            log.warning("%s", exc)
 
     status = service_mgr.status(SERVICE_NAME, system_scope=args.system)
     _print_summary(profile, lay, runtime_config, service_status=status, shim_path=shim_path)

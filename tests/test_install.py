@@ -687,3 +687,33 @@ class TestRunInstallDefaultModelSizing:
 
         assert rc == 0
         assert any("Could not pre-fetch/size" in rec.message for rec in caplog.records)
+
+
+class TestServiceLoggingUnderPythonw:
+    def test_logging_setup_survives_having_no_stdout(self, tmp_path, monkeypatch):
+        """pythonw.exe (how the Windows logon task starts the service, so no console window opens)
+        gives the process no stdout: sys.stdout is None. Logging setup must still work, to the file."""
+        import logging
+        import sys as _sys
+
+        from aipotluck.service import aipotluck_service
+
+        monkeypatch.setattr(_sys, "stdout", None)
+        # Under pythonw stderr is None too, so a StreamHandler(None) -- which quietly falls back to
+        # sys.stderr -- breaks the first time it writes. Reproduce both.
+        monkeypatch.setattr(_sys, "stderr", None)
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        root.handlers = []
+        try:
+            aipotluck_service.setup_logging(tmp_path)
+            assert all(getattr(h, "stream", True) is not None for h in root.handlers), \
+                "a console handler with no console was installed"
+            logging.getLogger("aipotluck.test").info("hello from pythonw")
+            for h in root.handlers:
+                h.flush()
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved
+        assert "hello from pythonw" in (tmp_path / "aipotluck.log").read_text()

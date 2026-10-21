@@ -52,7 +52,9 @@ def default_config_dir() -> Path:
 
 
 def setup_logging(log_dir: Path | None) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # sys.stdout is None under pythonw.exe (how the Windows logon task starts the service, so no
+    # console window opens): the log file is then the only handler.
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)] if sys.stdout else []
     if log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
