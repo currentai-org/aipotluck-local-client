@@ -367,19 +367,27 @@ def run_install(args: argparse.Namespace) -> int:
         log.error("%s", exc)
         raise
     log.info("Using Python interpreter for service: %s", python_exe)
-    service_mgr.install(
-        SERVICE_NAME,
-        exec_path=python_exe,
-        args=[str(service_script)] + service_args,
-        system_scope=args.system,
-        working_dir=REPO_ROOT,
-        log_dir=lay.log_dir,
-    )
-    log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
+    service_installed = True
+    try:
+        service_mgr.install(
+            SERVICE_NAME,
+            exec_path=python_exe,
+            args=[str(service_script)] + service_args,
+            system_scope=args.system,
+            working_dir=REPO_ROOT,
+            log_dir=lay.log_dir,
+        )
+        log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
+    except RuntimeError as exc:
+        # Everything else (llama.cpp, the model, runtime.json, the CLI) is in place and usable;
+        # only the OS service is missing, and the summary below says so. Logged as an error, not
+        # dropped: before this, a failed Windows registration was silently reported as installed.
+        service_installed = False
+        log.error("%s", exc)
 
     shim_path = install_cli_shim(profile, python_exe, args.system)
 
-    if not args.no_start:
+    if service_installed and not args.no_start:
         service_mgr.start(SERVICE_NAME, system_scope=args.system)
         log.info("Started %s service", SERVICE_NAME)
 

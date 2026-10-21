@@ -570,6 +570,29 @@ class TestRunInstallWithService:
 
         mgr.start.assert_not_called()
 
+    def test_a_failed_service_registration_is_reported_and_never_started_but_the_install_still_completes(
+        self, tmp_path, fake_fetch, monkeypatch, caplog
+    ):
+        """A service manager that can't register (Windows' Task Scheduler refusing an SSH logon)
+        must not be reported as installed, nor 'started'; llama.cpp, runtime.json and the CLI shim
+        are still usable, and the hosted fallback (the GUI) can run the service itself."""
+        mgr = self._fake_service_manager(monkeypatch)
+        mgr.install.side_effect = RuntimeError("Couldn't register the AIPotluck_aipotluck Scheduled Task: ERROR: Access is denied.")
+        mgr.status.return_value = ServiceStatus(ServiceState.NOT_INSTALLED, detail="not found")
+        monkeypatch.setattr(install, "ensure_python", lambda: Path("/usr/bin/python3"))
+        shim = MagicMock(return_value=Path("/fake/bin/aipotluck-local-client"))
+        monkeypatch.setattr(install, "install_cli_shim", shim)
+        args = make_args(tmp_path / "install")
+
+        with caplog.at_level("INFO"):
+            rc = install.run_install(args)
+
+        assert rc == 0
+        mgr.start.assert_not_called()
+        shim.assert_called_once()
+        assert any(r.levelname == "ERROR" and "Access is denied" in r.getMessage() for r in caplog.records)
+        assert not any("Installed aipotluck service" in r.getMessage() for r in caplog.records)
+
     def test_summary_shows_shim_path_and_login_command(self, tmp_path, fake_fetch, monkeypatch, capsys):
         self._fake_service_manager(monkeypatch)
         monkeypatch.setattr(install, "ensure_python", lambda: Path("/usr/bin/python3"))

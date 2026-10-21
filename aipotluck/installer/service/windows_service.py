@@ -30,6 +30,24 @@ def _task_name(name: str) -> str:
     return f"{TASK_PREFIX}_{name}"
 
 
+def _task_state(csv_out: str) -> ServiceState:
+    """The task's state from `schtasks /query /fo csv /nh`: one row per trigger, each
+    "TaskName","Next Run Time","Status". Running on any row is RUNNING; Ready/Disabled (installed,
+    not running right now) is STOPPED. Anything else -- including a localized status word, since
+    schtasks prints those in the system's display language -- is UNKNOWN rather than a guess."""
+    import csv
+
+    states = set()
+    for row in csv.reader(line for line in csv_out.splitlines() if line.strip()):
+        if len(row) >= 3:
+            states.add(row[2].strip().lower())
+    if "running" in states:
+        return ServiceState.RUNNING
+    if states and states <= {"ready", "disabled", "queued"}:
+        return ServiceState.STOPPED
+    return ServiceState.UNKNOWN
+
+
 class WindowsServiceManager(ServiceManager):
     """STUB: no-admin path uses schtasks; --system path uses pywin32.
     Neither has been exercised on real Windows -- implemented per
@@ -57,8 +75,16 @@ class WindowsServiceManager(ServiceManager):
             "/tn", task_name,
             "/tr", command,
         ]
-        log.info("Would run (STUB, untested): %s", " ".join(cmd))
-        subprocess.run(cmd, capture_output=True, text=True)
+        log.info("Registering a logon Scheduled Task: %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # Surfaced, not swallowed: a task that was never created looks exactly like one that
+            # hasn't started yet. "Access is denied" here is usually a non-interactive (SSH,
+            # network) logon, whose token Task Scheduler refuses even for a per-user task.
+            raise RuntimeError(
+                f"Couldn't register the {task_name} Scheduled Task: "
+                f"{(result.stderr or result.stdout).strip() or f'schtasks exit {result.returncode}'}"
+            )
 
     def uninstall(self, name: str, *, system_scope: bool = False) -> None:
         if system_scope:
@@ -91,11 +117,12 @@ class WindowsServiceManager(ServiceManager):
             return ServiceStatus(ServiceState.STOPPED, detail=result.stdout.strip())
 
         result = subprocess.run(
-            ["schtasks", "/query", "/tn", _task_name(name)], capture_output=True, text=True
+            ["schtasks", "/query", "/tn", _task_name(name), "/fo", "csv", "/nh"],
+            capture_output=True, text=True,
         )
         if result.returncode != 0:
             return ServiceStatus(ServiceState.NOT_INSTALLED, detail=result.stderr.strip())
-        return ServiceStatus(ServiceState.UNKNOWN, detail=result.stdout.strip())
+        return ServiceStatus(_task_state(result.stdout), detail=result.stdout.strip())
 
     @staticmethod
     def _install_windows_service(
