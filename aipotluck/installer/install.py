@@ -287,6 +287,7 @@ def run_install(args: argparse.Namespace) -> int:
 
         archive_path = fetch.download_asset(manifest, asset_entry, lay.state_dir / "downloads")
         llama_dir = fetch.extract_archive(archive_path, lay.install_root / "llama.cpp", manifest["tag"], asset_key)
+        fetch.fetch_companions(manifest, asset_entry, lay.state_dir / "downloads", llama_dir)
 
         server_bin = fetch.find_binary(llama_dir, "llama-server")
 

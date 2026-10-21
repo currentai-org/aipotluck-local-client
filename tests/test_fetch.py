@@ -112,3 +112,46 @@ class TestResolveAssetAliases:
         profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
         assert fetch.resolve_asset(manifest, profile)[0] == "linux-x64-cpu"
 
+
+
+class TestFetchCompanions:
+    """Windows CUDA: llama.cpp ships the CUDA runtime DLLs as a separate cudart zip that must land
+    beside llama-server, or the CUDA backend quietly fails to load and everything runs on the CPU."""
+
+    def _zip(self, path, names):
+        import zipfile as zf
+        with zf.ZipFile(path, "w") as z:
+            for n in names:
+                z.writestr(n, b"x")
+        return path
+
+    def test_unpacks_each_companion_beside_the_binaries_once(self, tmp_path, monkeypatch):
+        llama_dir = tmp_path / "llama"
+        llama_dir.mkdir()
+        archive = self._zip(tmp_path / "cudart.zip", ["cudart64_12.dll", "cublas64_12.dll"])
+        calls = []
+
+        def fake_download(manifest, entry, dest):
+            calls.append(entry["file"])
+            return archive
+
+        monkeypatch.setattr(fetch, "download_asset", fake_download)
+        entry = {"file": "llama-win-cuda.zip", "companions": [{"file": "cudart.zip", "sha256": "0" * 64}]}
+        fetch.fetch_companions({}, entry, tmp_path / "dl", llama_dir)
+        assert (llama_dir / "cudart64_12.dll").exists() and (llama_dir / "cublas64_12.dll").exists()
+        fetch.fetch_companions({}, entry, tmp_path / "dl", llama_dir)
+        assert calls == ["cudart.zip"]  # second run is a no-op
+
+    def test_an_asset_without_companions_downloads_nothing_extra(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fetch, "download_asset", lambda *a: pytest.fail("no download expected"))
+        fetch.fetch_companions({}, {"file": "llama-win-vulkan.zip"}, tmp_path, tmp_path)
+
+    def test_the_pinned_windows_cuda_asset_carries_its_cuda_runtime(self):
+        import json
+        from pathlib import Path
+        manifest = json.loads((Path(__file__).resolve().parents[1] / "llama_version.json").read_text())
+        cuda = manifest["assets"]["windows-x64-cuda"]
+        assert cuda["cuda_version"] == "12.4"
+        assert [c["file"] for c in cuda["companions"]] == ["cudart-llama-bin-win-cuda-12.4-x64.zip"]
+        assert all(len(c["sha256"]) == 64 for c in cuda["companions"])
+        assert "windows-x64-vulkan" in manifest["assets"]

@@ -41,6 +41,21 @@
       "file": "llama-b10989-bin-win-cpu-x64.zip",
       "sha256": "595d0fc76fd12794fca29facbc986eec8d9cb47309cc9668c4d5f37f2068aa39"
     },
+    "windows-x64-cuda": {
+      "file": "llama-b10989-bin-win-cuda-12.4-x64.zip",
+      "sha256": "858697102998e6c8c9b73976a3f1ca00007be554fe27a0dcd5cf7ada1baae61a",
+      "cuda_version": "12.4",
+      "companions": [
+        {
+          "file": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+          "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+        }
+      ]
+    },
+    "windows-x64-vulkan": {
+      "file": "llama-b10989-bin-win-vulkan-x64.zip",
+      "sha256": "79ef9669d323f907fc9c8edb30b67fd2591af9bae9232b87a76fedd26e849b6f"
+    },
     "windows-arm64-cpu": {
       "file": "llama-b10989-bin-win-cpu-arm64.zip",
       "sha256": "6dacb3cf52153c2f38f7514a80a991b1865eb8c24cb91cb9348d69bc91fdc632"
@@ -48,15 +63,25 @@
   },
   "notes": {
     "macos": "Metal acceleration is built into the standard macOS asset -- no separate GPU variant needed.",
-    "windows_gpu": "windows-x64-cuda / windows-x64-vulkan asset entries can be added the same way when GPU support is validated on Windows; stubbed out in platform_detect.py for now.",
+    "windows_gpu": "windows-x64-cuda is llama.cpp's CUDA 12.4 build (CUDA 12.4 needs NVIDIA driver >= 550 on Windows; platform_detect only auto-picks it when nvidia-smi's 'CUDA Version' is >= cuda_version). Its CUDA runtime DLLs ship as a separate cudart zip, pinned under `companions` and unpacked beside llama-server (fetch.fetch_companions). The 12.4 build is chosen over 13.x for the wider driver range. sha256s match GitHub's published asset digests for b10989. windows-x64-vulkan is the fallback for any other GPU. windows-arm64 GPU variants are not pinned.",
     "linux_arm64_cuda_note": "No linux-arm64-cuda asset published upstream at all (Jetson-class boards are the only real-world arm64+CUDA host) -- source_build.py builds llama-server from vendor/llama.cpp instead of falling back to linux-arm64-cpu, which would silently throw away the GPU.",
     "min_glibc": "llama.cpp's own release CI builds Linux arm64 assets against a newer base image than most arm64 boards actually run -- confirmed live 2026-09-23: the b10989 linux-arm64-cpu asset needs glibc 2.38 (via its GLIBC_* symbol versions, `objdump -T llama-server | grep GLIBC_`), which JetPack 6.2.3 / Ubuntu 22.04 (glibc 2.35) does not have, so even the CPU-only asset fails to start there (not just the missing CUDA asset). The x64-cpu asset only needs glibc 2.34, so this mostly bites arm64. Not re-verified per release bump -- re-check with the same objdump command whenever `tag` changes, since the CI base image is upstream's choice, not ours."
   },
   "source_build": {
     "_comment": "Used when platform_detect.resolve_install_strategy (aipotluck/installer/build_strategy.py) decides no viable prebuilt asset exists for this host -- builds llama-server from the pinned tag checked out into vendor/llama.cpp instead. Confirmed viable on a real Jetson Orin Nano (JetPack 6.2.3): a manually-built llama-server there already links libggml-cuda.so against the JetPack-bundled CUDA 12.6 toolkit at CMAKE_CUDA_ARCHITECTURES=87.",
-    "required_tools": ["cmake", "a C++17 compiler (g++/clang++)", "git"],
-    "cuda_required_tools": ["nvcc (from the JetPack/CUDA toolkit, e.g. /usr/local/cuda/bin/nvcc)"],
-    "apt_packages_ubuntu_debian": ["cmake", "build-essential", "libssl-dev"],
+    "required_tools": [
+      "cmake",
+      "a C++17 compiler (g++/clang++)",
+      "git"
+    ],
+    "cuda_required_tools": [
+      "nvcc (from the JetPack/CUDA toolkit, e.g. /usr/local/cuda/bin/nvcc)"
+    ],
+    "apt_packages_ubuntu_debian": [
+      "cmake",
+      "build-essential",
+      "libssl-dev"
+    ],
     "apt_packages_note": "libssl-dev is easy to miss and does NOT fail the cmake configure step -- llama.cpp's HTTPS support (LLAMA_OPENSSL, needed for the -hf model downloader and --cache-list our pull/list commands depend on) does a plain, non-REQUIRED find_package(OpenSSL) and silently compiles without HTTPS if the dev headers aren't present, so a build can succeed and only fail later at runtime with 'HTTPS is not supported'. source_build.py checks for the header before ever starting cmake, specifically to avoid burning a 30-90 minute build on a binary with this silently missing.",
     "min_free_disk_gb": 6,
     "default_build_timeout_seconds": 5400

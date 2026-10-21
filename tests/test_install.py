@@ -717,3 +717,16 @@ class TestServiceLoggingUnderPythonw:
                 h.close()
             root.handlers = saved
         assert "hello from pythonw" in (tmp_path / "aipotluck.log").read_text()
+
+
+class TestRunInstallCompanions:
+    def test_the_installer_fetches_the_assets_companions_into_the_llama_dir(self, tmp_path, fake_fetch, monkeypatch):
+        """Windows CUDA's cudart zip has to be unpacked beside llama-server by the install itself,
+        not just be listed in the manifest -- otherwise the CUDA build runs on the CPU."""
+        calls = []
+        monkeypatch.setattr(
+            install.fetch, "fetch_companions",
+            lambda manifest, entry, downloads, llama_dir: calls.append((entry["file"], llama_dir)),
+        )
+        assert install.run_install(make_args(tmp_path / "inst", ["--no-service"])) == 0
+        assert calls == [("llama-x.tar.gz", fake_fetch.parent)]
