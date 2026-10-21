@@ -17,17 +17,15 @@ a deliberate re-pull is a reasonable time to re-size) and the service's own star
 cached models that don't have a preset entry yet -- backfills a deleted/corrupted presets file, or
 a model that reached the cache some other way).
 
-Why the memory budget is a fixed fraction of TOTAL installed RAM, not a live "available now"
-reading: available/background memory headroom fluctuates over a device's uptime (other processes,
-OS cache pressure, whatever else the user runs), and a value picked once from a single live
-snapshot would bake in whatever happened to be true at that moment -- exactly the kind of "it just
-works until it doesn't" gap CLAUDE.md's "Runtime parameters" section warns about. Total installed
-RAM is a stable hardware fact instead. `_MEMORY_BUDGET_FRACTION` (80%, matching Ollama's own
-`freeMemory*80/100` eviction threshold) is the reserved headroom for the OS, other processes, and
-the compute/attention scratch buffers that scale with context but aren't captured by the KV-cache
-formula alone. This is a deliberate, openly-approximate policy, not a live measurement -- monitoring
-a model's *actually observed* headroom over its running lifetime and adjusting from there would be
-a real improvement, but it's future work, tracked here rather than attempted in this pass.
+Which memory the budget comes from is `memory_budget.detect`'s call, made when the model is probed:
+the free VRAM of a discrete GPU, free shared memory on a unified-memory GPU (Apple silicon, Jetson,
+integrated graphics), or free system memory for a CPU build -- less a safety margin. Budgeting a
+discrete GPU against total system RAM, as this module used to, sized a 4B model to a 262k context
+on a 6GB card; llama.cpp then moved most of its layers to the CPU to fit the KV cache, and
+generation ran ~10x slower. See memory_budget's docstring.
+
+When the pool can't be measured, sizing falls back to the older estimate: `_MEMORY_BUDGET_FRACTION`
+(80%) of TOTAL installed RAM, the headroom Ollama's own eviction threshold uses.
 """
 
 from __future__ import annotations
@@ -44,7 +42,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aipotluck.proc import NO_WINDOW
-from aipotluck.installer import llama_errors, model_presets
+from aipotluck.installer import llama_errors, memory_budget, model_presets
+from aipotluck.installer.memory_budget import MemoryBudget
+from aipotluck.installer.platform_detect import UnsupportedPlatformError, detect_arch, detect_os
 from aipotluck.installer.source_build import _total_memory_gb
 
 log = logging.getLogger("aipotluck.installer.model_sizing")
@@ -116,7 +116,10 @@ class ModelProfile:
     n_embd_k_gqa: int
     n_embd_v_gqa: int
     model_size_bytes: int
-    total_memory_gb: float | None  # installed physical RAM -- see module docstring
+    total_memory_gb: float | None  # installed physical RAM -- the fallback budget's basis
+    # The pool the model will actually live in (VRAM, unified or system) and how much is free;
+    # None when it couldn't be measured, and sizing falls back to total_memory_gb.
+    memory: MemoryBudget | None = None
 
 
 @dataclass
@@ -242,6 +245,10 @@ def probe_model_profile(
     if gpu_layers is not None:
         cmd += ["--gpu-layers", str(gpu_layers)]
 
+    # Measured before the probe loads anything, so the probe's own copy of the model isn't counted
+    # as used. Callers free the router first (model_ops/runner), for the same reason.
+    memory = _detect_memory(server_binary)
+
     log.info("Probing model metadata for %s", model_path or model_hf)
     # errors="replace", not the default "strict": llama.cpp truncates long string values in its
     # `llama_model_loader: - kv NN: ...` preview at a fixed width WITHOUT respecting UTF-8
@@ -307,6 +314,7 @@ def probe_model_profile(
             n_embd_v_gqa=_parse_int_or_list_max(output, "n_embd_v_gqa"),
             model_size_bytes=_parse_model_size_bytes(output),
             total_memory_gb=_total_memory_gb(),
+            memory=_spill_if_weights_exceed(memory, _parse_model_size_bytes(output)),
         )
     except ModelSizingError as exc:
         # A truncated read and a genuinely missing hparam look identical from here -- both are just
@@ -318,6 +326,32 @@ def probe_model_profile(
                 f"({drain_failures[0]!r}), so the value may well have been printed."
             ) from exc
         raise
+
+
+def _detect_memory(server_binary: Path) -> MemoryBudget | None:
+    try:
+        budget = memory_budget.detect(server_binary, detect_os(), detect_arch())
+    except (UnsupportedPlatformError, OSError) as exc:
+        log.warning("Could not tell which memory this model will use (%s); sizing against total RAM", exc)
+        return None
+    log.info("Sizing against %s -- %s", budget.describe(), budget.reason)
+    return budget
+
+
+def _spill_if_weights_exceed(memory: MemoryBudget | None, model_size_bytes: int) -> MemoryBudget | None:
+    """A model too big for the GPU's free VRAM still runs: llama.cpp keeps the layers that don't
+    fit on the CPU. Then VRAM no longer bounds it -- system RAM does -- and sizing against VRAM
+    would reject a model that works. So that case is sized against free system memory instead,
+    and the tuning record says so."""
+    if memory is None or memory.kind != memory_budget.KIND_VRAM or memory.budget_bytes is None:
+        return memory
+    if model_size_bytes <= memory.budget_bytes:
+        return memory
+    return memory_budget.system_fallback(
+        f"its {model_size_bytes / 1024**3:.2f}GB of weights don't fit {memory.pool}'s "
+        f"{memory.budget_bytes / 1024**3:.2f}GB of usable VRAM, so llama.cpp will run part of it on "
+        "the CPU -- sized against free system memory instead, and expect it to be slow"
+    )
 
 
 def _kv_cache_bytes_per_token(profile: ModelProfile, cache_type_k: str, cache_type_v: str) -> float:
@@ -340,7 +374,7 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
         )
     }
 
-    if profile.total_memory_gb is None:
+    if profile.total_memory_gb is None and (profile.memory is None or profile.memory.budget_bytes is None):
         tuning["ctx_size"] = (
             "could not measure total system memory on this platform -- sized to the model's own "
             f"trained context ({profile.n_ctx_train}) with no memory-budget check"
@@ -358,11 +392,21 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
             ) if too_narrow else None,
         )
 
-    # Budgeted against TOTAL installed RAM (a stable hardware fact), not a live "available now"
-    # reading -- see module docstring. The model's own resident weight footprint comes out of the
-    # same budget before anything is left for KV cache, since router mode may hold this model
-    # loaded for a long time regardless of what else the box is doing at sizing time.
-    total_budget_bytes = profile.total_memory_gb * (1024**3) * _MEMORY_BUDGET_FRACTION
+    # The model's own weights come out of the same pool before anything is left for KV cache.
+    if profile.memory is not None and profile.memory.budget_bytes is not None:
+        total_budget_bytes = profile.memory.budget_bytes
+        budget_desc = profile.memory.describe()
+        tuning["memory"] = profile.memory.reason
+    else:
+        total_budget_bytes = profile.total_memory_gb * (1024**3) * _MEMORY_BUDGET_FRACTION
+        budget_desc = (
+            f"{profile.total_memory_gb:.2f}GB total system memory, "
+            f"{int(_MEMORY_BUDGET_FRACTION * 100)}% budgeted"
+        )
+        tuning["memory"] = (
+            "couldn't measure the free memory of the device the model will run on, so sized "
+            "against a share of total system RAM"
+        )
     kv_budget_bytes = total_budget_bytes - profile.model_size_bytes
 
     def max_ctx_for(cache_type_k: str, cache_type_v: str) -> int:
@@ -430,9 +474,7 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
                 f"{MIN_SERVABLE_CTX_TOKENS} a single turn needs"
             )
         else:
-            headroom_gb = (
-                profile.total_memory_gb * _MEMORY_BUDGET_FRACTION - model_size_gb
-            )
+            headroom_gb = total_budget_bytes / (1024**3) - model_size_gb
             shortfall = (
                 f"its {model_size_gb:.2f}GB of weights leave {headroom_gb:.2f}GB"
                 if headroom_gb >= 0
@@ -440,7 +482,7 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
             )
             rejection_code = REJECT_NO_ROOM_FOR_CONTEXT
             rejection = (
-                f"this device has {profile.total_memory_gb:.2f}GB of memory and "
+                f"this device has {budget_desc} and "
                 f"{shortfall} for a KV cache -- enough for about {max(fitted_ctx, 0)} tokens of "
                 f"context, where one turn needs {MIN_SERVABLE_CTX_TOKENS}"
             )
@@ -451,15 +493,13 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
         tuning["ctx_size"] = (
             f"memory budget only supports ~{max(ctx, 0)} tokens of context after the model's own "
             f"{model_size_gb:.2f}GB, below the {_MIN_CTX_SIZE} floor -- using the floor anyway rather "
-            f"than handing back something too small to be useful ({profile.total_memory_gb:.2f}GB total, "
-            f"{int(_MEMORY_BUDGET_FRACTION * 100)}% budgeted)"
+            f"than handing back something too small to be useful ({budget_desc})"
         )
         ctx = _MIN_CTX_SIZE
     else:
         tuning["ctx_size"] = (
             f"largest context fitting the memory budget after the model's own {model_size_gb:.2f}GB "
-            f"({profile.total_memory_gb:.2f}GB total, {int(_MEMORY_BUDGET_FRACTION * 100)}% budgeted), "
-            f"capped at the model's trained context ({profile.n_ctx_train})"
+            f"({budget_desc}), capped at the model's trained context ({profile.n_ctx_train})"
         )
 
     return SizingResult(

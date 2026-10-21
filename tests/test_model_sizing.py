@@ -8,8 +8,10 @@ not a mock that just returns what the test expects to see.
 
 from __future__ import annotations
 
+import os
 import socket
 import stat
+import sys
 import subprocess
 import textwrap
 from pathlib import Path
@@ -60,7 +62,18 @@ FAKE_SERVER_SCRIPT = textwrap.dedent(
     parser.add_argument("--n-embd-k-gqa", default="1024")
     parser.add_argument("--n-embd-v-gqa", default="1024")
     parser.add_argument("--file-size", default="1.92 GiB")
+    parser.add_argument("--list-devices", action="store_true")
     args = parser.parse_args()
+
+    if args.list_devices:
+        # The real format (common/arg.cpp's common_print_available_devices). FAKE_DEVICES is
+        # substituted per test: a GPU line, or nothing for a CPU-only build.
+        print("Available devices:")
+        for line in FAKE_DEVICES:
+            print("  " + line)
+        if not FAKE_DEVICES:
+            print("  (none)")
+        sys.exit(0)
 
     if args.fail:
         print("error: could not resolve repo/quant", file=sys.stderr)
@@ -110,12 +123,29 @@ FAKE_SERVER_SCRIPT = textwrap.dedent(
 )
 
 
+def _write_fake_server(path: Path, devices: list[str], script: str = FAKE_SERVER_SCRIPT) -> Path:
+    """A runnable fake llama-server. On POSIX the script itself (shebang); on Windows, which can't
+    execute a shebang script, a `.cmd` launcher beside it that runs it with this interpreter --
+    without that, every test here that spawns the fake failed on Windows."""
+    path.write_text(script.replace("import time\n", f"import time\nFAKE_DEVICES = {devices!r}\n", 1), encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    if os.name == "nt":
+        launcher = path.with_name(path.name + ".cmd")
+        launcher.write_text(f'@"{sys.executable}" "{path}" %*\r\n', encoding="utf-8")
+        return launcher
+    return path
+
+
 @pytest.fixture
 def fake_server_binary(tmp_path: Path) -> Path:
-    script = tmp_path / "fake-llama-server"
-    script.write_text(FAKE_SERVER_SCRIPT, encoding="utf-8")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return script
+    """A CPU-only build by default (no devices), so these tests size against system memory."""
+    return _write_fake_server(tmp_path / "fake-llama-server", [])
+
+
+@pytest.fixture(autouse=True)
+def _known_system_memory(monkeypatch):
+    """Free/total system memory are a fact about the machine running the suite; pin them."""
+    monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (3 * 1024**3, 4 * 1024**3))
 
 
 def _port_is_open(host: str, port: int) -> bool:
@@ -179,16 +209,26 @@ class TestProbeModelProfile:
 
         monkeypatch.setattr(model_sizing.subprocess, "Popen", _capture_popen)
         probe_model_profile(fake_server_binary, model_hf="org/model:Q4_K_M")
-        assert seen_cmds and "--verbose" in seen_cmds[0]
+        # Only the probe itself: the device listing and anything the stdlib spawns (Windows'
+        # platform module runs `ver`) are other commands.
+        probes = [c for c in seen_cmds if isinstance(c, list) and "--port" in c]
+        assert probes and "--verbose" in probes[0]
 
     def test_returns_a_profile_parsed_from_the_real_server_output(self, fake_server_binary, monkeypatch):
         monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
         profile = probe_model_profile(fake_server_binary, model_hf="org/model:Q4_K_M")
+        assert profile.memory is not None and profile.memory.kind == "system"
         assert profile == ModelProfile(
             n_ctx_train=131072, n_layer=28, n_embd_head_k=128, n_embd_k_gqa=1024, n_embd_v_gqa=1024,
-            model_size_bytes=int(1.92 * 1024**3), total_memory_gb=3.5,
+            model_size_bytes=int(1.92 * 1024**3), total_memory_gb=3.5, memory=profile.memory,
         )
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the Windows fake is a .cmd launcher; terminating it ends cmd.exe, not the Python "
+        "server behind it. The real llama-server.exe is a single process, so this harness limit "
+        "says nothing about the product.",
+    )
     def test_terminates_the_probe_process_rather_than_leaving_it_running(self, fake_server_binary, monkeypatch):
         monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
         port_holder: list[int] = []
@@ -268,12 +308,9 @@ class TestProbeModelProfile:
         # reproduction of "the server started but its log doesn't have what we need" is a fake
         # binary that never prints the hparam lines at all.
         script = tmp_path / "fake-llama-server-no-hparams"
-        script.write_text(
-            FAKE_SERVER_SCRIPT.replace('parser.add_argument("--omit-hparams", action="store_true")',
-                                        'parser.add_argument("--omit-hparams", action="store_true", default=True)'),
-            encoding="utf-8",
-        )
-        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        script = _write_fake_server(script, [], FAKE_SERVER_SCRIPT.replace(
+            'parser.add_argument("--omit-hparams", action="store_true")',
+            'parser.add_argument("--omit-hparams", action="store_true", default=True)'))
         monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
         with pytest.raises(ModelSizingError, match="n_ctx_train"):
             probe_model_profile(script, model_hf="org/model:Q4_K_M")
@@ -470,11 +507,7 @@ class TestEnsurePreset:
 
     def test_omits_cache_type_keys_when_the_architecture_cannot_use_them(self, tmp_path, monkeypatch):
         script = tmp_path / "fake-llama-server-odd-head-dim"
-        script.write_text(
-            FAKE_SERVER_SCRIPT.replace('default="128"', 'default="80"'),
-            encoding="utf-8",
-        )
-        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        script = _write_fake_server(script, [], FAKE_SERVER_SCRIPT.replace('default="128"', 'default="80"'))
         monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.0)
         presets_path = tmp_path / "presets.ini"
 
@@ -483,3 +516,136 @@ class TestEnsurePreset:
         text = presets_path.read_text(encoding="utf-8")
         assert "cache-type-k" not in text
         assert "cache-type-v" not in text
+
+
+GTX_1660_TI = "CUDA0: NVIDIA GeForce GTX 1660 Ti (6143 MiB, 5130 MiB free)"  # verbatim, b10989 on Windows
+
+
+class TestMemoryPool:
+    """Which memory a model is sized against. The bug this pins: a 16GB Windows box with a 6GB
+    GTX 1660 Ti sized Qwen3.5-4B (2.54GB of weights) to its full 262,144-token context against
+    80% of system RAM; llama.cpp then moved most layers to the CPU to fit the KV cache and
+    generation ran at ~4 tok/s."""
+
+    @pytest.fixture(autouse=True)
+    def _windows_x64(self, monkeypatch):
+        """The GTX 1660 Ti box. Tests about other hosts override this; without it the suite's own
+        host would decide (linux-arm64 CUDA reads as a Jetson)."""
+        monkeypatch.setattr(model_sizing, "detect_os", lambda: "windows")
+        monkeypatch.setattr(model_sizing, "detect_arch", lambda: "x64")
+
+    def _qwen35_4b(self, memory, total_gb=15.96):
+        return ModelProfile(
+            n_ctx_train=262144, n_layer=32, n_embd_head_k=256, n_embd_k_gqa=1024, n_embd_v_gqa=1024,
+            model_size_bytes=int(2.54 * 1024**3), total_memory_gb=total_gb, memory=memory,
+        )
+
+    def test_a_discrete_gpu_is_sized_to_its_free_vram_not_system_ram(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (12 * 1024**3, 16 * 1024**3))
+        server = _write_fake_server(tmp_path / "srv", [GTX_1660_TI])
+        budget = model_sizing._detect_memory(server)
+        assert budget.kind == "vram" and budget.free_bytes == 5130 * 1024**2
+        sized = compute_sizing(self._qwen35_4b(budget))
+        assert sized.ctx_size < 262144
+        # weights + KV cache must fit what's free on the card, less the margin
+        kv = model_sizing._kv_cache_bytes_per_token(self._qwen35_4b(budget), sized.cache_type_k, sized.cache_type_v)
+        assert int(2.54 * 1024**3) + kv * sized.ctx_size <= budget.budget_bytes
+        assert "VRAM" in sized.tuning["memory"] and "CUDA0" in sized.tuning["ctx_size"]
+
+    def test_the_same_model_on_a_cpu_build_is_sized_to_free_system_memory(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (12 * 1024**3, 16 * 1024**3))
+        budget = model_sizing._detect_memory(_write_fake_server(tmp_path / "srv", []))
+        assert budget.kind == "system" and budget.free_bytes == 12 * 1024**3
+        gpu = compute_sizing(self._qwen35_4b(model_sizing._detect_memory(_write_fake_server(tmp_path / "g", [GTX_1660_TI]))))
+        assert compute_sizing(self._qwen35_4b(budget)).ctx_size > gpu.ctx_size
+
+    def test_free_memory_is_used_not_total(self, tmp_path, monkeypatch):
+        """Same card, more of it already in use: a smaller context."""
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (12 * 1024**3, 16 * 1024**3))
+        idle = model_sizing._detect_memory(_write_fake_server(tmp_path / "a", [GTX_1660_TI]))
+        busy = model_sizing._detect_memory(_write_fake_server(
+            tmp_path / "b", ["CUDA0: NVIDIA GeForce GTX 1660 Ti (6143 MiB, 4500 MiB free)"]))
+        assert compute_sizing(self._qwen35_4b(busy)).ctx_size < compute_sizing(self._qwen35_4b(idle)).ctx_size
+
+    def test_a_jetson_sizes_against_free_shared_memory(self, tmp_path, monkeypatch):
+        """CUDA on linux-arm64 is a Tegra board: the GPU's memory IS system memory, so free system
+        memory is the pool, whatever cudaMemGetInfo-style number the device line shows."""
+        monkeypatch.setattr(model_sizing, "detect_os", lambda: "linux")
+        monkeypatch.setattr(model_sizing, "detect_arch", lambda: "arm64")
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (9 * 1024**3, 15 * 1024**3))
+        budget = model_sizing._detect_memory(_write_fake_server(
+            tmp_path / "srv", ["CUDA0: Orin (15511 MiB, 8000 MiB free)"]))
+        assert budget.kind == "unified"
+        assert budget.free_bytes == 9 * 1024**3 and budget.total_bytes == 15 * 1024**3
+        assert "shares system memory" in budget.reason
+
+    def test_an_integrated_gpu_reporting_most_of_system_ram_is_unified(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(model_sizing, "detect_os", lambda: "windows")
+        monkeypatch.setattr(model_sizing, "detect_arch", lambda: "x64")
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (20 * 1024**3, 32 * 1024**3))
+        budget = model_sizing._detect_memory(_write_fake_server(
+            tmp_path / "srv", ["Vulkan0: AMD Radeon 780M Graphics (31000 MiB, 28000 MiB free)"]))
+        assert budget.kind == "unified" and budget.free_bytes == 20 * 1024**3
+
+    def test_apple_silicon_metal_is_unified(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(model_sizing, "detect_os", lambda: "macos")
+        monkeypatch.setattr(model_sizing, "detect_arch", lambda: "arm64")
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (40 * 1024**3, 64 * 1024**3))
+        budget = model_sizing._detect_memory(_write_fake_server(
+            tmp_path / "srv", ["MTL0: Apple M5 Pro (49152 MiB, 49151 MiB free)"]))
+        assert budget.kind == "unified" and budget.free_bytes == 40 * 1024**3
+
+    def test_weights_too_big_for_vram_are_sized_against_system_memory_instead(self, tmp_path, monkeypatch):
+        """A 9GB model on a 6GB card still runs (llama.cpp keeps the rest on the CPU), so VRAM
+        mustn't reject it -- it's sized against system memory, and the reason says it'll be slow."""
+        monkeypatch.setattr(model_sizing.memory_budget, "system_memory_bytes", lambda: (12 * 1024**3, 16 * 1024**3))
+        vram = model_sizing._detect_memory(_write_fake_server(tmp_path / "srv", [GTX_1660_TI]))
+        spilled = model_sizing._spill_if_weights_exceed(vram, 9 * 1024**3)
+        assert spilled.kind == "system" and "slow" in spilled.reason
+        assert model_sizing._spill_if_weights_exceed(vram, 2 * 1024**3) is vram
+
+    def test_an_unmeasurable_pool_falls_back_to_the_total_ram_estimate(self):
+        sized = compute_sizing(self._qwen35_4b(None))
+        assert "total system RAM" in sized.tuning["memory"] and "80% budgeted" in sized.tuning["ctx_size"]
+
+    def test_the_margin_is_llama_cpps_1gib_or_10_percent(self):
+        from aipotluck.installer.memory_budget import MemoryBudget
+        small = MemoryBudget("vram", "x", 5 * 1024**3, 6 * 1024**3, "")
+        big = MemoryBudget("unified", "x", 40 * 1024**3, 64 * 1024**3, "")
+        assert small.margin_bytes == 1024**3
+        assert big.margin_bytes == int(6.4 * 1024**3)
+
+
+class TestListDevices:
+    def test_parses_llama_cpps_own_output(self, tmp_path):
+        from aipotluck.installer import memory_budget
+        devs = memory_budget.list_devices(_write_fake_server(
+            tmp_path / "srv", [GTX_1660_TI, "Vulkan1: Intel(R) UHD Graphics 770 (16000 MiB, 15000 MiB free)"]))
+        assert [(d.name, d.backend, d.total_bytes // 1024**2, d.free_bytes // 1024**2) for d in devs] == [
+            ("CUDA0", "cuda", 6143, 5130), ("Vulkan1", "vulkan", 16000, 15000)]
+        assert devs[0].description == "NVIDIA GeForce GTX 1660 Ti"
+
+    def test_a_cpu_only_build_has_no_devices(self, tmp_path):
+        from aipotluck.installer import memory_budget
+        assert memory_budget.list_devices(_write_fake_server(tmp_path / "srv", [])) == []
+
+    def test_a_binary_that_cant_run_is_unknown_not_cpu(self, tmp_path):
+        from aipotluck.installer import memory_budget
+        assert memory_budget.list_devices(tmp_path / "missing") is None
+
+
+class TestSystemMemory:
+    def test_free_system_memory_is_available_not_total(self, monkeypatch):
+        from aipotluck.installer import memory_budget, source_build
+        monkeypatch.undo()  # the module-wide pin replaces exactly the function under test here
+        monkeypatch.setattr(source_build, "_available_memory_gb", lambda: 5.0)
+        monkeypatch.setattr(source_build, "_total_memory_gb", lambda: 16.0)
+        monkeypatch.setattr(memory_budget.os, "name", "posix")
+        monkeypatch.setattr(memory_budget.Path, "exists", lambda self: str(self) == "/proc/meminfo" or False)
+        assert memory_budget.system_memory_bytes() == (5 * 1024**3, 16 * 1024**3)
+
+    def test_the_real_hosts_reading_is_sane(self, monkeypatch):
+        from aipotluck.installer import memory_budget
+        monkeypatch.undo()
+        avail, total = memory_budget.system_memory_bytes()
+        assert total and avail and 0 < avail <= total
