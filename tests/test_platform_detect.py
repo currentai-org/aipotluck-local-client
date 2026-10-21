@@ -58,8 +58,44 @@ class TestDetectGpuBackend:
     def test_intel_mac_stays_cpu(self):
         assert pd.detect_gpu_backend("macos", "x64", "auto") == "cpu"
 
-    def test_windows_is_always_cpu_for_now(self):
-        assert pd.detect_gpu_backend("windows", "x64", "auto") == "cpu"
+    @pytest.mark.parametrize(
+        ("driver_cuda", "vulkan_gpu", "expected"),
+        [
+            ("12.8", True, "cuda"),     # driver newer than the 12.4 build: CUDA
+            ("12.4", True, "cuda"),     # exactly the build's version is enough
+            ("12.2", True, "vulkan"),   # NVIDIA driver too old for the build: Vulkan, not a broken CUDA
+            ("11.8", False, "cpu"),
+            (None, True, "vulkan"),     # AMD/Intel GPU, or NVIDIA with no nvidia-smi
+            (None, False, "cpu"),       # VM, remote session, basic display driver
+        ],
+    )
+    def test_windows_picks_cuda_then_vulkan_then_cpu(self, monkeypatch, driver_cuda, vulkan_gpu, expected):
+        monkeypatch.setattr(pd, "windows_cuda_build_version", lambda: "12.4")
+        monkeypatch.setattr(pd, "detect_driver_cuda_version", lambda: driver_cuda)
+        monkeypatch.setattr(pd, "detect_windows_vulkan_gpu", lambda: vulkan_gpu)
+        assert pd.detect_gpu_backend("windows", "x64", "auto") == expected
+
+    def test_windows_never_picks_cuda_when_no_cuda_build_is_pinned(self, monkeypatch):
+        monkeypatch.setattr(pd, "windows_cuda_build_version", lambda: None)
+        monkeypatch.setattr(pd, "detect_driver_cuda_version", lambda: "13.0")
+        monkeypatch.setattr(pd, "detect_windows_vulkan_gpu", lambda: True)
+        assert pd.detect_gpu_backend("windows", "x64", "auto") == "vulkan"
+
+    def test_windows_arm64_stays_cpu(self, monkeypatch):
+        # Only x64 GPU builds are pinned; an arm64 machine must not be steered at one.
+        monkeypatch.setattr(pd, "detect_driver_cuda_version", lambda: "13.0")
+        monkeypatch.setattr(pd, "detect_windows_vulkan_gpu", lambda: True)
+        assert pd.detect_gpu_backend("windows", "arm64", "auto") == "cpu"
+
+    def test_windows_override_is_never_second_guessed(self, monkeypatch):
+        monkeypatch.setattr(pd, "detect_driver_cuda_version", lambda: None)
+        monkeypatch.setattr(pd, "detect_windows_vulkan_gpu", lambda: False)
+        for forced in ("cuda", "vulkan", "cpu"):
+            assert pd.detect_gpu_backend("windows", "x64", forced) == forced
+
+    def test_the_pinned_windows_cuda_build_records_its_cuda_version(self):
+        # The auto-detect compares against this; without it Windows would never pick CUDA.
+        assert pd.windows_cuda_build_version() == "12.4"
 
     def test_linux_detects_nvidia(self, monkeypatch):
         monkeypatch.setattr(pd, "_has_cmd", lambda name: name == "nvidia-smi")
@@ -184,3 +220,69 @@ class TestDetectHostProfile:
     def test_asset_key_property(self):
         profile = pd.HostProfile(os_name="linux", arch="arm64", backend="cuda")
         assert profile.asset_key == "linux-arm64-cuda"
+
+
+class TestDriverCudaVersion:
+    BANNER = """
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 581.57                 Driver Version: 581.57         CUDA Version: 13.0     |
+|-----------------------------------------+------------------------+----------------------+
+"""
+
+    def test_reads_the_cuda_version_from_nvidia_smis_banner(self, monkeypatch):
+        monkeypatch.setattr(pd, "_has_cmd", lambda name: True)
+        monkeypatch.setattr(
+            pd.subprocess, "run",
+            lambda *a, **k: pd.subprocess.CompletedProcess(a, 0, stdout=self.BANNER, stderr=""),
+        )
+        assert pd.detect_driver_cuda_version() == "13.0"
+
+    def test_none_without_nvidia_smi_or_when_it_fails(self, monkeypatch):
+        monkeypatch.setattr(pd, "_has_cmd", lambda name: False)
+        assert pd.detect_driver_cuda_version() is None
+        monkeypatch.setattr(pd, "_has_cmd", lambda name: True)
+        monkeypatch.setattr(
+            pd.subprocess, "run",
+            lambda *a, **k: pd.subprocess.CompletedProcess(a, 9, stdout="NVIDIA-SMI has failed", stderr=""),
+        )
+        assert pd.detect_driver_cuda_version() is None
+
+    def test_a_two_digit_minor_version_counts_as_newer(self, monkeypatch):
+        # "12.10" < "12.4" as text; a driver reporting CUDA 12.10 must still get the 12.4 build.
+        monkeypatch.setattr(pd, "windows_cuda_build_version", lambda: "12.4")
+        monkeypatch.setattr(pd, "detect_driver_cuda_version", lambda: "12.10")
+        monkeypatch.setattr(pd, "detect_windows_vulkan_gpu", lambda: True)
+        assert pd.detect_gpu_backend("windows", "x64", "auto") == "cuda"
+
+    def test_versions_compare_numerically_not_as_text(self):
+        assert pd._version_tuple("12.10") > pd._version_tuple("12.4")
+        assert pd._version_tuple("13.0") > pd._version_tuple("12.9")
+
+
+class TestWindowsVulkanGpu:
+    def test_a_real_gpu_with_the_vulkan_loader(self, monkeypatch, tmp_path):
+        (tmp_path / "System32").mkdir()
+        (tmp_path / "System32" / "vulkan-1.dll").write_bytes(b"")
+        monkeypatch.setenv("SystemRoot", str(tmp_path))
+        monkeypatch.setattr(pd, "windows_display_adapters", lambda: ["Microsoft Basic Display Adapter", "AMD Radeon RX 7600"])
+        assert pd.detect_windows_vulkan_gpu() is True
+
+    def test_only_microsofts_basic_or_remote_display_is_not_a_gpu(self, monkeypatch, tmp_path):
+        (tmp_path / "System32").mkdir()
+        (tmp_path / "System32" / "vulkan-1.dll").write_bytes(b"")
+        monkeypatch.setenv("SystemRoot", str(tmp_path))
+        monkeypatch.setattr(pd, "windows_display_adapters", lambda: ["Microsoft Basic Display Adapter", "Microsoft Remote Display Adapter"])
+        assert pd.detect_windows_vulkan_gpu() is False
+
+    def test_no_vulkan_loader_means_no_vulkan(self, monkeypatch, tmp_path):
+        (tmp_path / "System32").mkdir()
+        monkeypatch.setenv("SystemRoot", str(tmp_path))
+        monkeypatch.setattr(pd, "windows_display_adapters", lambda: ["NVIDIA GeForce GTX 1660 Ti"])
+        assert pd.detect_windows_vulkan_gpu() is False
+
+    @pytest.mark.skipif(not hasattr(__import__("ctypes"), "WinDLL"), reason="Windows only")
+    def test_the_real_adapter_list_is_readable_on_windows(self):
+        # Run over SSH in this project's Windows checks, i.e. outside any interactive desktop:
+        # exactly where a display-device API call comes back empty.
+        names = pd.windows_display_adapters()
+        assert names and all(isinstance(n, str) and n for n in names)

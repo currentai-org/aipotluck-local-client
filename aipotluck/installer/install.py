@@ -287,6 +287,7 @@ def run_install(args: argparse.Namespace) -> int:
 
         archive_path = fetch.download_asset(manifest, asset_entry, lay.state_dir / "downloads")
         llama_dir = fetch.extract_archive(archive_path, lay.install_root / "llama.cpp", manifest["tag"], asset_key)
+        fetch.fetch_companions(manifest, asset_entry, lay.state_dir / "downloads", llama_dir)
 
         server_bin = fetch.find_binary(llama_dir, "llama-server")
 
@@ -367,21 +368,35 @@ def run_install(args: argparse.Namespace) -> int:
         log.error("%s", exc)
         raise
     log.info("Using Python interpreter for service: %s", python_exe)
-    service_mgr.install(
-        SERVICE_NAME,
-        exec_path=python_exe,
-        args=[str(service_script)] + service_args,
-        system_scope=args.system,
-        working_dir=REPO_ROOT,
-        log_dir=lay.log_dir,
-    )
-    log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
+    service_installed = True
+    try:
+        service_mgr.install(
+            SERVICE_NAME,
+            exec_path=python_exe,
+            args=[str(service_script)] + service_args,
+            system_scope=args.system,
+            working_dir=REPO_ROOT,
+            log_dir=lay.log_dir,
+        )
+        log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
+    except RuntimeError as exc:
+        # Everything else (llama.cpp, the model, runtime.json, the CLI) is in place and usable;
+        # only the OS service is missing, and the summary below says so. Logged as an error, not
+        # dropped: before this, a failed Windows registration was silently reported as installed.
+        service_installed = False
+        log.error("%s", exc)
 
     shim_path = install_cli_shim(profile, python_exe, args.system)
 
-    if not args.no_start:
-        service_mgr.start(SERVICE_NAME, system_scope=args.system)
-        log.info("Started %s service", SERVICE_NAME)
+    if service_installed and not args.no_start:
+        try:
+            service_mgr.start(SERVICE_NAME, system_scope=args.system)
+            log.info("Started %s service", SERVICE_NAME)
+        except RuntimeError as exc:
+            # Registered but not running now (Windows: the logon task can't be started from a
+            # session with no desktop). It will start at the next sign-in; the summary below shows
+            # its real state rather than a "Started" that didn't happen.
+            log.warning("%s", exc)
 
     status = service_mgr.status(SERVICE_NAME, system_scope=args.system)
     _print_summary(profile, lay, runtime_config, service_status=status, shim_path=shim_path)

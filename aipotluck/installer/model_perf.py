@@ -66,6 +66,8 @@ import logging
 import math
 import os
 import subprocess
+
+from aipotluck.proc import NO_WINDOW
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -293,7 +295,7 @@ def run_bench_raw(bench_binary: Path, model_id: str, args: list[str], *, timeout
     try:
         # errors="replace": llama.cpp can emit half-written UTF-8 characters when it truncates long metadata strings (see model_sizing.probe_model_profile), and a decode error here would lose a measurement over mojibake in a log line nothing parses.
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, **NO_WINDOW
         )
     except subprocess.TimeoutExpired as exc:
         raise ModelPerfError(f"llama-bench timed out after {timeout:.0f}s") from exc
@@ -362,7 +364,7 @@ def run_bench_point(
     try:
         # errors="replace" -- same reason as run_bench_raw above.
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, errors="replace", timeout=timeout
+            cmd, capture_output=True, text=True, errors="replace", timeout=timeout, **NO_WINDOW
         )
     except subprocess.TimeoutExpired as exc:
         raise ModelPerfError(f"llama-bench timed out after {timeout:.0f}s at depth {depth}") from exc

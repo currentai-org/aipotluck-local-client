@@ -170,6 +170,23 @@ class TestBackfillMissingPresets:
         runner.backfill_missing_presets({"server_binary": "/fake/llama-server", "presets_path": "/cfg/presets.ini"})
         assert sized == ["org/good:Q8"]
 
+    def test_resizes_presets_written_before_sizing_knew_the_memory_pool_once(self, tmp_path, monkeypatch):
+        """A preset sized against total system RAM (tuning record with no "memory" reason) is
+        re-sized, forced, on the next start; one sized by the new policy and one written by hand
+        (no tuning record) are left alone."""
+        presets = tmp_path / "presets.ini"
+        for m in ("org/old:Q4", "org/new:Q4", "org/hand:Q4"):
+            runner.model_presets.write_preset(presets, m, {"ctx-size": "262144"})
+        runner.model_presets.write_tuning(presets, "org/old:Q4", {"ctx_size": "80% of total RAM"})
+        runner.model_presets.write_tuning(presets, "org/new:Q4", {"ctx_size": "x", "memory": "VRAM"})
+        monkeypatch.setattr(runner.model_pull, "list_cached_models", lambda *a, **kw: ["org/old:Q4", "org/new:Q4", "org/hand:Q4"])
+        monkeypatch.setattr(runner.model_perf_live, "free_router_memory", lambda url: None)
+        monkeypatch.setattr(runner.model_ops, "reload_router", lambda cfg: True)
+        calls = []
+        monkeypatch.setattr(runner.model_sizing, "ensure_preset", lambda *a, **kw: calls.append((kw["model_hf"], kw["force"])))
+        runner.backfill_missing_presets({"server_binary": "/fake/llama-server", "presets_path": str(presets)})
+        assert calls == [("org/old:Q4", True)]
+
     def test_list_cached_models_failure_is_a_no_op_not_a_crash(self, monkeypatch):
         def raise_pull_error(*a, **kw):
             raise runner.model_pull.ModelPullError("no server binary")

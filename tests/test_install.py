@@ -570,6 +570,29 @@ class TestRunInstallWithService:
 
         mgr.start.assert_not_called()
 
+    def test_a_failed_service_registration_is_reported_and_never_started_but_the_install_still_completes(
+        self, tmp_path, fake_fetch, monkeypatch, caplog
+    ):
+        """A service manager that can't register (Windows' Task Scheduler refusing an SSH logon)
+        must not be reported as installed, nor 'started'; llama.cpp, runtime.json and the CLI shim
+        are still usable, and the hosted fallback (the GUI) can run the service itself."""
+        mgr = self._fake_service_manager(monkeypatch)
+        mgr.install.side_effect = RuntimeError("Couldn't register the AIPotluck_aipotluck Scheduled Task: ERROR: Access is denied.")
+        mgr.status.return_value = ServiceStatus(ServiceState.NOT_INSTALLED, detail="not found")
+        monkeypatch.setattr(install, "ensure_python", lambda: Path("/usr/bin/python3"))
+        shim = MagicMock(return_value=Path("/fake/bin/aipotluck-local-client"))
+        monkeypatch.setattr(install, "install_cli_shim", shim)
+        args = make_args(tmp_path / "install")
+
+        with caplog.at_level("INFO"):
+            rc = install.run_install(args)
+
+        assert rc == 0
+        mgr.start.assert_not_called()
+        shim.assert_called_once()
+        assert any(r.levelname == "ERROR" and "Access is denied" in r.getMessage() for r in caplog.records)
+        assert not any("Installed aipotluck service" in r.getMessage() for r in caplog.records)
+
     def test_summary_shows_shim_path_and_login_command(self, tmp_path, fake_fetch, monkeypatch, capsys):
         self._fake_service_manager(monkeypatch)
         monkeypatch.setattr(install, "ensure_python", lambda: Path("/usr/bin/python3"))
@@ -664,3 +687,46 @@ class TestRunInstallDefaultModelSizing:
 
         assert rc == 0
         assert any("Could not pre-fetch/size" in rec.message for rec in caplog.records)
+
+
+class TestServiceLoggingUnderPythonw:
+    def test_logging_setup_survives_having_no_stdout(self, tmp_path, monkeypatch):
+        """pythonw.exe (how the Windows logon task starts the service, so no console window opens)
+        gives the process no stdout: sys.stdout is None. Logging setup must still work, to the file."""
+        import logging
+        import sys as _sys
+
+        from aipotluck.service import aipotluck_service
+
+        monkeypatch.setattr(_sys, "stdout", None)
+        # Under pythonw stderr is None too, so a StreamHandler(None) -- which quietly falls back to
+        # sys.stderr -- breaks the first time it writes. Reproduce both.
+        monkeypatch.setattr(_sys, "stderr", None)
+        root = logging.getLogger()
+        saved = root.handlers[:]
+        root.handlers = []
+        try:
+            aipotluck_service.setup_logging(tmp_path)
+            assert all(getattr(h, "stream", True) is not None for h in root.handlers), \
+                "a console handler with no console was installed"
+            logging.getLogger("aipotluck.test").info("hello from pythonw")
+            for h in root.handlers:
+                h.flush()
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers = saved
+        assert "hello from pythonw" in (tmp_path / "aipotluck.log").read_text()
+
+
+class TestRunInstallCompanions:
+    def test_the_installer_fetches_the_assets_companions_into_the_llama_dir(self, tmp_path, fake_fetch, monkeypatch):
+        """Windows CUDA's cudart zip has to be unpacked beside llama-server by the install itself,
+        not just be listed in the manifest -- otherwise the CUDA build runs on the CPU."""
+        calls = []
+        monkeypatch.setattr(
+            install.fetch, "fetch_companions",
+            lambda manifest, entry, downloads, llama_dir: calls.append((entry["file"], llama_dir)),
+        )
+        assert install.run_install(make_args(tmp_path / "inst", ["--no-service"])) == 0
+        assert calls == [("llama-x.tar.gz", fake_fetch.parent)]

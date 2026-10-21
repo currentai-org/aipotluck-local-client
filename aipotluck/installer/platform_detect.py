@@ -8,10 +8,18 @@ OSes raise UnsupportedPlatformError with a clear message.
 
 from __future__ import annotations
 
+import json
+import os
 import platform
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
+
+from aipotluck.proc import NO_WINDOW
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class UnsupportedPlatformError(RuntimeError):
@@ -56,7 +64,7 @@ def _has_cmd(name: str) -> bool:
 def _cmd_ok(args: list[str]) -> bool:
     try:
         result = subprocess.run(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, **NO_WINDOW
         )
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -82,8 +90,16 @@ def detect_gpu_backend(os_name: str, arch: str, requested: str = "auto") -> str:
         return "metal" if arch == "arm64" else "cpu"
 
     if os_name == "windows":
-        # GPU asset variants for Windows are not wired into the manifest
-        # yet (stubbed intentionally per project phase) -- default to CPU.
+        # CUDA only when the NVIDIA driver can run the CUDA version llama.cpp's Windows CUDA build
+        # was compiled for (a driver that's too old fails at load, not at download); otherwise
+        # Vulkan, which every current GPU driver ships, when there's a real GPU; otherwise CPU.
+        if arch == "x64":
+            need = windows_cuda_build_version()
+            have = detect_driver_cuda_version()
+            if need and have and _version_tuple(have) >= _version_tuple(need):
+                return "cuda"
+            if detect_windows_vulkan_gpu():
+                return "vulkan"
         return "cpu"
 
     if os_name == "linux":
@@ -98,6 +114,91 @@ def detect_gpu_backend(os_name: str, arch: str, requested: str = "auto") -> str:
         return "cpu"
 
     return "cpu"
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", v)[:2])
+
+
+def windows_cuda_build_version() -> str | None:
+    """The CUDA version the pinned windows-x64-cuda asset was built with ("12.4"), from
+    llama_version.json -- or None if that asset isn't pinned."""
+    try:
+        manifest = json.loads((_REPO_ROOT / "llama_version.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entry = manifest.get("assets", {}).get("windows-x64-cuda") or {}
+    value = entry.get("cuda_version")
+    return value if isinstance(value, str) else None
+
+
+def detect_driver_cuda_version() -> str | None:
+    """The newest CUDA version the installed NVIDIA driver supports ("12.8"), as nvidia-smi's
+    banner reports it, or None with no NVIDIA driver (or an unreadable one). A CUDA build runs on
+    any driver whose number here is >= the version it was compiled with."""
+    if not _has_cmd("nvidia-smi"):
+        return None
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+            text=True, **NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    m = re.search(r"CUDA Version:\s*(\d+\.\d+)", result.stdout)
+    return m.group(1) if m else None
+
+
+# Adapters Windows lists that are not a GPU anyone could run inference on.
+_NOT_A_GPU = ("microsoft basic display", "microsoft basic render", "microsoft remote display",
+              "microsoft hyper-v video", "citrix", "parsec virtual", "virtual display")
+
+
+_DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+
+def windows_display_adapters() -> list[str]:
+    """Names (DriverDesc) of the display adapters with a driver installed, from the display device
+    class in the registry. Readable by a standard user in any session -- unlike
+    EnumDisplayDevicesW, which sees nothing outside an interactive desktop (an SSH logon, a
+    service), and WMI, which a restricted logon can't use. [] off Windows or if it can't be read."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    names: list[str] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS_KEY) as cls:
+            for i in range(64):
+                try:
+                    sub = winreg.EnumKey(cls, i)
+                except OSError:
+                    break
+                if not sub.isdigit():  # "Properties" and similar aren't devices
+                    continue
+                try:
+                    with winreg.OpenKey(cls, sub) as dev:
+                        desc, _ = winreg.QueryValueEx(dev, "DriverDesc")
+                except OSError:
+                    continue
+                if isinstance(desc, str) and desc and desc not in names:
+                    names.append(desc)
+    except OSError:
+        return []
+    return names
+
+
+def detect_windows_vulkan_gpu() -> bool:
+    """True when this Windows machine has a real GPU and a Vulkan loader (vulkan-1.dll, which
+    NVIDIA, AMD and Intel drivers all install). Doesn't prove the driver's Vulkan works -- nothing
+    short of loading a model does -- but rules out the common no-GPU cases: VMs, remote sessions
+    and servers on Microsoft's basic display driver."""
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    if not (system32 / "vulkan-1.dll").exists():
+        return False
+    return any(not n.lower().startswith(_NOT_A_GPU) for n in windows_display_adapters())
 
 
 def detect_host_profile(requested_backend: str = "auto") -> HostProfile:
@@ -144,7 +245,7 @@ def detect_cuda_compute_capability() -> str | None:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True, **NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

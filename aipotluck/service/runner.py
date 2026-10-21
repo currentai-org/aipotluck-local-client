@@ -160,8 +160,21 @@ def models_missing_presets(llama_cfg: dict) -> list[str]:
     except model_pull.ModelPullError as exc:
         log.warning("Could not list cached models for preset backfill: %s", exc)
         return []
-    known = model_presets.known_model_ids(Path(presets_path_str))
-    return [model_id for model_id in cached if model_id not in known]
+    presets_path = Path(presets_path_str)
+    known = model_presets.known_model_ids(presets_path)
+    return [model_id for model_id in cached if model_id not in known] + [
+        model_id for model_id in cached if model_id in known and _sized_by_old_policy(presets_path, model_id)
+    ]
+
+
+def _sized_by_old_policy(presets_path: Path, model_id: str) -> bool:
+    """A preset this project wrote before sizing knew which memory a model lives in -- its tuning
+    record has no "memory" reason. Those were sized against 80% of total system RAM, which on a
+    discrete GPU means a context far bigger than the card holds (a 4B model at 262k tokens on a
+    6GB card, with most layers pushed to the CPU), so they're re-sized once. A preset with no
+    tuning record at all was written by hand and is never touched."""
+    tuning = model_presets.read_tuning(presets_path).get(model_id)
+    return isinstance(tuning, dict) and "memory" not in tuning
 
 
 def backfill_missing_presets(llama_cfg: dict, *, progress=lambda _message: None) -> dict:
@@ -192,7 +205,9 @@ def backfill_missing_presets(llama_cfg: dict, *, progress=lambda _message: None)
         model_perf_live.free_router_memory(model_ops.base_url(llama_cfg))
         try:
             model_sizing.ensure_preset(
-                server_binary, presets_path, model_id, model_hf=model_id, gpu_layers=llama_cfg.get("gpu_layers")
+                server_binary, presets_path, model_id, model_hf=model_id, gpu_layers=llama_cfg.get("gpu_layers"),
+                # A preset sized by the old policy exists, so only `force` gets it re-sized.
+                force=_sized_by_old_policy(presets_path, model_id),
             )
         except model_sizing.ModelSizingError as exc:
             log.warning("Could not size cached model %r (%s) -- it will use llama-server's own defaults", model_id, exc)

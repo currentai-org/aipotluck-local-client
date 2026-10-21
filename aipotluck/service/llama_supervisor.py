@@ -15,6 +15,8 @@ import http.client
 import json
 import logging
 import subprocess
+
+from aipotluck.proc import NO_WINDOW
 import threading
 import time
 import urllib.error
@@ -157,6 +159,7 @@ class LlamaSupervisor:
             stdout=stdout_target,
             stderr=stderr_target,
             env=self.env,
+            **NO_WINDOW,
         )
         with self._lock:
             self._proc = proc

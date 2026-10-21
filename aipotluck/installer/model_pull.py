@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import TextIO
 
+from aipotluck.proc import NO_WINDOW
 from aipotluck.installer import cache_router
 
 log = logging.getLogger("aipotluck.installer.model_pull")
@@ -109,7 +110,7 @@ def list_cached_models(server_binary: Path) -> list[str]:
             [str(server_binary), "--cache-list"],
             # errors="replace" -- a cached model whose name or metadata decodes badly must not
             # make the whole cache unlistable. See model_sizing.probe_model_profile.
-            capture_output=True, text=True, errors="replace", timeout=LIST_TIMEOUT_SECONDS,
+            capture_output=True, text=True, errors="replace", timeout=LIST_TIMEOUT_SECONDS, **NO_WINDOW,
         )
     except OSError as exc:
         raise ModelPullError(f"Could not run {server_binary} --cache-list: {exc}") from exc

@@ -266,8 +266,8 @@ def _total_memory_gb() -> float | None:
     docstring for why.
 
     Linux reads /proc/meminfo's MemTotal; macOS (no /proc) reads the `hw.memsize` sysctl, in
-    bytes. None when neither is available (Windows today), which model_sizing treats as "no
-    memory budget" rather than guessing one."""
+    bytes; Windows asks the kernel directly (GlobalMemoryStatusEx). None when none of those
+    answers, which model_sizing treats as "no memory budget" rather than guessing one."""
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as fh:
             for line in fh:
@@ -278,7 +278,39 @@ def _total_memory_gb() -> float | None:
         pass
     except (OSError, ValueError, IndexError):
         return None
+    if os.name == "nt":
+        return _windows_total_memory_gb()
     return _sysctl_memsize_gb()
+
+
+def _windows_total_memory_gb() -> float | None:
+    """Total physical RAM on Windows from kernel32's GlobalMemoryStatusEx (ullTotalPhys, bytes).
+    Plain ctypes, so it needs no elevation and no WMI -- WMI refuses a non-interactive (SSH,
+    service) logon on a default install, which is exactly where the background service runs."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+
+    try:
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return status.ullTotalPhys / (1024**3) if status.ullTotalPhys else None
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def _sysctl_memsize_gb() -> float | None:

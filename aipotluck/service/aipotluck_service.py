@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from aipotluck.service.runner import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, AipotluckServiceRunner  # noqa: E402
+from aipotluck.service.win_job import kill_children_with_this_process  # noqa: E402
 
 log = logging.getLogger("aipotluck.service")
 
@@ -51,7 +52,9 @@ def default_config_dir() -> Path:
 
 
 def setup_logging(log_dir: Path | None) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # sys.stdout is None under pythonw.exe (how the Windows logon task starts the service, so no
+    # console window opens): the log file is then the only handler.
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)] if sys.stdout else []
     if log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
@@ -66,6 +69,10 @@ def setup_logging(log_dir: Path | None) -> None:
 
 
 def run_foreground(host: str, port: int, config_dir: Path, log_dir: Path | None) -> None:
+    # Before anything is spawned, so llama-server and newt inherit it (Windows only; a no-op
+    # elsewhere). Without it, any stop on Windows -- schtasks /end, a crash, the GUI closing --
+    # orphans them, because none of those runs the signal handler below.
+    kill_children_with_this_process()
     runner = AipotluckServiceRunner(host, port, config_dir, log_dir)
     runner.start()
 

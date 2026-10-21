@@ -138,6 +138,24 @@ def extract_archive(archive_path: Path, extract_root: Path, tag: str, asset_key:
     return target_dir
 
 
+def fetch_companions(manifest: dict[str, Any], asset_entry: dict[str, Any], downloads_dir: Path,
+                     llama_dir: Path) -> None:
+    """Download, verify and unpack an asset's `companions` into its own directory, next to
+    llama-server. Windows CUDA needs this: llama.cpp publishes the CUDA runtime DLLs (cudart,
+    cuBLAS) as a separate `cudart-...zip` that must sit beside the binaries, and without it the
+    CUDA backend silently fails to load and llama-server runs on the CPU. Idempotent, like
+    extract_archive: each companion leaves its own marker."""
+    for companion in asset_entry.get("companions", []):
+        marker = llama_dir / f".extracted.{companion['file']}.ok"
+        if marker.exists():
+            continue
+        archive = download_asset(manifest, companion, downloads_dir)
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(llama_dir)
+        marker.write_text("ok\n", encoding="utf-8")
+        log.info("Extracted %s into %s", companion["file"], llama_dir)
+
+
 # Directory-name shapes that are leftovers rather than part of an extraction -- a hand-made backup
 # of a previous build parked beside the current one. A stale copy is not harmless: it holds a
 # working `llama-server`, so the install keeps serving while `server_binary` quietly names an older
