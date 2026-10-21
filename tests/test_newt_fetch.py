@@ -27,6 +27,7 @@ MANIFEST = newt_fetch.load_newt_manifest(REPO_ROOT / "newt_version.json")
         ("linux", "arm64", "newt_linux_arm64"),
         ("macos", "arm64", "newt_darwin_arm64"),
         ("macos", "x64", "newt_darwin_amd64"),
+        ("windows", "x64", "newt_windows_amd64.exe"),
     ],
 )
 def test_every_supported_platform_resolves_to_a_verified_newt_so_login_can_pair(os_name, arch, file):
@@ -38,6 +39,8 @@ def test_every_supported_platform_resolves_to_a_verified_newt_so_login_can_pair(
 
 def test_a_placeholder_checksum_is_refused_rather_than_trusted():
     """The fail-closed half of the contract: an unverified entry must stop login, never download
-    an unchecked binary. Windows is still on the placeholder at this pin."""
+    an unchecked binary. No real entry is a placeholder any more, so a synthetic one stands in."""
+    manifest = {**MANIFEST, "assets": {**MANIFEST["assets"], "windows-x64": {
+        "file": "newt_windows_amd64.exe", "sha256": "UNVERIFIED_DOWNLOAD_AND_COMPUTE_BEFORE_USE"}}}
     with pytest.raises(newt_fetch.NewtVersionManifestError, match="never been downloaded/verified"):
-        newt_fetch.resolve_newt_asset(MANIFEST, HostProfile(os_name="windows", arch="x64", backend="cpu"))
+        newt_fetch.resolve_newt_asset(manifest, HostProfile(os_name="windows", arch="x64", backend="cpu"))

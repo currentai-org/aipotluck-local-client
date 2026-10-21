@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned fosrl/newt release (Pangolin's tunnel client, CUR-1266). Bump deliberately, same way llama_version.json is bumped. sha256s computed by us at pin time -- newt's GitHub releases publish no checksums file. UNLIKE llama.cpp, these assets are single raw binaries, not tar.gz/zip archives -- no extraction step, just download + verify + chmod +x. linux-x64/linux-arm64 and macos-arm64/macos-x64 checksums have been downloaded and verified (the macOS pair on a real Apple-silicon Mac, macOS 27, and cross-checked against the digests GitHub publishes for the 1.18.1 assets; newt_darwin_arm64 also run and paired end to end there); the windows entry is the real published filename/URL but its sha256 is a placeholder that MUST be verified (download once, compute sha256, replace) before relying on it -- see aipotluck/installer/newt_fetch.py's own warning on an unverified entry.",
+  "_comment": "Pinned fosrl/newt release (Pangolin's tunnel client, CUR-1266). Bump deliberately, same way llama_version.json is bumped. sha256s computed by us at pin time -- newt's GitHub releases publish no checksums file. UNLIKE llama.cpp, these assets are single raw binaries, not tar.gz/zip archives -- no extraction step, just download + verify + chmod +x. linux-x64/linux-arm64 and macos-arm64/macos-x64 checksums have been downloaded and verified (the macOS pair on a real Apple-silicon Mac, macOS 27, and cross-checked against the digests GitHub publishes for the 1.18.1 assets; newt_darwin_arm64 also run and paired end to end there); windows-x64's checksum was computed from a download on a real Windows 10 22H2 x64 machine (Authenticode signature valid, `--version` 1.18.1) and matches GitHub's published digest. Any future placeholder entry MUST be verified the same way (download once, compute sha256, replace) before relying on it -- see aipotluck/installer/newt_fetch.py's own warning on an unverified entry.",
   "tag": "1.18.1",
   "release_base_url": "https://github.com/fosrl/newt/releases/download",
   "assets": {
@@ -21,7 +21,7 @@
     },
     "windows-x64": {
       "file": "newt_windows_amd64.exe",
-      "sha256": "UNVERIFIED_DOWNLOAD_AND_COMPUTE_BEFORE_USE"
+      "sha256": "21fba75f998e17b31dcf20901c81917291fd45d0853c3d8b47692b13ca470d7c"
     }
   }
 }
