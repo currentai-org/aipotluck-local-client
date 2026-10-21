@@ -43,6 +43,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from aipotluck.proc import NO_WINDOW
 from aipotluck.installer import llama_errors, model_presets
 from aipotluck.installer.source_build import _total_memory_gb
 
@@ -255,7 +256,7 @@ def probe_model_profile(
     # in a tokenizer preview costs nothing, while a crash costs the user the model.
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, errors="replace", bufsize=1,
+        text=True, errors="replace", bufsize=1, **NO_WINDOW,
     )
     lines: list[str] = []
     drain_failures: list[BaseException] = []

@@ -11,6 +11,8 @@ from __future__ import annotations
 import platform
 import shutil
 import subprocess
+
+from aipotluck.proc import NO_WINDOW
 from dataclasses import dataclass
 
 
@@ -56,7 +58,7 @@ def _has_cmd(name: str) -> bool:
 def _cmd_ok(args: list[str]) -> bool:
     try:
         result = subprocess.run(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, **NO_WINDOW
         )
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -144,7 +146,7 @@ def detect_cuda_compute_capability() -> str | None:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True, **NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

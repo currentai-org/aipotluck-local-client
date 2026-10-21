@@ -34,6 +34,8 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+
+from aipotluck.proc import NO_WINDOW
 import threading
 import time
 from dataclasses import dataclass
@@ -248,6 +250,7 @@ class NewtSupervisor:
             stdout=stdout_target,
             stderr=stderr_target,
             env=env,
+            **NO_WINDOW,
         )
         with self._lock:
             self._proc = proc

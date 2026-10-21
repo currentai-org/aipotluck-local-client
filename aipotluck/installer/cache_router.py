@@ -44,6 +44,8 @@ import os
 import queue
 import socket
 import subprocess
+
+from aipotluck.proc import NO_WINDOW
 import tempfile
 import threading
 import time
@@ -136,7 +138,7 @@ def scratch_router(server_binary: Path, *, startup_timeout: float = STARTUP_TIME
         with os.fdopen(log_fd, "wb") as log_file:
             try:
                 proc = subprocess.Popen(
-                    cmd, stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
+                    cmd, stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT, **NO_WINDOW,
                 )
             except OSError as exc:
                 raise CacheRouterError(f"could not start {server_binary}: {exc}") from exc
