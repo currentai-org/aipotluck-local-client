@@ -24,6 +24,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale.
 | NVIDIA Jetson Orin NX 16GB (Developer Kit) | JetPack 6.x / L4T R36.5.0 (Ubuntu 22.04, glibc 2.35) | CUDA (SM 8.7) | our own binary cache (`linux-arm64-cuda-sm87`) -- same cache entry as the Orin Nano above, since both report the same compute capability | confirmed -- cache-hit installs, real GPU-accelerated inference verified |
 | Mac Mini M5 Pro 64GB | MacOS Golden Gate 27.0 | Metal | prebuilt `macox-arm64-metal` asset | confirmed |
 | Macbook Air M1 | MacOS Tahoe 26.6.2 | Metal | prebuilt `macox-arm64-metal` asset | confirmed |
+| Windows GTX 1660 Ti | Windows 10 Pro | CPU | prebuilt `windows-x64-cpu` asset | confirmed |
+| Windows GTX 1660 Ti | Windows 10 Pro | CUDA | prebuilt `windows-x64-cuda` asset | confirmed |
 
 Everything else in "Status" just below is implemented against documented OS
 conventions but not run on real hardware yet.
