@@ -328,8 +328,8 @@ def _kv_cache_bytes_per_token(profile: ModelProfile, cache_type_k: str, cache_ty
 
 def compute_sizing(profile: ModelProfile) -> SizingResult:
     """Picks ctx_size, parallel, and KV cache type from a ModelProfile. Never raises -- if
-    total_memory_gb couldn't be measured (Windows today; _total_memory_gb() reads /proc/meminfo on
-    Linux and the hw.memsize sysctl on macOS), falls back to the model's trained context with no quantization rather than
+    total_memory_gb couldn't be measured (_total_memory_gb() reads /proc/meminfo on Linux, the
+    hw.memsize sysctl on macOS and GlobalMemoryStatusEx on Windows), falls back to the model's trained context with no quantization rather than
     guessing a memory budget that doesn't exist."""
     parallel = 1
     tuning = {

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -221,6 +222,9 @@ class TestTotalMemory:
 
     @staticmethod
     def _fake_sysctl(tmp_path, monkeypatch, body: str) -> Path:
+        if sys.platform == "win32":
+            pytest.skip("the stand-in sysctl is a POSIX shell script")
+        monkeypatch.setattr(sb.os, "name", "posix")  # the macOS path, on Linux too
         script = tmp_path / "sysctl"
         script.write_text("#!/bin/sh\n" + body + "\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
@@ -244,8 +248,38 @@ class TestTotalMemory:
 
     def test_no_proc_meminfo_and_no_sysctl_is_unknown_memory(self, monkeypatch):
         self._no_proc_meminfo(monkeypatch)
+        monkeypatch.setattr(sb.os, "name", "posix")
         monkeypatch.setattr(sb.shutil, "which", lambda name: None)
         monkeypatch.setattr(sb.Path, "exists", lambda self: False)
+        assert sb._total_memory_gb() is None
+
+    def test_windows_reads_total_ram_from_the_kernel_not_wmi(self, monkeypatch):
+        """No /proc and no sysctl on Windows: the reading comes from GlobalMemoryStatusEx. Stood in
+        for by a fake kernel32 that fills ullTotalPhys, as the real one does."""
+        import ctypes
+
+        self._no_proc_meminfo(monkeypatch)
+        monkeypatch.setattr(sb.os, "name", "nt")
+        monkeypatch.setattr(sb, "_sysctl_memsize_gb", lambda: pytest.fail("sysctl used on Windows"))
+
+        class FakeKernel32:
+            @staticmethod
+            def GlobalMemoryStatusEx(ptr):
+                status = ptr._obj
+                assert status.dwLength == ctypes.sizeof(type(status)), "dwLength must be set first"
+                status.ullTotalPhys = 16 * 1024**3
+                return 1
+
+        monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": FakeKernel32})(), raising=False)
+        assert sb._total_memory_gb() == 16.0
+
+    def test_a_failing_windows_memory_call_is_unknown_memory_not_a_guess(self, monkeypatch):
+        import ctypes
+
+        self._no_proc_meminfo(monkeypatch)
+        monkeypatch.setattr(sb.os, "name", "nt")
+        monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": type("K", (), {
+            "GlobalMemoryStatusEx": staticmethod(lambda ptr: 0)})})(), raising=False)
         assert sb._total_memory_gb() is None
 
     @pytest.mark.skipif(not Path("/proc/meminfo").exists(), reason="Linux only")
