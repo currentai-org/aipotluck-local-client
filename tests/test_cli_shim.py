@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -56,23 +58,84 @@ class TestShimText:
         assert "\r\n" in text  # real Windows line endings, not bare \n
 
 
-class TestEnsureOnPathPosix:
-    def test_warns_when_bin_dir_missing_from_path(self, monkeypatch, caplog, tmp_path):
-        missing_dir = tmp_path / "not-on-path"
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
-        with caplog.at_level(logging.WARNING, logger="aipotluck.installer.cli_shim"):
-            cli_shim._ensure_on_path_posix(missing_dir)
-        assert any("not on your PATH" in rec.message for rec in caplog.records)
+class TestShellProfiles:
+    """The PATH entry for new shells: a marked block in the user's startup files. Real files under
+    tmp_path, and real shells where the host has them -- the block has to actually work."""
 
-    def test_silent_when_bin_dir_already_on_path(self, monkeypatch, caplog, tmp_path):
-        present_dir = tmp_path / "already-there"
-        monkeypatch.setenv("PATH", f"/usr/bin:{present_dir}:/bin")
-        with caplog.at_level(logging.WARNING, logger="aipotluck.installer.cli_shim"):
-            cli_shim._ensure_on_path_posix(present_dir)
-        assert caplog.records == []
+    def test_writes_the_login_shells_file_when_there_are_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "zsh")
+        written = cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        assert written == [tmp_path / ".zshenv"]  # macOS's default: zsh, no dotfiles yet
+
+    def test_adds_to_every_existing_startup_file_and_keeps_their_contents(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        (tmp_path / ".bashrc").write_text("alias ll='ls -l'\n")
+        (tmp_path / ".profile").write_text("export EDITOR=vi")  # no trailing newline
+        written = cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        assert sorted(written) == sorted([tmp_path / ".bashrc", tmp_path / ".profile"])
+        assert (tmp_path / ".bashrc").read_text().startswith("alias ll='ls -l'\n")
+        assert (tmp_path / ".profile").read_text().startswith("export EDITOR=vi\n")
+
+    def test_is_idempotent_and_a_new_bin_dir_replaces_the_old_one(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        cli_shim.add_to_shell_profiles(tmp_path / "old", home=tmp_path)
+        cli_shim.add_to_shell_profiles(tmp_path / "new", home=tmp_path)
+        cli_shim.add_to_shell_profiles(tmp_path / "new", home=tmp_path)
+        text = (tmp_path / ".profile").read_text()
+        assert text.count(cli_shim.PROFILE_BEGIN) == 1
+        assert str(tmp_path / "new") in text and str(tmp_path / "old") not in text
+
+    def test_remove_restores_the_file_exactly(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        original = "# my profile\nexport EDITOR=vi\n"
+        (tmp_path / ".profile").write_text(original)
+        cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        assert cli_shim.remove_from_shell_profiles(home=tmp_path) == [tmp_path / ".profile"]
+        assert (tmp_path / ".profile").read_text() == original
+
+    def test_remove_leaves_files_without_the_block_untouched(self, tmp_path):
+        (tmp_path / ".bashrc").write_text("x\n")
+        assert cli_shim.remove_from_shell_profiles(home=tmp_path) == []
+        assert (tmp_path / ".bashrc").read_text() == "x\n"
+
+    @pytest.mark.parametrize("shell, startup", [("bash", ".bashrc"), ("bash", ".profile"), ("zsh", ".zshenv"), ("sh", ".profile")])
+    def test_a_real_new_shell_finds_the_command(self, monkeypatch, tmp_path, shell, startup):
+        exe = shutil.which(shell)
+        if exe is None:
+            pytest.skip(f"no {shell} on this host")
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: shell)
+        (tmp_path / startup).touch()
+        bin_dir = tmp_path / "bin dir"  # a space, as in a macOS "Application Support" path
+        bin_dir.mkdir()
+        tool = bin_dir / "aipotluck-local-client"
+        tool.write_text("#!/bin/sh\necho found-it\n")
+        tool.chmod(0o755)
+        cli_shim.add_to_shell_profiles(bin_dir, home=tmp_path)
+        env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", "ENV": str(tmp_path / ".profile")}
+        flags = {".bashrc": ["-i", "-c"], ".profile": ["-l", "-c"], ".zshenv": ["-c"]}[startup]
+        if shell == "sh":
+            flags = ["-i", "-c"]  # POSIX sh reads $ENV for interactive shells
+        out = subprocess.run([exe, *flags, "aipotluck-local-client"], env=env, capture_output=True, text=True, timeout=20)
+        assert "found-it" in out.stdout, (out.stdout, out.stderr)
 
 
 class TestInstallCliShimPosix:
+    @pytest.fixture(autouse=True)
+    def _no_real_profiles(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_shim.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+        (tmp_path / "home").mkdir(exist_ok=True)
+
+    def test_user_install_puts_the_bin_dir_on_path_for_new_shells(self, monkeypatch, tmp_path):
+        bin_dir = self._redirect_bin_dir(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        cli_shim.install_cli_shim(HostProfile(os_name="linux", arch="x64", backend="cpu"), Path("/usr/bin/python3"), system_scope=False)
+        assert str(bin_dir) in (tmp_path / "home" / ".profile").read_text()
+
+    def test_system_install_leaves_shell_profiles_alone(self, monkeypatch, tmp_path):
+        self._redirect_bin_dir(monkeypatch, tmp_path)
+        cli_shim.install_cli_shim(HostProfile(os_name="linux", arch="x64", backend="cpu"), Path("/usr/bin/python3"), system_scope=True)
+        assert list((tmp_path / "home").iterdir()) == []
+
     def _redirect_bin_dir(self, monkeypatch, tmp_path):
         target = tmp_path / "bin"
         monkeypatch.setattr(cli_shim, "_bin_dir", lambda profile, system_scope: target)
@@ -118,6 +181,17 @@ class TestInstallCliShimPosix:
 
 
 class TestInstallCliShimWindows:
+    @pytest.fixture(autouse=True)
+    def _never_the_real_user_path(self, monkeypatch, request):
+        """On a Windows host the real _add_to_user_path_windows writes HKCU\\Environment\\Path --
+        found doing exactly that, leaving pytest temp dirs on the test account's PATH. Only the
+        test that is about winreg being absent may reach the real function, and only off Windows."""
+        if request.node.name == "test_gracefully_handles_no_winreg_available":
+            if os.name == "nt":
+                pytest.skip("would write the real user PATH; the no-winreg branch only exists off Windows")
+            return
+        monkeypatch.setattr(cli_shim, "_add_to_user_path_windows", lambda bin_dir: True)
+
     def _redirect_bin_dir(self, monkeypatch, tmp_path):
         target = tmp_path / "bin"
         monkeypatch.setattr(cli_shim, "_bin_dir", lambda profile, system_scope: target)

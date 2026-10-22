@@ -65,15 +65,113 @@ def _windows_shim_text(python_exe: Path) -> str:
     )
 
 
-def _ensure_on_path_posix(bin_dir: Path) -> None:
-    path_entries = os.environ.get("PATH", "").split(os.pathsep)
-    if str(bin_dir) in path_entries:
-        return
-    log.warning(
-        "%s is not on your PATH yet, so `%s` won't be found until you add it. Add this to your "
-        'shell profile (~/.bashrc, ~/.zshrc, ...) and open a new terminal:\n    export PATH="%s:$PATH"',
-        bin_dir, CLI_SHIM_NAME, bin_dir,
+PROFILE_BEGIN = "# >>> aipotluck-local-client >>>"
+PROFILE_END = "# <<< aipotluck-local-client <<<"
+
+# Startup files that put a directory on PATH for every shell a person is likely to open, written to
+# when they already exist: bash login shells read .bash_profile or else .profile, interactive
+# non-login bash (most Linux terminals) reads .bashrc, and every zsh reads .zshenv.
+_PROFILE_FILES = (".profile", ".bash_profile", ".bashrc", ".zshenv")
+
+
+def _login_shell() -> str:
+    """The user's login shell's name ("zsh", "bash", ...). From the password database, not $SHELL:
+    an app started from the desktop (the GUI, a launchd job) may not have SHELL set at all."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_shell).name
+    except (ImportError, KeyError, OSError):
+        return Path(os.environ.get("SHELL", "")).name
+
+
+def _profile_block(bin_dir: Path) -> str:
+    # POSIX sh, so bash, zsh, dash and ksh all accept it; the case guard keeps PATH free of
+    # duplicates when several of these files are read by one shell.
+    return (
+        f"{PROFILE_BEGIN}\n"
+        "# Added by the aipotluck-local-client installer so the `aipotluck-local-client` command is\n"
+        "# found. Removed by `aipotluck-local-client uninstall`.\n"
+        f'case ":$PATH:" in *":{bin_dir}:"*) ;; *) export PATH="{bin_dir}:$PATH" ;; esac\n'
+        f"{PROFILE_END}\n"
     )
+
+
+def _strip_block(text: str) -> str:
+    lines, out, inside = text.splitlines(keepends=True), [], False
+    for line in lines:
+        if line.strip() == PROFILE_BEGIN:
+            inside = True
+            continue
+        if inside:
+            if line.strip() == PROFILE_END:
+                inside = False
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _profile_targets(home: Path) -> list[Path]:
+    """The startup files to put the block in: every one of _PROFILE_FILES that exists, plus the
+    one the login shell reads if it has none yet (macOS's default zsh starts with no dotfiles)."""
+    targets = [home / name for name in _PROFILE_FILES if (home / name).is_file()]
+    shell = _login_shell()
+    own = home / (".zshenv" if shell == "zsh" else ".profile" if shell in ("bash", "sh", "dash", "ksh") else "")
+    if own.name and own not in targets:
+        targets.append(own)
+    return targets
+
+
+def add_to_shell_profiles(bin_dir: Path, home: Path | None = None) -> list[Path]:
+    """Puts bin_dir on PATH for new shells by adding a marked block to the user's shell startup
+    files (see _profile_targets). Idempotent: an existing block is replaced, never duplicated.
+    Returns the files written. Never raises -- an unwritable file is a warning, since the shim
+    itself is still installed and reachable by its full path."""
+    home = home or Path.home()
+    written = []
+    for path in _profile_targets(home):
+        try:
+            old = path.read_text(encoding="utf-8") if path.exists() else ""
+            body = _strip_block(old)
+            if body and not body.endswith("\n"):
+                body += "\n"
+            new = body + ("\n" if body.strip() else "") + _profile_block(bin_dir)
+            if new != old:
+                path.write_text(new, encoding="utf-8")
+            written.append(path)
+        except OSError as exc:
+            log.warning("Could not add %s to PATH in %s (%s)", bin_dir, path, exc)
+    if not written:
+        log.warning(
+            "%s is not on your PATH and no shell startup file could be updated (login shell: %s). "
+            'Add this to your shell\'s startup file:\n    export PATH="%s:$PATH"',
+            bin_dir, _login_shell() or "unknown", bin_dir,
+        )
+    else:
+        log.info("Added %s to PATH for new shells in %s", bin_dir, ", ".join(str(p) for p in written))
+    return written
+
+
+def remove_from_shell_profiles(home: Path | None = None) -> list[Path]:
+    """Removes the block add_to_shell_profiles wrote, from every file that has one. Leaves
+    everything else in those files exactly as it was."""
+    home = home or Path.home()
+    cleaned = []
+    for name in _PROFILE_FILES:
+        path = home / name
+        try:
+            old = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if PROFILE_BEGIN not in old:
+            continue
+        new = _strip_block(old)
+        # drop the blank separator line the add left behind, if that's all that's at the end
+        if new.endswith("\n\n"):
+            new = new[:-1]
+        path.write_text(new, encoding="utf-8")
+        cleaned.append(path)
+    return cleaned
 
 
 def _add_to_user_path_windows(bin_dir: Path) -> bool:
@@ -147,7 +245,8 @@ def install_cli_shim(profile: HostProfile, python_exe: Path, system_scope: bool)
         shim_path = bin_dir / CLI_SHIM_NAME
         shim_path.write_text(_posix_shim_text(python_exe), encoding="utf-8")
         shim_path.chmod(shim_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        _ensure_on_path_posix(bin_dir)
+        if not system_scope:  # /usr/local/bin is on PATH everywhere already
+            add_to_shell_profiles(bin_dir)
 
     log.info("Installed %s -> %s", CLI_SHIM_NAME, shim_path)
     return shim_path

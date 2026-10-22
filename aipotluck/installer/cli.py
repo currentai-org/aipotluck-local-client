@@ -182,6 +182,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip the confirmation prompt (required when there's no terminal to prompt on)",
     )
 
+    uninstall_p = sub.add_parser(
+        "uninstall", parents=[common],
+        help="Stop and remove the background service, and delete llama.cpp, newt, config, logs and downloads",
+    )
+    uninstall_p.add_argument(
+        "--remove-models", action="store_true",
+        help="Also delete every downloaded model (the Hugging Face cache llama.cpp uses); kept by default",
+    )
+    uninstall_p.add_argument(
+        "--models-only", action="store_true",
+        help="Delete every downloaded model and leave the rest of the install (and the service) in place",
+    )
+    uninstall_p.add_argument(
+        "--yes", action="store_true",
+        help="Skip the confirmation prompt (required when there's no terminal to prompt on)",
+    )
+
     benchmark = sub.add_parser(
         "benchmark", parents=[common],
         help="Re-measure how fast a cached model runs on this device, without re-downloading it",
@@ -633,6 +650,56 @@ def run_list_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_uninstall(args: argparse.Namespace) -> int:
+    """Removes this install: service first, then (if asked) models, then files. See uninstall.py."""
+    from aipotluck.installer import uninstall as uninstall_mod
+
+    profile, lay = _profile_and_layout(args)
+    if args.models_only:
+        what = "every downloaded model (the rest of the install stays)"
+    else:
+        what = "the background service, llama.cpp, newt, this device's pairing, config, logs and downloads"
+        if args.remove_models:
+            what += ", and every downloaded model"
+    if not args.yes:
+        if not sys.stdin.isatty():
+            log.error("Uninstalling removes %s. Re-run with --yes to confirm.", what)
+            return 1
+        try:
+            answer = input(f"Remove {what}? [y/N]: ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("Left alone.")
+            return 1
+
+    if args.models_only:
+        try:
+            removed = uninstall_mod.remove_all_models(lay)
+        except uninstall_mod.UninstallError as exc:
+            log.error("Uninstall stopped: %s", exc)
+            return 1
+        print(json.dumps({"models_removed": removed}, indent=2))
+        return 0
+
+    try:
+        report = uninstall_mod.uninstall(
+            profile, lay, get_service_manager(profile.os_name),
+            system_scope=args.system, remove_models=args.remove_models,
+        )
+    except uninstall_mod.UninstallError as exc:
+        log.error("Uninstall stopped: %s", exc)
+        return 1
+    for warning in report.warnings:
+        log.warning("%s", warning)
+    print(json.dumps(report.as_dict(), indent=2))
+    print(
+        "Uninstalled. This computer is no longer paired here; the server it was paired as still "
+        "appears in your aipotluck.org account until you remove it there."
+    )
+    return 0
+
+
 def run_remove_model(args: argparse.Namespace) -> int:
     """Deletes a cached model and everything this client remembers about it.
 
@@ -743,6 +810,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_remove_model(args)
         if args.command == "benchmark":
             return run_benchmark(args)
+        if args.command == "uninstall":
+            return run_uninstall(args)
     except SystemExit:
         raise
     except Exception as exc:  # top-level guard: always report clearly
