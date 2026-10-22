@@ -82,6 +82,18 @@ def test_removes_service_shim_and_every_install_directory(installed):
     assert not (lay.config_dir / "runtime.json").exists()
 
 
+def test_removes_the_path_block_from_shell_startup_files(installed, monkeypatch, tmp_path):
+    lay, *_ = installed
+    home = tmp_path / "home"
+    original = "export EDITOR=vi\n"
+    (home / ".bashrc").write_text(original)
+    monkeypatch.setattr(uninstall.cli_shim, "_login_shell", lambda: "bash")
+    uninstall.cli_shim.add_to_shell_profiles(tmp_path / "bin", home=home)
+    assert uninstall.cli_shim.PROFILE_BEGIN in (home / ".bashrc").read_text()
+    uninstall.uninstall(LINUX, lay, RecordingServiceManager())
+    assert (home / ".bashrc").read_text() == original
+
+
 def test_keeps_the_model_cache_unless_asked(installed, monkeypatch):
     lay, *_rest, models, _gui = installed
     monkeypatch.setattr(uninstall.cache_router, "delete", lambda *a: pytest.fail("no model deletion expected"))

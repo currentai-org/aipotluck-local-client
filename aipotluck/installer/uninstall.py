@@ -223,6 +223,9 @@ def uninstall(
         report.shim_removed = str(shim)
     if profile.os_name == "windows" and not system_scope:
         _remove_windows_path_entry(bin_dir)
+    elif not system_scope:
+        for path in cli_shim.remove_from_shell_profiles():
+            report.paths_removed.append(f"PATH entry in {path}")
 
     progress("Deleting downloads, configuration and logs")
     for path in [lay.install_root / sub for sub in _INSTALL_SUBDIRS] + [lay.config_dir, lay.log_dir, lay.state_dir]:
