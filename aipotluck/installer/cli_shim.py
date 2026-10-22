@@ -169,7 +169,12 @@ def remove_from_shell_profiles(home: Path | None = None) -> list[Path]:
         # drop the blank separator line the add left behind, if that's all that's at the end
         if new.endswith("\n\n"):
             new = new[:-1]
-        path.write_text(new, encoding="utf-8")
+        if new.strip():
+            path.write_text(new, encoding="utf-8")
+        else:
+            # Nothing but our block: add_to_shell_profiles created this file (a default macOS
+            # account has no .zshenv), so it goes. Found as an empty ~/.zshenv on the Mac mini.
+            path.unlink()
         cleaned.append(path)
     return cleaned
 

@@ -93,6 +93,15 @@ class TestShellProfiles:
         assert cli_shim.remove_from_shell_profiles(home=tmp_path) == [tmp_path / ".profile"]
         assert (tmp_path / ".profile").read_text() == original
 
+    def test_remove_deletes_a_startup_file_it_created(self, monkeypatch, tmp_path):
+        """A default macOS account has no .zshenv; install creates one, uninstall must not leave an
+        empty one behind."""
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "zsh")
+        cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        assert (tmp_path / ".zshenv").exists()
+        cli_shim.remove_from_shell_profiles(home=tmp_path)
+        assert not (tmp_path / ".zshenv").exists()
+
     def test_remove_leaves_files_without_the_block_untouched(self, tmp_path):
         (tmp_path / ".bashrc").write_text("x\n")
         assert cli_shim.remove_from_shell_profiles(home=tmp_path) == []

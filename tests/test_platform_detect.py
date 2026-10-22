@@ -34,7 +34,25 @@ class TestDetectArch:
     )
     def test_maps_known_arches(self, monkeypatch, machine_value, expected):
         monkeypatch.setattr(pd.platform, "machine", lambda: machine_value)
+        monkeypatch.setattr(pd, "running_under_rosetta", lambda: False)
         assert pd.detect_arch() == expected
+
+    def test_an_intel_process_under_rosetta_reports_the_macs_real_arch(self, monkeypatch):
+        """The Intel GUI build on an Apple silicon Mac runs its bundled Python under Rosetta, where
+        platform.machine() says x86_64. Installing for that put Intel llama.cpp (no Metal) on an
+        M-series Mac and inference crawled."""
+        monkeypatch.setattr(pd.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(pd, "running_under_rosetta", lambda: True)
+        assert pd.detect_arch() == "arm64"
+
+    def test_a_real_intel_mac_stays_x64(self, monkeypatch):
+        monkeypatch.setattr(pd.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(pd, "running_under_rosetta", lambda: False)
+        assert pd.detect_arch() == "x64"
+
+    def test_rosetta_detection_is_false_off_macos(self, monkeypatch):
+        monkeypatch.setattr(pd.platform, "system", lambda: "Linux")
+        assert pd.running_under_rosetta() is False
 
     def test_unknown_arch_raises(self, monkeypatch):
         monkeypatch.setattr(pd.platform, "machine", lambda: "riscv64")

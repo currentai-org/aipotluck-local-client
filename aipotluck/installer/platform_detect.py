@@ -48,9 +48,36 @@ def detect_os() -> str:
     raise UnsupportedPlatformError(f"Unsupported OS: {system!r}")
 
 
+def running_under_rosetta() -> bool:
+    """True when this process is an Intel (x86_64) binary being translated by Rosetta 2 on an Apple
+    silicon Mac -- e.g. the GUI's Intel build opened on an M-series Mac, with its bundled Intel
+    Python. `sysctl.proc_translated` is 1 then, 0 for a native process, and absent on Intel Macs
+    and everywhere else."""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if libc.sysctlbyname(b"sysctl.proc_translated", ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+            return False
+        return value.value == 1
+    except (OSError, AttributeError):
+        return False
+
+
 def detect_arch() -> str:
+    """The MACHINE's architecture, not this process's. Under Rosetta, platform.machine() says
+    x86_64 on an Apple silicon Mac, which installed Intel llama.cpp and newt there: llama.cpp
+    without Metal, translated instruction by instruction, so inference ran many times slower than
+    the Mac can. The binaries this installs are separate processes, so they run natively whatever
+    architecture the Python driving them is."""
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"):
+        if running_under_rosetta():
+            return "arm64"
         return "x64"
     if machine in ("arm64", "aarch64"):
         return "arm64"
