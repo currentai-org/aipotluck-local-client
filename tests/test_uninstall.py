@@ -191,3 +191,30 @@ def test_cli_with_yes_uninstalls(installed, monkeypatch):
     args = cli.build_arg_parser().parse_args(["uninstall", "--yes", "--install-dir", str(lay.install_root)])
     assert cli.run_uninstall(args) == 0
     assert not server.exists() and svc.calls[-1] == "uninstall:aipotluck"
+
+
+def test_models_only_removes_each_model_the_way_remove_does_and_leaves_the_install(installed, monkeypatch):
+    lay, server, bin_dir, *_ = installed
+    from aipotluck.service import model_ops
+    monkeypatch.setattr(uninstall, "list_cached_models", lambda srv: ["org/a:Q4", "org/b:Q8"])
+    calls = []
+    monkeypatch.setattr(model_ops, "remove", lambda cfg, config_dir, m: calls.append((m, config_dir)))
+    assert uninstall.remove_all_models(lay) == ["org/a:Q4", "org/b:Q8"]
+    assert calls == [("org/a:Q4", lay.config_dir), ("org/b:Q8", lay.config_dir)]
+    assert server.exists() and (lay.config_dir / "runtime.json").exists() and (bin_dir / "aipotluck-local-client").exists()
+
+
+def test_models_only_with_nothing_installed_says_so(tmp_path):
+    lay = layout_mod.get_layout("linux", override_root=tmp_path / "aipotluck")
+    with pytest.raises(uninstall.UninstallError, match="nothing is installed"):
+        uninstall.remove_all_models(lay)
+
+
+def test_cli_models_only_never_touches_the_service(installed, monkeypatch):
+    lay, server, *_ = installed
+    monkeypatch.setattr(cli, "get_service_manager", lambda os_name: pytest.fail("service must be left alone"))
+    monkeypatch.setattr(cli, "detect_host_profile", lambda *a: LINUX)
+    monkeypatch.setattr(uninstall, "list_cached_models", lambda srv: [])
+    args = cli.build_arg_parser().parse_args(["uninstall", "--models-only", "--yes", "--install-dir", str(lay.install_root)])
+    assert cli.run_uninstall(args) == 0
+    assert server.exists()

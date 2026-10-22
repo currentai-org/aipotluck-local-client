@@ -191,6 +191,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Also delete every downloaded model (the Hugging Face cache llama.cpp uses); kept by default",
     )
     uninstall_p.add_argument(
+        "--models-only", action="store_true",
+        help="Delete every downloaded model and leave the rest of the install (and the service) in place",
+    )
+    uninstall_p.add_argument(
         "--yes", action="store_true",
         help="Skip the confirmation prompt (required when there's no terminal to prompt on)",
     )
@@ -651,9 +655,12 @@ def run_uninstall(args: argparse.Namespace) -> int:
     from aipotluck.installer import uninstall as uninstall_mod
 
     profile, lay = _profile_and_layout(args)
-    what = "the background service, llama.cpp, newt, this device's pairing, config, logs and downloads"
-    if args.remove_models:
-        what += ", and every downloaded model"
+    if args.models_only:
+        what = "every downloaded model (the rest of the install stays)"
+    else:
+        what = "the background service, llama.cpp, newt, this device's pairing, config, logs and downloads"
+        if args.remove_models:
+            what += ", and every downloaded model"
     if not args.yes:
         if not sys.stdin.isatty():
             log.error("Uninstalling removes %s. Re-run with --yes to confirm.", what)
@@ -665,6 +672,15 @@ def run_uninstall(args: argparse.Namespace) -> int:
         if answer not in ("y", "yes"):
             print("Left alone.")
             return 1
+
+    if args.models_only:
+        try:
+            removed = uninstall_mod.remove_all_models(lay)
+        except uninstall_mod.UninstallError as exc:
+            log.error("Uninstall stopped: %s", exc)
+            return 1
+        print(json.dumps({"models_removed": removed}, indent=2))
+        return 0
 
     try:
         report = uninstall_mod.uninstall(

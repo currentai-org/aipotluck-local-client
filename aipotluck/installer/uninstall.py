@@ -240,3 +240,30 @@ def uninstall(
     except OSError:
         pass
     return report
+
+
+def remove_all_models(lay: layout_mod.Layout, progress=log.info) -> list[str]:
+    """Delete every downloaded model and leave the install itself alone -- the same path as
+    `remove` for each one (model_ops.remove: unload it from the running router, delete it through
+    llama.cpp's cache logic, forget its preset and records), so the service keeps running and its
+    model list is right afterwards. Stops at the first model that can't be removed."""
+    from aipotluck.service import model_ops
+
+    llama_cfg = read_llama_cfg(lay)
+    if not llama_cfg.get("server_binary"):
+        raise UninstallError("can't remove downloaded models: nothing is installed to remove them with.")
+    try:
+        models = list_cached_models(Path(llama_cfg["server_binary"]))
+    except ModelPullError as exc:
+        raise UninstallError(f"can't list downloaded models ({exc})") from exc
+    removed: list[str] = []
+    for model_id in models:
+        progress(f"Removing model {model_id}")
+        try:
+            model_ops.remove(llama_cfg, lay.config_dir, model_id)
+        except model_ops.ModelOpError as exc:
+            raise UninstallError(
+                f"couldn't remove model {model_id} ({exc}). Removed so far: {', '.join(removed) or 'nothing'}."
+            ) from exc
+        removed.append(model_id)
+    return removed
