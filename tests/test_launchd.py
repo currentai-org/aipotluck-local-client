@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the fake launch
 FAKE_LAUNCHCTL = r'''#!/usr/bin/env python3
 import json, os, plistlib, sys
 state_path = os.environ["FAKE_LAUNCHD_STATE"]
-st = json.load(open(state_path)) if os.path.exists(state_path) else {"jobs": {}, "next_pid": 1000, "calls": []}
+st = json.load(open(state_path)) if os.path.exists(state_path) else {"jobs": {}, "next_pid": 1000, "calls": [], "disabled": []}
 a = sys.argv[1:]
 st["calls"].append(a)
 jobs = st["jobs"]
@@ -56,6 +56,8 @@ if cmd == "list":
     print("};")
 elif cmd == "bootstrap":
     label = plistlib.load(open(a[2], "rb"))["Label"]
+    if label in st.get("disabled", []):  # as real launchd: a disabled label won't bootstrap
+        print("Bootstrap failed: 5: Input/output error", file=sys.stderr); save(); sys.exit(5)
     if label in jobs:
         print("Bootstrap failed: 5: Input/output error", file=sys.stderr); save(); sys.exit(5)
     load(a[2])
@@ -86,6 +88,11 @@ elif cmd == "load":
 elif cmd == "unload":
     label = plistlib.load(open(a[-1], "rb"))["Label"]
     jobs.pop(label, None)
+    if "-w" in a:  # -w writes a persistent "disabled" override
+        st.setdefault("disabled", []).append(label)
+elif cmd == "enable":
+    label = a[1].split("/")[-1]
+    st["disabled"] = [l for l in st.get("disabled", []) if l != label]
 else:
     print("unknown subcommand", cmd, file=sys.stderr); save(); sys.exit(64)
 save()
@@ -156,6 +163,16 @@ def test_reinstalling_runs_the_new_definition_not_the_old_one(launchd_env):
     install(mgr, "/opt/aipotluck/v2/aipotluck_service.py")
     job = launchd_env["state"]()["jobs"][LABEL]
     assert job["args"][1] == "/opt/aipotluck/v2/aipotluck_service.py"
+    assert mgr.status("aipotluck").state is ServiceState.RUNNING
+
+
+def test_install_works_where_the_old_backend_left_the_label_disabled(launchd_env):
+    """Found on the Mac mini: the old uninstall's `unload -w` marks the label disabled for good, and
+    launchd then refuses to bootstrap it ("Bootstrap failed: 5")."""
+    Path(os.environ["FAKE_LAUNCHD_STATE"]).write_text(
+        json.dumps({"jobs": {}, "next_pid": 1000, "calls": [], "disabled": [LABEL]}))
+    mgr = launchd.LaunchdServiceManager()
+    install(mgr)
     assert mgr.status("aipotluck").state is ServiceState.RUNNING
 
 

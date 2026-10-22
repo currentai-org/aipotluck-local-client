@@ -15,6 +15,9 @@ operation has to work, and the first version got it wrong (found on a Mac mini, 
 - **install** must replace a job that's already loaded (bootout, then bootstrap). The legacy
   `launchctl load` leaves the old definition in place, so a reinstall kept running the previous
   interpreter and source paths.
+- **install/start** must clear a "disabled" mark first (`launchctl enable`). The legacy
+  `unload -w` that the first version uninstalled with writes one permanently, and launchd then
+  refuses to bootstrap the label at all ("Bootstrap failed: 5: Input/output error").
 
 `bootstrap`/`bootout`/`kickstart` are launchctl's current interface (macOS 10.10+); `load`/`unload`
 are legacy and deprecated. A stopped service stays stopped until `start` or the next login, which
@@ -142,6 +145,10 @@ class LaunchdServiceManager(ServiceManager):
 
     def _bootstrap(self, name: str, system_scope: bool) -> None:
         plist_path = _plist_path(name, system_scope)
+        # A label marked disabled refuses bootstrap ("Bootstrap failed: 5: Input/output error").
+        # The legacy `unload -w` -- which the previous version of this backend used to uninstall --
+        # sets that mark permanently, so every reinstall on such a Mac failed. Clear it first.
+        self._launchctl(["enable", _target(name, system_scope)])
         result = self._launchctl(["bootstrap", _domain(system_scope), str(plist_path)])
         if result.returncode != 0 and not self._loaded(name, system_scope):
             raise RuntimeError(f"Couldn't load {plist_path} into launchd: {self._why(result)}")
