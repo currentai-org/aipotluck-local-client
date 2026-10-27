@@ -89,7 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-clie
 
 # pointing at a fork/branch instead of the default: the env vars have to go on bash's side of the
 # pipe, not curl's -- a leading assignment on a pipeline only applies to the first command in it
-# (curl here), so putting them before curl silently does nothing (confirmed live, CUR-1965).
+# (curl here), so putting them before curl silently does nothing (CUR-1965).
 curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | \
   AIPOTLUCK_REPO_URL=https://github.com/<owner>/<fork>.git AIPOTLUCK_REF=main bash
 ```
@@ -185,7 +185,7 @@ Two concrete cases this covers today:
   `linux-arm64-cuda` asset.
 - **The best available asset needs a newer glibc than the host has** --
   llama.cpp's release CI builds its Linux arm64 assets against a newer base
-  image than most arm64 boards actually run. Confirmed live: the pinned
+  image than most arm64 boards actually run. The pinned
   `linux-arm64-cpu` asset needs glibc 2.38; JetPack 6.2.3 (Ubuntu 22.04)
   ships 2.35, so even the CPU-only fallback refuses to start there.
 
@@ -377,7 +377,7 @@ install, which skips the shim) fall back to
 connected"** (`tunnel_connected` in its output) -- these are genuinely different claims. `newt`
 retries forever on its own and never exits just because it can't reach Pangolin, so a real
 connection failure looks identical to success under `running: true` unless this is checked
-explicitly (confirmed live: a device ran with `running: true` for 20+ hours while the tunnel was
+explicitly (one device ran with `running: true` for 20+ hours while the tunnel was
 never actually up, because Pangolin's endpoint was pointing at an address the device couldn't
 reach).
 
@@ -385,7 +385,7 @@ The check (`aipotluck/service/newt_supervisor.py`) combines two signals, in prio
 
 1. **newt's own `--health-file`** (newt >= 1.17.0) -- a real runtime signal newt computes from its
    actual connection state, not text matching. It writes the literal content `ok` once genuinely
-   connected. **Confirmed live that this is not sufficient alone**: newt never refreshes it on
+   connected. **This is not sufficient alone**: newt never refreshes it on
    later pings, and critically does *not* clear it if an already-established connection later
    drops -- killing a real, connected Pangolin server out from under a live newt process left the
    file saying `ok` while newt went straight into its own `ERROR:`-logged retry loop. A stale `ok`
@@ -587,7 +587,7 @@ second, and works whether or not the service is running. The service's router is
 unload the model first, then to reload once its preset section has been dropped. `remove` takes the
 same path.
 
-**`pull` does not benchmark.** It used to, and the measurement made every pull minutes longer than
+**`pull` does not benchmark.** The measurement would make every pull minutes longer than
 its download for a verdict nobody had asked for yet. A pull downloads and sizes; `benchmark`
 measures, on request, and `list` marks every model that has not been measured. A pull still rejects
 a model that sizing proves cannot load or cannot hold a usable context, since that verdict comes for

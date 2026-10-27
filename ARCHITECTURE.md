@@ -329,7 +329,7 @@ now:
   "active model" to summarize -- every sized model is reported, keyed by id.
   `aipotluck-local-client status` prints the same dict. See CLAUDE.md's "Runtime parameters"
   section for why this exists as a standing convention, not a one-off for the ctx_size/parallel
-  case that prompted it (CUR-1965).
+  case that prompted it.
 
 Two-tier self-healing, confirmed by test:
 1. systemd `Restart=always` / launchd `KeepAlive` / Windows Service restarts
@@ -346,8 +346,8 @@ clean shutdown terminates both processes with no orphans.
 
 ### 4.5.1 Router mode + automatic per-model sizing (`aipotluck/installer/model_sizing.py`/`model_presets.py`, CUR-1965)
 
-CUR-1965 started as a single-model bug (a device silently running with 4x more KV-cache-eating
-parallel slots than a single-user box needs) and its fix evolved into a real architecture change:
+This started as a single-model bug (a device silently running with 4x more KV-cache-eating
+parallel slots than a single-user box needs), and the fix became a real architecture change:
 rather than this project detecting "the user switched models" itself (which would mean intercepting
 or proxying every inference request), llama-server's own **router mode** already does exactly that
 -- confirmed by reading `vendor/llama.cpp/tools/server/server-models.cpp` directly rather than
@@ -402,7 +402,7 @@ parsed from the log).
 
 **The sizing math itself** (`compute_sizing`): KV-cache bytes/token = `n_layer * (n_embd_k_gqa *
 bytes_per_element(cache_type_k) + n_embd_v_gqa * bytes_per_element(cache_type_v))` -- the same
-formula CUR-1965 hand-derived and confirmed against a real device (~112 KiB/token for Llama 3.2 3B
+formula checked by hand against a real device (~112 KiB/token for Llama 3.2 3B
 at f16: 28 layers, 8 KV-heads, 128 head-dim). The budget is **80% of this device's TOTAL installed
 RAM** (`_MEMORY_BUDGET_FRACTION`, matching Ollama's own `freeMemory*80/100` eviction threshold),
 **not a live "available right now" reading** -- a deliberate choice: background memory headroom

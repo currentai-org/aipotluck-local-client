@@ -59,7 +59,7 @@ branch a commit lands on, it's what's true before it lands:
 
 Any parameter this project computes on the host's behalf rather than taking as an explicit
 user-specified value — today, per-model `ctx_size`/`parallel`/`cache_type_k`/`cache_type_v`,
-auto-sized by `aipotluck.installer.model_sizing` (CUR-1965's follow-up) whenever a model is
+auto-sized by `aipotluck.installer.model_sizing` whenever a model is
 `pull`ed, installed as the default, or found in the HF cache with no preset yet — must be visible
 two ways: from the device itself (`aipotluck-local-client status`) and over the
 HTTP API a remote caller (the web UI, a support session, anything reaching the service through the
@@ -67,7 +67,7 @@ tunnel) would use (`GET /status`'s `runtime_params` key; `GET /capabilities`'
 `current_install.runtime_params` too). Both today read the exact same function
 (`aipotluck.diagnostics.runtime_params`) — never build a second summary that could drift from it.
 
-This isn't hypothetical caution: CUR-1965 itself was a real device silently running with 4x more
+This isn't hypothetical caution: the original bug was a real device silently running with 4x more
 KV-cache-eating parallel slots than a single-user box needs, and nothing — not `status`, not any
 HTTP surface — made that visible before the person debugging it had to work it out from a
 context-overflow error and a manual `/props` query. When you add a parameter this project computes
@@ -79,7 +79,7 @@ Concretely, when auto-computing a value: write it into the model's `--models-pre
 (`aipotluck.installer.model_presets.write_preset`) and its sibling `{param_name: "reason string"}`
 tuning JSON (`model_presets.write_tuning`) — a plain sentence someone can read in `status` output
 directly, not a code to look up. `runtime.json` no longer carries a `llama_cpp.tuning` map itself
-(router mode, CUR-1965's follow-up, means there's no single "active model" left to hang one flat
+(router mode means there's no single "active model" left to hang one flat
 map off of) — `runtime_params` reads the preset files directly instead, per model.
 
 **The memory budget behind `ctx_size` sizing is a fixed 80% of this device's TOTAL installed RAM,
