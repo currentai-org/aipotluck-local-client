@@ -146,8 +146,8 @@ class LaunchdServiceManager(ServiceManager):
     def _bootstrap(self, name: str, system_scope: bool) -> None:
         plist_path = _plist_path(name, system_scope)
         # A label marked disabled refuses bootstrap ("Bootstrap failed: 5: Input/output error").
-        # The legacy `unload -w` -- which the previous version of this backend used to uninstall --
-        # sets that mark permanently, so every reinstall on such a Mac failed. Clear it first.
+        # The legacy `unload -w` sets that mark permanently, so a reinstall on a Mac that
+        # ever used it fails. Clear it first.
         self._launchctl(["enable", _target(name, system_scope)])
         result = self._launchctl(["bootstrap", _domain(system_scope), str(plist_path)])
         if result.returncode != 0 and not self._loaded(name, system_scope):

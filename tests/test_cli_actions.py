@@ -778,7 +778,7 @@ class TestOversizedModelGate:
 
 
 class TestRunPullModel:
-    """Router mode (CUR-1965's follow-up): there's no "active model" to write into runtime.json
+    """Router mode: there's no "active model" to write into runtime.json
     anymore -- pull downloads a model, sizes it (model_sizing.ensure_preset persists the
     --models-preset INI section + its tuning-reasons sidecar on its own, see
     test_model_sizing.py/test_model_presets.py for that), then best-effort asks a running router

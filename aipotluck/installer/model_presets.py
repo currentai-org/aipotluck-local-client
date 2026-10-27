@@ -1,5 +1,5 @@
 """Read/write for the router-mode preset file (`llama-server --models-preset`) -- the mechanical
-half of CUR-1965's auto-sizing follow-up; `model_sizing.py` decides *what* values go in, this
+half of automatic per-model sizing; `model_sizing.py` decides *what* values go in, this
 module only knows *how* to get them in and out of the INI file llama-server itself reads.
 
 Confirmed against vendor/llama.cpp/common/preset.cpp's real parser (a hand-rolled PEG grammar, not

@@ -10,7 +10,7 @@ Two independent, confirmed-real conditions force a source build -- either is suf
      throw away the GPU -- so this case is intercepted before fetch.resolve_asset ever runs.
 
   2. The best available prebuilt asset for this os/arch/backend needs a newer glibc than the host
-     has. Confirmed live 2026-09-23: llama.cpp's release CI builds its Linux arm64 assets against a
+     has. llama.cpp's release CI builds its Linux arm64 assets against a
      newer base image than most arm64 boards run -- the pinned b10989 linux-arm64-cpu asset needs
      glibc 2.38, JetPack 6.2.3 / Ubuntu 22.04 ships 2.35, and the binary refuses to even start
      there. This is a distinct problem from (1): it would still bite an arm64+CPU-only host with an

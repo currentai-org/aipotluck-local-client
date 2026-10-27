@@ -1,7 +1,7 @@
 """aipotluck.installer.cli's argument parser.
 
-The regression this file exists to guard: --install-dir/--system/-v used to be declared on both
-the top-level parser and each subparser (via a shared `parents=[...]`), and argparse's subparsers
+The regression this file exists to guard: --install-dir/--system/-v must not be declared on both
+the top-level parser and each subparser (via a shared `parents=[...]`): argparse's subparsers
 action silently discards the outer parser's value in that setup -- `--install-dir X login` would
 parse without error but `args.install_dir` would come back None, not X. See cli.py's
 `_common_args_parser` docstring for the full mechanism. These tests pin the fixed behavior (flags

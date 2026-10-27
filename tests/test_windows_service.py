@@ -1,8 +1,8 @@
 """aipotluck.installer.service.windows_service: reading a Scheduled Task's state, and the task
 definition the installer registers.
 
-`status()` used to return UNKNOWN for every installed task, so `install` always warned "Service
-status is ambiguous" on Windows and nothing could tell a running service from a stopped one. These
+`status()` has to tell a running service from a stopped one; returning UNKNOWN for every installed
+task would make `install` warn "Service status is ambiguous" on Windows every time. These
 read schtasks' real CSV output, captured from a Windows 10 22H2 machine, rather than a mock of it.
 
 The task definition is checked as the XML Task Scheduler will parse (ElementTree), not as text:

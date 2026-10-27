@@ -85,7 +85,7 @@ def _common_args_parser() -> argparse.ArgumentParser:
     namespace and then unconditionally overwrites the outer one with it (`_SubParsersAction.
     __call__` passes `None`, not the existing namespace, to the subparser's own parse_known_args) --
     so a flag declared on BOTH the top parser and a subparser silently reverts to the subparser's
-    own default the moment it's given before the subcommand name, with no error. Confirmed live:
+    own default the moment it's given before the subcommand name, with no error. For example,
     `aipotluck-local-client --install-dir X login` silently ignored X and wrote to the default
     install dir instead; `aipotluck-local-client login --install-dir X` (this design) fails loudly
     on an unrecognized argument if given in the wrong position rather than acting on the wrong
@@ -444,7 +444,7 @@ def run_status(_args: argparse.Namespace) -> int:
     # See CLAUDE.md's "Runtime parameters" convention: anything this project computes
     # automatically (not just what the user passed at install time) must be traceable here, not
     # just over HTTP -- this reads the exact same `runtime_params` GET /status already returns,
-    # never a second, potentially-drifting summary of it. Router mode (CUR-1965's follow-up) means
+    # never a second, potentially-drifting summary of it. Router mode means
     # there's no single active model to summarize -- print router-level params, then every SIZED
     # model with its own ctx_size/parallel/cache_type and why.
     params = payload.get("runtime_params")
@@ -597,7 +597,7 @@ def run_list_models(args: argparse.Namespace) -> int:
         print("No models cached locally yet -- pull one with `aipotluck-local-client pull <repo[:quant]>`.")
         return 0
 
-    # Router mode (CUR-1965's follow-up): there's no single "active" model anymore -- any cached
+    # Router mode: there's no single "active" model anymore -- any cached
     # model can be requested at any time. "not sized yet" instead marks whether `pull` (or the
     # service's own startup backfill) has already computed a preset for it.
     held_back = {m["id"]: m["held_back"] for m in models if m["held_back"]}

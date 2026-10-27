@@ -216,7 +216,7 @@ def runtime_params(runtime_config: dict[str, Any]) -> dict[str, Any]:
     A param's absence from a model's tuning means it's llama-server's own static default, not that
     nothing is known about it.
 
-    Router mode (CUR-1965's follow-up) means there is no single "active model" anymore -- any
+    Router mode means there is no single "active model" anymore -- any
     model llama-server's router has a cache entry (or a --models-preset section) for can be
     requested at any time, so this reports EVERY sized model, keyed by id, rather than one flat set
     of fields. This is the traceability surface CLAUDE.md's "Runtime parameters" convention

@@ -401,8 +401,8 @@ def _configure(source_dir: Path, build_dir: Path, *, cuda_arch: str | None, cmak
         # and the top-level CMakeLists only ever does add_subdirectory(tools) -- which is what
         # actually defines the "llama-server" target `cmake --build --target llama-server` asks
         # for -- when LLAMA_BUILD_TOOLS is on. LLAMA_BUILD_SERVER alone (tools/CMakeLists.txt's own
-        # gate one level down) is never even evaluated otherwise. Confirmed live on the reference
-        # Jetson: turning LLAMA_BUILD_TOOLS off (to shrink the build, on the wrong assumption that
+        # gate one level down) is never even evaluated otherwise. On the reference
+        # Jetson, turning LLAMA_BUILD_TOOLS off (to shrink the build, on the wrong assumption that
         # it was independent of the server) configured fine but failed the actual build with
         # "No rule to make target 'llama-server'" -- the target had never been defined at all.
         "-DLLAMA_BUILD_SERVER=ON",
@@ -420,8 +420,8 @@ def _configure(source_dir: Path, build_dir: Path, *, cuda_arch: str | None, cmak
     ]
     if cuda_arch:
         args += ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"]
-        # cmake's own CUDA-language detection only searches PATH -- confirmed live on the
-        # reference Jetson: nvcc is genuinely installed but not on PATH there (it's under
+        # cmake's own CUDA-language detection only searches PATH. On the
+        # reference Jetson, nvcc is genuinely installed but not on PATH there (it's under
         # /usr/local/cuda-12.6/bin), find_nvcc()'s glob fallback locates it fine, but without this
         # flag cmake still fails with CMAKE_CUDA_COMPILER-NOTFOUND. Always pass it when we have it
         # rather than only as a fallback -- it's strictly more robust than letting cmake redo a

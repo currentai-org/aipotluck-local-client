@@ -370,8 +370,8 @@ class TestBuildLlamaServer:
         assert "-DCMAKE_CUDA_ARCHITECTURES=87" in marker
 
     def test_cuda_build_passes_the_located_nvcc_path_to_cmake(self, tmp_path, fake_cmake, monkeypatch):
-        # Regression: cmake's own CUDA-compiler detection only searches PATH. Confirmed live on
-        # the reference Jetson that nvcc is real but not on PATH (find_nvcc()'s glob fallback is
+        # Regression: cmake's own CUDA-compiler detection only searches PATH. On
+        # the reference Jetson, nvcc is real but not on PATH (find_nvcc()'s glob fallback is
         # the only reason it was found at all) -- without threading that path through explicitly,
         # configure fails with CMAKE_CUDA_COMPILER-NOTFOUND despite find_nvcc() succeeding.
         monkeypatch.setattr(sb, "find_nvcc", lambda: Path("/usr/local/cuda-12.6/bin/nvcc"))

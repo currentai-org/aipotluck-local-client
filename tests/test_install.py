@@ -29,7 +29,7 @@ def _stable_profile(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_model_prefetch(monkeypatch):
-    """The default-model pre-fetch/pre-size step (CUR-1965's router-mode follow-up) is a real
+    """The default-model pre-fetch/pre-size step (router-mode auto-sizing) is a real
     subprocess/network boundary, same category as fetch.*/get_service_manager above -- mocked by
     default so every other test in this file isn't incidentally exercising it against a fake,
     non-executable placeholder binary. TestRunInstallDefaultModelSizing below un-mocks it
@@ -502,7 +502,7 @@ class TestRunInstallAptInstallConsent:
 
     def test_nvcc_gap_is_never_apt_installable_even_with_consent(self, tmp_path, fake_source_build, monkeypatch):
         # missing_apt_packages() never includes nvcc (see its docstring) -- so even full consent
-        # can't paper over a real nvcc gap; the CUDA toolkit is never something this auto-installs.
+        # can't hide a real nvcc gap; the CUDA toolkit is never something this auto-installs.
         monkeypatch.setattr(
             install.source_build, "check_build_prerequisites",
             lambda backend: ["nvcc not found -- ..."],
@@ -609,7 +609,7 @@ class TestRunInstallWithService:
 
 
 class TestRunInstallDefaultModelSizing:
-    """CUR-1965's router-mode follow-up: a fresh install pre-fetches (HF only) and pre-sizes the
+    """Router mode: a fresh install pre-fetches (HF only) and pre-sizes the
     default model, so it has a correctly-sized preset waiting rather than falling back to
     llama-server's stock defaults until the person runs `pull`. model_pull.pull_model/
     model_sizing.ensure_preset are mocked here too (real subprocess coverage lives in

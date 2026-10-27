@@ -1,4 +1,4 @@
-"""aipotluck.installer.model_sizing -- the CUR-1965 follow-up that computes per-model
+"""aipotluck.installer.model_sizing -- computes per-model
 ctx_size/parallel/cache_type_k/cache_type_v presets for llama-server's router mode.
 
 Same "deliberately not mocked" posture as test_model_pull.py: probe_model_profile's subprocess
@@ -195,7 +195,7 @@ class TestParseHelpers:
 
 class TestProbeModelProfile:
     def test_passes_verbose_so_print_info_lines_are_never_gated_out(self, fake_server_binary, monkeypatch):
-        # CUR-1965, found live against a real device: at least one real llama-server build gates
+        # At least one real llama-server build gates
         # its print_info: hparam lines behind a verbosity threshold not met at default settings --
         # the vendored source alone didn't predict this. --verbose is the one setting guaranteed
         # to surface them regardless of a given build's default threshold.
@@ -259,8 +259,8 @@ class TestProbeModelProfile:
         self, fake_server_binary, monkeypatch
     ):
         """llama.cpp truncates its kv preview without honouring UTF-8 boundaries, so a byte-level
-        BPE tokenizer can leave a lead byte with no continuation. Confirmed live on a Jetson with
-        LiquidAI/LFM2.5-8B-A1B-GGUF, where strict decoding killed the reader thread and the pull
+        BPE tokenizer can leave a lead byte with no continuation. On a Jetson with
+        LiquidAI/LFM2.5-8B-A1B-GGUF, strict decoding killed the reader thread and the pull
         died. The contract is that undecodable bytes cost nothing: the probe still returns the
         hparams printed AFTER them."""
         monkeypatch.setattr(model_sizing, "_total_memory_gb", lambda: 3.5)
@@ -318,8 +318,8 @@ class TestProbeModelProfile:
 
 class TestKvCacheBytesPerToken:
     def test_matches_the_real_measured_llama_3_2_3b_figure(self):
-        # Llama 3.2 3B: 28 layers, 8 KV-heads (GQA), 128 head-dim, f16 -- confirmed against the
-        # real device this whole feature was built for (CUR-1965): ~112 KiB/token.
+        # Llama 3.2 3B: 28 layers, 8 KV-heads (GQA), 128 head-dim, f16 -- checked against a
+        # real device: ~112 KiB/token.
         profile = ModelProfile(
             n_ctx_train=131072, n_layer=28, n_embd_head_k=128, n_embd_k_gqa=1024, n_embd_v_gqa=1024,
             model_size_bytes=0, total_memory_gb=None,

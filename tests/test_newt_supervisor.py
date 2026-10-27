@@ -4,8 +4,8 @@ The one thing this file exists to pin: tunnel_connected() correctly distinguishe
 process is alive" from "the tunnel is actually connected" -- process liveness alone can't make
 this distinction (a real failure this project hit showed newt "running" for 20+ hours while its
 own retry loop never once succeeded), and neither can newt's own --health-file taken alone: it's
-a real runtime signal (newt writes "ok" once it has genuinely connected) but confirmed live
-against a real Pangolin tunnel that it is NEVER refreshed on later pings and -- the important
+a real runtime signal (newt writes "ok" once it has genuinely connected) but, as observed
+against a real Pangolin tunnel, it is NEVER refreshed on later pings and -- the important
 part -- is NOT cleared if an already-established connection later drops. So a stale "ok" from an
 earlier, now-dead connection would read as healthy forever unless something else catches it; the
 log-tail check (kept from this module's first pass) is that catch. Real log/health files are used
@@ -94,7 +94,7 @@ class TestHealthFileSaysOk:
         assert _health_file_says_ok(tmp_path / "nope.ok") is False
 
     def test_matches_real_newt_output(self, tmp_path):
-        # Confirmed live: newt's --health-file writes the literal 2-byte content "ok".
+        # newt's --health-file writes the literal 2-byte content "ok".
         path = tmp_path / "newt-health.ok"
         path.write_text("ok", encoding="utf-8")
         assert _health_file_says_ok(path) is True
@@ -180,7 +180,7 @@ class TestNewtSupervisorTunnelConnected:
         assert supervisor.tunnel_connected() is True
 
     def test_stale_ok_health_file_is_overridden_by_a_fresh_error(self, tmp_path):
-        # The exact bug this feature exists to fix, reproduced directly: confirmed live that newt
+        # The exact bug this feature exists to fix: newt
         # does NOT clear --health-file when an already-established connection later drops, so a
         # stale "ok" alone would read as healthy forever. The log's fresh ERROR must win.
         supervisor, newt_log, health_file = self._supervisor(tmp_path)

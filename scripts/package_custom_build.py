@@ -18,7 +18,7 @@ What it does, in order:
      from THIS host's profile via the exact same code build_cache.py uses to look one up, unless
      overridden -- so packaging always produces a key the installer would actually match).
   2. Stage --build-dir's bin/ contents into a flat llama-<tag>/ directory, matching upstream's own
-     release archive layout exactly (confirmed against a real llama.cpp release tarball) -- no
+     release archive layout exactly (matching a real llama.cpp release tarball) -- no
      nested bin/, so fetch.find_binary's recursive search works unchanged either way.
   3. Verify relocatability FOR REAL: copy the staged directory to a fresh path elsewhere and run
      `llama-server --list-devices` from there. This is not a formality -- this exact project once

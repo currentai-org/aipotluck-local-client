@@ -97,8 +97,8 @@ TURN_BUDGET_MS = 155_000.0
 # template the app renders on top; and real cost grows slightly faster than linearly past the
 # deepest point the probe can afford to measure.
 #
-# At the old 1.25 that left a turn at N_fit really taking ~169s against a 155s budget -- the grade
-# would have promised something false. 1.5 puts the same turn at ~141s. The validator
+# A factor of 1.25 would leave a turn at N_fit really taking ~169s against a 155s budget, so the
+# grade would promise something false. 1.5 puts the same turn at ~141s. The validator
 # (scripts/validate_model_perf.py) gates on exactly this: real turn at N_fit must fit the budget.
 
 
