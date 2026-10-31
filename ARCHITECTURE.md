@@ -515,13 +515,13 @@ trusted `sys.executable`, which matters most on Windows where the
 resolved python.exe may have just been installed by winget in this same
 run.
 
-STUB STATUS for this whole section: written against documented winget
-CLI behavior (`winget install`, silent flags, package ID
-`Python.Python.3.12`) and pywin32's public API surface, but **not
-exercised on real Windows hardware** -- no Windows host is available in
-this environment. Everything downstream of `ensure_python()` returning a
-valid interpreter path is the exact same code already tested end-to-end on
-Linux.
+STUB STATUS for this whole section: the winget auto-install branch is
+written against documented CLI behavior (`winget install`, silent flags,
+package ID `Python.Python.3.12`) and has **never run** -- the Windows box
+this was tested on already had a suitable Python, so `ensure_python()`
+returned before reaching it. Everything downstream of `ensure_python()`
+returning a valid interpreter path is the exact same code already tested
+end-to-end on Linux, and run on Windows.
 
 ## 4.8 Public one-line installer layer
 
@@ -555,8 +555,9 @@ repo as a stand-in "public" remote (`file://` URL via
 `AIPOTLUCK_REPO_URL`): fresh clone with submodule init, re-run against an
 existing checkout (updates via fetch + reset --hard rather than
 re-cloning), and the placeholder-URL guard correctly refusing to run
-without an override. The Windows `install.ps1` (repo root) is untested
-like the rest of the Windows surface (no Windows host available).
+without an override. The Windows `install.ps1` (repo root) has never been
+run itself; the Windows surface it drives was exercised directly on a
+Windows 10 box (see README's "Confirmed hardware").
 
 ## 5. Open questions before implementation
 

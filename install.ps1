@@ -22,11 +22,11 @@
 # packaging\windows\install.ps1 (-System, -Backend, -ModelHf, -Tag,
 # -NoStart, -Verbose).
 #
-# STATUS: STUB. Written against documented winget/git/PowerShell behavior,
-# not exercised on real Windows hardware (no Windows host available in
-# this environment). packaging\windows\install.ps1 (which this hands off
-# to) carries the same caveat; see that file and
-# aipotluck/installer/python_bootstrap.py for details.
+# STATUS: not itself run. The Windows install path it drives was exercised
+# directly on a Windows 10 box; what stays unproven is the branch that
+# installs Python and git via winget when they are missing, and so the case
+# where this script is the entry point on a machine with neither. See
+# packaging\windows\install.ps1 and aipotluck/installer/python_bootstrap.py.
 
 param(
     [string]$RepoUrl,

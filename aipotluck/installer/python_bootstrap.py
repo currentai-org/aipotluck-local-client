@@ -117,9 +117,9 @@ def ensure_python(auto_install: bool = True) -> Path:
     Raises PythonNotFoundError with an actionable message if none can be
     found or installed.
 
-    STUB STATUS (Windows auto-install path): implemented against
-    documented winget CLI behavior, not exercised on real Windows hardware
-    (no Windows host available in this environment).
+    STUB STATUS (Windows auto-install path): implemented against documented
+    winget CLI behavior and never run -- every Windows machine tested so far
+    already had a suitable Python, so this branch was not reached.
     """
     found = find_python()
     if found:

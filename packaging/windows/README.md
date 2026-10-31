@@ -45,13 +45,16 @@ aipotluck-local-client[windows]`).
 
 ## Status
 
-STUB: implemented against documented winget / schtasks / pywin32 behavior.
-Not exercised on real Windows hardware (no Windows host available in this
-environment). Everything downstream of "find/install a working Python
-interpreter and hand off to `aipotluck/installer/install.py`" is the exact same
-code path already tested end-to-end on Linux (`aipotluck/installer/`, `aipotluck/service/`)
--- the untested surface is narrowly: winget's actual install behavior,
-schtasks syntax correctness, and the pywin32 ServiceFramework contract.
+Tested on Windows 10 22H2: the per-user logon task registers as a standard
+user, reports its real state, and the service it starts tears its children
+down on any kind of stop (the Job Object). Everything downstream of
+"find/install a working Python interpreter and hand off to
+`aipotluck/installer/install.py`" is the exact same code path already tested
+end-to-end on Linux and run on Windows (`aipotluck/installer/`, `aipotluck/service/`).
+
+Unverified here, narrowly: winget's actual install behavior (the test
+machine already had Python, and a machine without it is the case that
+matters), and the pywin32 ServiceFramework contract used by `--system`.
 
 ## Future work
 

@@ -187,10 +187,9 @@ def _add_to_user_path_windows(bin_dir: Path) -> bool:
     PATH edit is recoverable (the shim file itself is still written) and must not fail the whole
     install over it.
 
-    STUB STATUS: implemented against documented Win32/registry behavior, not exercised on real
-    Windows hardware (no Windows host available in this environment) -- same caveat as the rest
-    of this repo's Windows path (see aipotluck/installer/python_bootstrap.py,
-    aipotluck/installer/service/windows_service.py).
+    STUB STATUS: the registry edit and the WM_SETTINGCHANGE broadcast are implemented against
+    documented Win32 behavior, but the broadcast has never been watched on a Windows desktop. It is
+    best-effort either way -- a new shell sees the PATH change regardless.
     """
     try:
         import winreg

@@ -279,7 +279,7 @@ class WindowsServiceManager(ServiceManager):
         host_script = Path(__file__).resolve().parent.parent.parent / "service" / "windows_service_host.py"
         python_exe = exec_path  # the resolved python.exe from platform_bootstrap
         cmd = [str(python_exe), str(host_script), "--startup", "auto", "install"]
-        log.info("Registering Windows Service (STUB, untested): %s", " ".join(cmd))
+        log.info("Registering Windows Service: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Windows Service registration failed: {result.stderr.strip()}")

@@ -5,11 +5,11 @@
 # `python -m aipotluck.installer.install` can't run without Python, so
 # something that doesn't need Python has to get Python first).
 #
-# STUB STATUS: written against documented winget/PowerShell behavior, not
-# exercised on real Windows hardware (no Windows host available in this
-# environment). Logic mirrors aipotluck/installer/python_bootstrap.py's
-# Windows path so both entry points agree; that module is the one covered
-# by unit-style testing (see tests), this script just drives it.
+# STUB STATUS: written against documented winget/PowerShell behavior and not
+# itself run. Logic mirrors aipotluck/installer/python_bootstrap.py's Windows
+# path so both entry points agree; that module is the one covered by
+# unit-style testing (see tests), this script just drives it. The winget
+# branch that installs Python when it is missing has never been exercised.
 #
 # Usage (from an elevated OR regular PowerShell prompt):
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1

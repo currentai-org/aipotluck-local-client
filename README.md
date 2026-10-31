@@ -27,23 +27,27 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale.
 | Windows GTX 1660 Ti | Windows 10 Pro | CPU | prebuilt `windows-x64-cpu` asset | confirmed |
 | Windows GTX 1660 Ti | Windows 10 Pro | CUDA | prebuilt `windows-x64-cuda` asset | confirmed |
 
-Everything else in "Status" just below is implemented against documented OS
-conventions but not run on real hardware yet.
+What is still unverified on each OS is named under "Status" below.
 
 ## Status
 
 - Linux: implemented and tested (systemd --user service backend, live
   llama-server supervision with crash-restart, verified end-to-end with a
   real model download and inference request).
-- macOS: implemented per Apple's documented launchd/plist conventions,
-  reusing the identical, already-tested service payload. **Untested** (no
-  macOS host available in this environment). See
+- macOS: tested on both Macs above, with the launchd service backend --
+  install, `status`, `login`, `logout` and `uninstall` were all run on real
+  Macs, which is where the two launchd bugs it now avoids came from. See
   `aipotluck/installer/service/launchd.py`, `packaging/macos/README.md`.
-- Windows: implemented per documented winget/schtasks/pywin32 conventions,
-  including a PowerShell bootstrapper (`packaging/windows/install.ps1`)
-  that installs Python itself via winget if none is found, plus a real
-  pywin32 Windows Service host for the `--system` path. **Untested** (no
-  Windows host available). See `aipotluck/installer/service/windows_service.py`,
+- Windows: tested on the Windows 10 box above -- install, the per-user logon
+  task registered as a standard user, `login` (newt downloaded and
+  checksum-verified), llama-server answering through the router, and every
+  child process torn down on stop. Three things remain unproven there:
+  installing Python itself via winget (that box already had one, and a stock
+  Windows machine has none -- the path a public one-line install actually
+  takes), the pywin32 Service host behind `--system`, and that the logon
+  task starts the service at an interactive sign-in (the box was reached
+  over SSH, where a network logon token cannot register tasks). See
+  `aipotluck/installer/service/windows_service.py`,
   `aipotluck/service/windows_service_host.py`, `aipotluck/installer/python_bootstrap.py`,
   `packaging/windows/README.md`.
 
@@ -787,7 +791,7 @@ aipotluck/                      the root package everything below lives under
     service/
       base.py                       ServiceManager ABC
       systemd.py                    Linux (tested)
-      launchd.py                    macOS (stub, untested)
+      launchd.py                    macOS (tested)
       windows_service.py            Windows: schtasks (no-admin) + pywin32 (--system)
   service/
     runner.py                       portable AipotluckServiceRunner (HTTP status + both supervisors,

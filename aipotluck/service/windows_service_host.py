@@ -6,8 +6,9 @@ so llama-server supervision can run as a proper Windows Service -- started
 at boot, no login required, restarted by the SCM on crash.
 
 STUB STATUS: written against documented pywin32 APIs
-(https://github.com/mhammond/pywin32), not exercised on real Windows
-hardware (no Windows host available in this environment). Requires:
+(https://github.com/mhammond/pywin32) and **not yet run on real Windows
+hardware** -- unlike the default per-user path, a Scheduled Task, which
+has been. Requires:
     pip install aipotluck-local-client[windows]
 
 CLI, driven by aipotluck/installer/service/windows_service.py:
@@ -66,8 +67,8 @@ def _setup_logging(log_dir: Path | None) -> None:
 
 
 class AipotluckWindowsService(win32serviceutil.ServiceFramework):
-    """STUB: implemented per pywin32's documented ServiceFramework contract,
-    not run on real Windows. SvcDoRun/SvcStop are the two SCM callbacks;
+    """Implemented per pywin32's documented ServiceFramework contract, not
+    yet run on real Windows. SvcDoRun/SvcStop are the two SCM callbacks;
     everything else is delegated to the same AipotluckServiceRunner used by
     every other OS."""
 
