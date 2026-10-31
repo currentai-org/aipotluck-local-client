@@ -42,7 +42,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$DefaultRepoUrl = "https://github.com/currentai-org/aitpotluck-local-client.git"
+$DefaultRepoUrl = "https://github.com/currentai-org/aipotluck-local-client.git"
 
 $repoUrl = if ($RepoUrl) { $RepoUrl } elseif ($env:AIPOTLUCK_REPO_URL) { $env:AIPOTLUCK_REPO_URL } else { $DefaultRepoUrl }
 $ref = if ($Ref) { $Ref } elseif ($env:AIPOTLUCK_REF) { $env:AIPOTLUCK_REF } else { "main" }

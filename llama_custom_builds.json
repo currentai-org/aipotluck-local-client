@@ -1,7 +1,7 @@
 {
   "_comment": "Our own cache of prebuilt llama-server binaries, for hosts/backends upstream doesn't publish (see build_cache.py, README.md's 'Building from source' section). Same shape as llama_version.json's assets section (release_base_url + tag + {key: {file, sha256}}) so fetch.py's download/verify/extract code works unchanged -- only the key format differs (see custom_asset_key in build_cache.py). This file is entirely optional: an empty assets map just falls through to a real source build every time, same as if it didn't exist.",
   "tag": "custom-builds",
-  "release_base_url": "https://github.com/currentai-org/aitpotluck-local-client/releases/download",
+  "release_base_url": "https://github.com/currentai-org/aipotluck-local-client/releases/download",
   "assets": {
     "linux-arm64-cuda-sm87": {
       "file": "llama-b10989-bin-linux-arm64-cuda-sm87.tar.gz",

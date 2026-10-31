@@ -541,7 +541,7 @@ and piped into a shell (`curl ... | bash`, `irm ... | iex`):
   `packaging/windows/install.ps1` (the one that finds-or-installs Python).
 
 Both scripts default to the real public clone URL
-(`https://github.com/currentai-org/aitpotluck-local-client.git`), overridable via
+(`https://github.com/currentai-org/aipotluck-local-client.git`), overridable via
 `AIPOTLUCK_REPO_URL` for a fork or a local mirror -- see README.md's "One-line
 public installer" section for exact end-user usage.
 

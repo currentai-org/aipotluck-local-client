@@ -50,7 +50,7 @@
 
 set -euo pipefail
 
-DEFAULT_REPO_URL="https://github.com/currentai-org/aitpotluck-local-client.git"
+DEFAULT_REPO_URL="https://github.com/currentai-org/aipotluck-local-client.git"
 
 REPO_URL="${AIPOTLUCK_REPO_URL:-$DEFAULT_REPO_URL}"
 REF="${AIPOTLUCK_REF:-main}"

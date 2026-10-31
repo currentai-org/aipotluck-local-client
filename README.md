@@ -60,15 +60,15 @@ only the OS-native "keep this process running" registration differs
 
 Linux / macOS:
 ```bash
-git clone https://github.com/currentai-org/aitpotluck-local-client.git
-cd aitpotluck-local-client
+git clone https://github.com/currentai-org/aipotluck-local-client.git
+cd aipotluck-local-client
 python3 -m aipotluck.installer.install --backend auto
 ```
 
 Windows (no prerequisites, installs Python itself if missing):
 ```powershell
-git clone https://github.com/currentai-org/aitpotluck-local-client.git
-cd aitpotluck-local-client
+git clone https://github.com/currentai-org/aipotluck-local-client.git
+cd aipotluck-local-client
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
 
@@ -86,24 +86,24 @@ a shell -- no manual `git clone` step required:
 
 ```bash
 # Linux / macOS -- standard practice for this kind of installer: no arguments needed.
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | bash
 
 # advanced use only -- installer flags, passed straight through:
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | bash -s -- --backend cuda --model-hf "org/repo:Q4_K_M"
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | bash -s -- --backend cuda --model-hf "org/repo:Q4_K_M"
 
 # pointing at a fork/branch instead of the default: the env vars have to go on bash's side of the
 # pipe, not curl's -- a leading assignment on a pipeline only applies to the first command in it
 # (curl here), so putting them before curl silently does nothing.
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | \
   AIPOTLUCK_REPO_URL=https://github.com/<owner>/<fork>.git AIPOTLUCK_REF=main bash
 ```
 
 ```powershell
 # Windows, no arguments:
-irm https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.ps1 | iex
 
 # Windows, with arguments (irm|iex can't take params directly, use this form):
-$script = irm https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.ps1
+$script = irm https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.ps1
 Invoke-Expression "& { $script } -Backend cuda -System"
 ```
 

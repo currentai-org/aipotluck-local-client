@@ -57,7 +57,7 @@ from aipotluck.installer.platform_detect import (  # noqa: E402
 log = logging.getLogger("package_custom_build")
 
 CUSTOM_MANIFEST_PATH = REPO_ROOT / "llama_custom_builds.json"
-RELEASE_REPO = "currentai-org/aitpotluck-local-client"
+RELEASE_REPO = "currentai-org/aipotluck-local-client"
 _RELOCATION_FAILURE_SIGNATURES = (
     "error while loading shared libraries",  # Linux (glibc dynamic linker)
     "image not found",  # macOS (dyld)
