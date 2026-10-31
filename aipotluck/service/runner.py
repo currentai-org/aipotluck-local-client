@@ -72,7 +72,7 @@ def load_runtime_config(config_dir: Path) -> dict:
 
 
 def build_llama_server_args(llama_cfg: dict) -> list[str]:
-    """Router mode (CUR-1965's follow-up): deliberately no `-hf`/`--model`/`--ctx-size`/
+    """Router mode: deliberately no `-hf`/`--model`/`--ctx-size`/
     `--parallel`/`--cache-type-k`/`-v` of our own. Passing no model at all puts llama-server into
     its own native multi-model router (confirmed against
     vendor/llama.cpp/tools/server/server-models.cpp): it auto-discovers every model already in the
@@ -178,8 +178,8 @@ def _sized_by_old_policy(presets_path: Path, model_id: str) -> bool:
 
 
 def backfill_missing_presets(llama_cfg: dict, *, progress=lambda _message: None) -> dict:
-    """Sizes every cached model that has no `--models-preset` section (CUR-1965's "on pull OR on
-    startup if it's found to be missing") -- recovering from a deleted/hand-edited-away presets
+    """Sizes every cached model that has no `--models-preset` section (sizing runs on pull, or at
+    startup if a preset is found missing) -- recovering from a deleted/hand-edited-away presets
     file, or a model that reached the cache some other way -- then reloads the router so the new
     presets take effect.
 

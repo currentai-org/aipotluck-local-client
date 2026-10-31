@@ -7,9 +7,8 @@ reachable from the SvelteKit backend over some API/control-plane. The
 client library runs inside aipotluck-local-client's monitor service. During
 install, the user links their local client to SvelteKit by exchanging an
 access token; SvelteKit then configures the reverse-proxy service to accept
-that client's connection and starts routing requests to it. All four full
-plans (cloned repos, real source/docs, not guesses) are in
-`implementation-plans/{chissl,pangolin,wstunnel,sish}/PLAN.md`.
+that client's connection and starts routing requests to it. Each tool was
+assessed from its source and docs; the Pangolin plan is in [PLAN.md](PLAN.md).
 
 ## At a glance
 
@@ -33,10 +32,8 @@ binding routes) at all; sish at least offers a read-only admin API and a
 synchronous authorization callback hook, while wstunnel offers literally
 nothing beyond CLI flags and two hot-reloaded config files.
 
-This inverts the picture from the earlier abstract survey scores. wstunnel
-and sish scored 5/5 there because that survey weighted client-leanness and
-tool maturity heavily and treated "server is a separate binary" as the only
-real cost. Once you actually design the concrete "SvelteKit registers a
+On client leanness and tool maturity alone, wstunnel and sish look like the
+strongest options. Once you actually design the concrete "SvelteKit registers a
 tunnel, links a device, and polls status" workflow, the *lack of a control-
 plane API* in wstunnel/sish surfaces as a large, unavoidable amount of
 custom backend work — a device registry, token issuer, config-file
@@ -83,8 +80,7 @@ SvelteKit binds a route + polls status" is close to a first-class supported
 flow rather than something we construct on top of low-level primitives. The
 tradeoffs are real: it's the heaviest deployment (Docker Compose with three
 containers, WireGuard kernel capabilities `NET_ADMIN`/`SYS_MODULE` on the
-Gerbil component — though the *client* newt itself is TUN-free per prior
-research), and some of its API surface (exact GET/list routes, the precise
+Gerbil component — though the *client* newt itself is TUN-free), and some of its API surface (exact GET/list routes, the precise
 mechanism flipping a site's `online` flag) wasn't fully traceable through
 static reading alone and would need a hands-on spike to nail down before
 committing.
@@ -95,8 +91,7 @@ single-binary deployment, at the cost of having to build our own routing
 layer (it has no hostname-based dispatch) and a somewhat unusual
 static-password client auth model in place of a token exchange.
 
-**wstunnel and sish should now be considered a materially larger build**,
-despite their strong scores in the abstract survey — both are excellent,
+**wstunnel and sish would be a materially larger build** — both are excellent,
 mature *transport* layers, but neither ships the control-plane, device
 registry, or routing logic this scenario needs, so choosing either means
 building most of what Pangolin/chiSSL already provide, on top of a

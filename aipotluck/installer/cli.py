@@ -22,7 +22,7 @@ Usage:
     aipotluck-local-client list     # list models already downloaded locally, with their grades
     aipotluck-local-client benchmark [model]        # measure speed without re-downloading
 
-llama-server itself runs in router mode (CUR-1965) -- one always-running process that serves
+llama-server itself runs in router mode -- one always-running process that serves
 whichever model an inference request's own "model" field names, loading/unloading instances on
 demand (see vendor/llama.cpp/tools/server/server-models.cpp). There's no single "active model" for
 this CLI to set anymore; `pull` just makes sure a model is downloaded and correctly sized
@@ -85,7 +85,7 @@ def _common_args_parser() -> argparse.ArgumentParser:
     namespace and then unconditionally overwrites the outer one with it (`_SubParsersAction.
     __call__` passes `None`, not the existing namespace, to the subparser's own parse_known_args) --
     so a flag declared on BOTH the top parser and a subparser silently reverts to the subparser's
-    own default the moment it's given before the subcommand name, with no error. Confirmed live:
+    own default the moment it's given before the subcommand name, with no error. For example,
     `aipotluck-local-client --install-dir X login` silently ignored X and wrote to the default
     install dir instead; `aipotluck-local-client login --install-dir X` (this design) fails loudly
     on an unrecognized argument if given in the wrong position rather than acting on the wrong
@@ -444,7 +444,7 @@ def run_status(_args: argparse.Namespace) -> int:
     # See CLAUDE.md's "Runtime parameters" convention: anything this project computes
     # automatically (not just what the user passed at install time) must be traceable here, not
     # just over HTTP -- this reads the exact same `runtime_params` GET /status already returns,
-    # never a second, potentially-drifting summary of it. Router mode (CUR-1965's follow-up) means
+    # never a second, potentially-drifting summary of it. Router mode means
     # there's no single active model to summarize -- print router-level params, then every SIZED
     # model with its own ctx_size/parallel/cache_type and why.
     params = payload.get("runtime_params")
@@ -517,7 +517,7 @@ def run_pull_model(args: argparse.Namespace) -> int:
     """Downloads `args.model` via llama-server's own downloader (see model_pull.py), sizes it
     (aipotluck.installer.model_sizing -- ctx_size/parallel/cache_type_k/-v, written into the
     router's --models-preset INI file), then asks a running router to pick both up immediately.
-    There's no "active model" to set anymore -- llama-server's router mode (CUR-1965) serves
+    There's no "active model" to set anymore -- llama-server's router mode serves
     whichever model a request's own "model" field names, autoloading on demand; `pull` just makes
     sure that works well (downloaded + correctly sized) the first time it's actually requested.
     Independent of login state: pulling a model doesn't need (or touch) pairing.
@@ -597,7 +597,7 @@ def run_list_models(args: argparse.Namespace) -> int:
         print("No models cached locally yet -- pull one with `aipotluck-local-client pull <repo[:quant]>`.")
         return 0
 
-    # Router mode (CUR-1965's follow-up): there's no single "active" model anymore -- any cached
+    # Router mode: there's no single "active" model anymore -- any cached
     # model can be requested at any time. "not sized yet" instead marks whether `pull` (or the
     # service's own startup backfill) has already computed a preset for it.
     held_back = {m["id"]: m["held_back"] for m in models if m["held_back"]}

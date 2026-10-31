@@ -27,23 +27,27 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design rationale.
 | Windows GTX 1660 Ti | Windows 10 Pro | CPU | prebuilt `windows-x64-cpu` asset | confirmed |
 | Windows GTX 1660 Ti | Windows 10 Pro | CUDA | prebuilt `windows-x64-cuda` asset | confirmed |
 
-Everything else in "Status" just below is implemented against documented OS
-conventions but not run on real hardware yet.
+What is still unverified on each OS is named under "Status" below.
 
 ## Status
 
 - Linux: implemented and tested (systemd --user service backend, live
   llama-server supervision with crash-restart, verified end-to-end with a
   real model download and inference request).
-- macOS: implemented per Apple's documented launchd/plist conventions,
-  reusing the identical, already-tested service payload. **Untested** (no
-  macOS host available in this environment). See
+- macOS: tested on both Macs above, with the launchd service backend --
+  install, `status`, `login`, `logout` and `uninstall` were all run on real
+  Macs, which is where the two launchd bugs it now avoids came from. See
   `aipotluck/installer/service/launchd.py`, `packaging/macos/README.md`.
-- Windows: implemented per documented winget/schtasks/pywin32 conventions,
-  including a PowerShell bootstrapper (`packaging/windows/install.ps1`)
-  that installs Python itself via winget if none is found, plus a real
-  pywin32 Windows Service host for the `--system` path. **Untested** (no
-  Windows host available). See `aipotluck/installer/service/windows_service.py`,
+- Windows: tested on the Windows 10 box above -- install, the per-user logon
+  task registered as a standard user, `login` (newt downloaded and
+  checksum-verified), llama-server answering through the router, and every
+  child process torn down on stop. Three things remain unproven there:
+  installing Python itself via winget (that box already had one, and a stock
+  Windows machine has none -- the path a public one-line install actually
+  takes), the pywin32 Service host behind `--system`, and that the logon
+  task starts the service at an interactive sign-in (the box was reached
+  over SSH, where a network logon token cannot register tasks). See
+  `aipotluck/installer/service/windows_service.py`,
   `aipotluck/service/windows_service_host.py`, `aipotluck/installer/python_bootstrap.py`,
   `packaging/windows/README.md`.
 
@@ -56,15 +60,15 @@ only the OS-native "keep this process running" registration differs
 
 Linux / macOS:
 ```bash
-git clone https://github.com/currentai-org/aitpotluck-local-client.git
-cd aitpotluck-local-client
+git clone https://github.com/currentai-org/aipotluck-local-client.git
+cd aipotluck-local-client
 python3 -m aipotluck.installer.install --backend auto
 ```
 
 Windows (no prerequisites, installs Python itself if missing):
 ```powershell
-git clone https://github.com/currentai-org/aitpotluck-local-client.git
-cd aitpotluck-local-client
+git clone https://github.com/currentai-org/aipotluck-local-client.git
+cd aipotluck-local-client
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
 
@@ -82,24 +86,24 @@ a shell -- no manual `git clone` step required:
 
 ```bash
 # Linux / macOS -- standard practice for this kind of installer: no arguments needed.
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | bash
 
 # advanced use only -- installer flags, passed straight through:
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | bash -s -- --backend cuda --model-hf "org/repo:Q4_K_M"
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | bash -s -- --backend cuda --model-hf "org/repo:Q4_K_M"
 
 # pointing at a fork/branch instead of the default: the env vars have to go on bash's side of the
 # pipe, not curl's -- a leading assignment on a pipeline only applies to the first command in it
-# (curl here), so putting them before curl silently does nothing (confirmed live, CUR-1965).
-curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | \
+# (curl here), so putting them before curl silently does nothing.
+curl -fsSL https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.sh | \
   AIPOTLUCK_REPO_URL=https://github.com/<owner>/<fork>.git AIPOTLUCK_REF=main bash
 ```
 
 ```powershell
 # Windows, no arguments:
-irm https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.ps1 | iex
 
 # Windows, with arguments (irm|iex can't take params directly, use this form):
-$script = irm https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.ps1
+$script = irm https://raw.githubusercontent.com/currentai-org/aipotluck-local-client/main/install.ps1
 Invoke-Expression "& { $script } -Backend cuda -System"
 ```
 
@@ -185,7 +189,7 @@ Two concrete cases this covers today:
   `linux-arm64-cuda` asset.
 - **The best available asset needs a newer glibc than the host has** --
   llama.cpp's release CI builds its Linux arm64 assets against a newer base
-  image than most arm64 boards actually run. Confirmed live: the pinned
+  image than most arm64 boards actually run. The pinned
   `linux-arm64-cpu` asset needs glibc 2.38; JetPack 6.2.3 (Ubuntu 22.04)
   ships 2.35, so even the CPU-only fallback refuses to start there.
 
@@ -197,9 +201,9 @@ against every Linux job in llama.cpp's own release CI (cpu/cuda/vulkan/rocm),
 intersected with what a native build of just the `llama-server` target
 actually needs (their CI installs several things -- `ninja-build`,
 `python3-venv`, `git-lfs`, `libjpeg-dev` -- for its own portable-build/test
-concerns that don't apply here; confirmed `libjpeg-dev` isn't even a real
-llama.cpp dependency, since image loading goes through the header-only
-`stb_image` instead of libjpeg). See `source_build.py`'s module docstring for
+concerns that don't apply here; `libjpeg-dev` isn't a llama.cpp dependency at
+all, since image loading goes through the header-only `stb_image` instead of
+libjpeg). See `source_build.py`'s module docstring for
 the full evidence trail.
 
 For everything except a GPU vendor toolchain, the installer can install the
@@ -377,7 +381,7 @@ install, which skips the shim) fall back to
 connected"** (`tunnel_connected` in its output) -- these are genuinely different claims. `newt`
 retries forever on its own and never exits just because it can't reach Pangolin, so a real
 connection failure looks identical to success under `running: true` unless this is checked
-explicitly (confirmed live: a device ran with `running: true` for 20+ hours while the tunnel was
+explicitly (one device ran with `running: true` for 20+ hours while the tunnel was
 never actually up, because Pangolin's endpoint was pointing at an address the device couldn't
 reach).
 
@@ -385,7 +389,7 @@ The check (`aipotluck/service/newt_supervisor.py`) combines two signals, in prio
 
 1. **newt's own `--health-file`** (newt >= 1.17.0) -- a real runtime signal newt computes from its
    actual connection state, not text matching. It writes the literal content `ok` once genuinely
-   connected. **Confirmed live that this is not sufficient alone**: newt never refreshes it on
+   connected. **This is not sufficient alone**: newt never refreshes it on
    later pings, and critically does *not* clear it if an already-established connection later
    drops -- killing a real, connected Pangolin server out from under a live newt process left the
    file saying `ok` while newt went straight into its own `ERROR:`-logged retry loop. A stale `ok`
@@ -405,7 +409,7 @@ e.g. right after a fresh start) is left alone rather than treated as a failure.
 
 ## Models: pull / list
 
-`llama-server` runs in its own **router mode** (CUR-1965): the service never pins a single
+`llama-server` runs in its own **router mode**: the service never pins a single
 `-hf`/`--model` of its own. One always-running process auto-discovers every model already in the
 Hugging Face cache and serves whichever one an inference request's own `"model"` field names,
 loading/unloading instances on demand (`--models-max` caps how many at once -- `1` by default, see
@@ -563,13 +567,6 @@ Two details worth knowing, both of which came out of measuring real hardware rat
 - **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and right after a
   download the file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
   `posix_fadvise(DONTNEED)` drops it first and a real sequential read is timed instead.
-- **The safety factor is measured, not guessed.** Checked against real full turns, the fit
-  under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
-  excludes tokenization and sampling from its numbers, nothing measures the chat template on top,
-  and real cost grows a little faster than linearly past the deepest point the probe can afford.
-  At the original 1.25x that left a turn at `N_fit` really taking ~169s against a 155s budget, so
-  the grade would have promised something false. It is 1.5x (1.75x for the live-server fallback),
-  which puts the same turn at ~141s.
 
 A model `pull` rejects -- one sizing proves cannot load, or cannot hold a usable context -- **is
 deleted** (`pull --force` keeps it anyway), via a router's own `DELETE /models` (which reuses llama.cpp's
@@ -587,7 +584,7 @@ second, and works whether or not the service is running. The service's router is
 unload the model first, then to reload once its preset section has been dropped. `remove` takes the
 same path.
 
-**`pull` does not benchmark.** It used to, and the measurement made every pull minutes longer than
+**`pull` does not benchmark.** The measurement would make every pull minutes longer than
 its download for a verdict nobody had asked for yet. A pull downloads and sizes; `benchmark`
 measures, on request, and `list` marks every model that has not been measured. A pull still rejects
 a model that sizing proves cannot load or cannot hold a usable context, since that verdict comes for
@@ -603,11 +600,6 @@ router instead (`model_perf_live.py`), labelled as such and graded more conserva
 a skipped grade or one gone stale after a llama.cpp upgrade or a re-size. Grades live in
 `llama_presets.performance.json` beside the presets file, with a device fingerprint so a stale one
 is shown as stale rather than silently trusted.
-
-**Validating the extrapolation is part of the work, not an afterthought:**
-`scripts/validate_model_perf.py` predicts a grid of turn sizes, then actually runs turns at those
-sizes and fails when the predictions do not hold -- in particular when they are optimistic, which
-is the only direction that hurts users.
 
 ### Router mode and memory budgeting
 
@@ -780,14 +772,14 @@ aipotluck/                      the root package everything below lives under
     fetch.py                       download+checksum+extract llama.cpp releases
     newt_fetch.py                  download+checksum-verify the pinned newt binary
     model_pull.py                   `pull`/`list`: download a model ahead of time via -hf, list what's cached
-    model_sizing.py                 auto-size ctx_size/parallel/cache_type_k/-v per model (router mode, CUR-1965)
+    model_sizing.py                 auto-size ctx_size/parallel/cache_type_k/-v per model (router mode)
     model_presets.py                read/write the --models-preset INI + its sibling tuning-reasons JSON
     layout.py                      per-OS install paths
     python_bootstrap.py            find/install a suitable Python (Windows: via winget)
     service/
       base.py                       ServiceManager ABC
       systemd.py                    Linux (tested)
-      launchd.py                    macOS (stub, untested)
+      launchd.py                    macOS (tested)
       windows_service.py            Windows: schtasks (no-admin) + pywin32 (--system)
   service/
     runner.py                       portable AipotluckServiceRunner (HTTP status + both supervisors,

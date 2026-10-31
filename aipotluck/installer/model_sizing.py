@@ -1,5 +1,4 @@
-"""Automatic per-model runtime-parameter sizing for llama-server's router mode
-(CUR-1965's follow-up).
+"""Automatic per-model runtime-parameter sizing for llama-server's router mode.
 
 The service runs `llama-server` in **router mode** (`aipotluck/service/runner.py`'s
 `build_llama_server_args`: no `-hf`/`--model` of its own) -- a single always-running process that
@@ -20,7 +19,7 @@ a model that reached the cache some other way).
 Which memory the budget comes from is `memory_budget.detect`'s call, made when the model is probed:
 the free VRAM of a discrete GPU, free shared memory on a unified-memory GPU (Apple silicon, Jetson,
 integrated graphics), or free system memory for a CPU build -- less a safety margin. Budgeting a
-discrete GPU against total system RAM, as this module used to, sized a 4B model to a 262k context
+discrete GPU against total system RAM sizes a 4B model to a 262k context
 on a 6GB card; llama.cpp then moved most of its layers to the CPU to fit the KV cache, and
 generation ran ~10x slower. See memory_budget's docstring.
 
@@ -227,7 +226,7 @@ def probe_model_profile(
     # compute_sizing) -- probing at the same slot count the real deployment will use keeps this
     # representative, though unlike the live-memory design this replaced, the memory budget below
     # no longer depends on anything measured during this probe.
-    # --verbose: confirmed live against a real device (CUR-1965) that llama-server's print_info:
+    # --verbose: llama-server's print_info:
     # hparam lines (n_ctx_train, n_embd_k_gqa, ...) this probe depends on are gated behind a
     # verbosity threshold NOT met at default settings on at least one real build -- the vendored
     # source's LOG_DEFAULT_LLAMA constant suggested INFO-level would print by default, but that
@@ -370,7 +369,7 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
     tuning = {
         "parallel": (
             "single-user local device -- 1 slot instead of llama-server's default 4 maximizes "
-            "usable context for the same memory budget (CUR-1965)"
+            "usable context for the same memory budget"
         )
     }
 

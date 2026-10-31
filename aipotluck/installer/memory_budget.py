@@ -1,11 +1,11 @@
 """Which memory a model's weights and KV cache will actually live in, and how much of it is free.
 
-Sizing used to budget against 80% of TOTAL system RAM regardless of backend. On a discrete GPU that
+Budgeting against 80% of TOTAL system RAM regardless of backend is wrong on a discrete GPU, where it
 is the wrong pool entirely: a 16GB Windows box with a 6GB GTX 1660 Ti sized Qwen3.5-4B to its full
 262,144-token context, llama.cpp then pushed most layers off the GPU to make room for the KV cache,
 and generation ran at ~4 tok/s instead of the ~40 the card manages with a context that fits.
 
-So the budget now comes from the pool the backend really allocates from:
+So the budget comes from the pool the backend really allocates from:
 
 - **vram** -- a discrete GPU (CUDA/Vulkan/ROCm on a card with its own memory): the device's free
   memory, as llama.cpp itself reports it (`llama-server --list-devices`).
@@ -15,7 +15,7 @@ So the budget now comes from the pool the backend really allocates from:
   reports for an integrated device (MemAvailable, see ggml-cuda.cu's UMA branch).
 - **system** -- CPU-only builds, or a GPU we could not read: free system memory.
 
-Free, not total: the old docstring argued for total RAM as "a stable hardware fact", but on a GPU
+Free, not total: total RAM looks like "a stable hardware fact", but on a GPU
 the free figure is what decides whether the layers land on it -- the desktop compositor alone held
 ~1GB of that 6GB card. A safety margin (`margin_bytes`) is kept back on top, matching llama.cpp's
 own `--fit` default of 1GiB per device, or 10% of the pool if that is larger.

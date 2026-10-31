@@ -58,7 +58,7 @@ def _stable_environment(monkeypatch):
 class TestRuntimeParams:
     """The traceability surface CLAUDE.md's "Runtime parameters" convention requires: any
     automatically-computed runtime parameter (per-model ctx_size/parallel/cache_type_k/-v, per
-    CUR-1965's router-mode auto-sizing) must be readable from one real place, not reconstructed
+    router-mode auto-sizing) must be readable from one real place, not reconstructed
     per-consumer. Router mode means there's no single "active model" anymore -- this reports
     router-level params plus every SIZED model, keyed by id, read from real files (the
     --models-preset INI + its sibling tuning JSON) rather than pure dict logic, so real file I/O

@@ -2,7 +2,7 @@
 
 build_strategy.py already tells us when no upstream release asset is viable -- every Jetson-class
 arm64+CUDA board hits this, and a from-source build there takes 30-90 minutes even on a good day
-(confirmed live: ~35 minutes at -j3 on a Jetson Orin Nano). Once we've paid that cost once for a
+(about 35 minutes at -j3 on a Jetson Orin Nano). Once we've paid that cost once for a
 given (os, arch, backend, GPU architecture) combination, there's no reason to pay it again on every
 matching host -- we can build the binary exactly once, archive it in the same format as the
 upstream release assets, host it as a release on this project's own public repo, and let install.py

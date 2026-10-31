@@ -33,9 +33,8 @@ class RouterStub:
     assert the fit recovers it -- exactly as the fake llama-bench in test_model_perf.py does.
 
     It SLEEPS for the duration it reports in `timings`, so a caller measuring wall clock and a
-    caller reading the timings block see the same thing. That is what makes it usable for
-    validate_model_perf.py, which compares predictions against measured wall clock; tests using it
-    that way pick per-token costs small enough to keep the whole run to a couple of seconds.
+    caller reading the timings block see the same thing; tests using it that way pick per-token
+    costs small enough to keep the whole run to a couple of seconds.
     """
 
     def __init__(self, *, prefill_base=1.0, prefill_slope=0.0, decode_base=20.0, decode_slope=0.0,

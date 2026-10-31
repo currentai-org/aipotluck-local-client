@@ -394,7 +394,7 @@ def pull(
     """Download a model and size it. `download_progress(received_bytes, total_bytes_or_None)` is
     called as the download runs; `progress` gets a message per step.
 
-    It is deliberately NOT benchmarked here. Measuring used to be part of every pull, and it made
+    It is deliberately NOT benchmarked here. Measuring is not part of a pull, because it would make
     the pull minutes longer than the download for a verdict the user had not asked for yet;
     `benchmark` does it on request, and `list` says which models have not been measured. Sizing
     stays, because the router needs a preset before the model's first turn, and a model sizing

@@ -59,7 +59,7 @@ class TestLoadRuntimeConfig:
 
 
 class TestBuildLlamaServerArgs:
-    """Router mode (CUR-1965's follow-up): no -hf/--model/--ctx-size/--parallel/--cache-type-k/-v
+    """Router mode: no -hf/--model/--ctx-size/--parallel/--cache-type-k/-v
     of our own -- those are per-model now, set in the --models-preset INI file instead (see
     test_model_presets.py/test_model_sizing.py). This just covers the router-level args."""
 

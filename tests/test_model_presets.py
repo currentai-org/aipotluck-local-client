@@ -1,4 +1,4 @@
-"""aipotluck.installer.model_presets -- the INI read/write half of CUR-1965's router-mode preset
+"""aipotluck.installer.model_presets -- the INI read/write half of router-mode preset
 generation. Real file I/O throughout (no mocks): this is exactly the kind of thing where "looks
 right" and "llama.cpp's own PEG parser actually accepts it" can silently diverge.
 """

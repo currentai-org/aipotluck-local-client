@@ -1,5 +1,5 @@
 """Per-model performance grading: will this model actually finish a turn before the web app
-gives up on it? (CUR-TBD)
+gives up on it?
 
 On a small device -- a CPU-only mini PC, a Jetson-class board -- it is very easy to `pull` a model
 that loads fine, appears in the chat model picker, and then simply never finishes a reply. This
@@ -87,19 +87,13 @@ TURN_BUDGET_MS = 155_000.0
 # purposes the compliant case is the one that matters, and it makes this the natural green line --
 # a model that can deliver this many tokens in budget is never cut off by time.
 
-# Applied to the predicted turn time before comparing it to the budget. It is not padding: the
-# cost model is KNOWN to run optimistic, and this is what keeps the grade's promise true anyway.
-#
-# Measured against real full turns on a CPU-only laptop (Qwen2.5-0.5B Q4_K_M, q8_0 K/V, via
-# `llama-bench -pg`), the fit under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024.
-# Two reasons, both structural rather than fixable by a better fit: llama-bench excludes
-# tokenization and sampling from its numbers (its own README says so) and nothing measures the chat
-# template the app renders on top; and real cost grows slightly faster than linearly past the
-# deepest point the probe can afford to measure.
-#
-# At the old 1.25 that left a turn at N_fit really taking ~169s against a 155s budget -- the grade
-# would have promised something false. 1.5 puts the same turn at ~141s. The validator
-# (scripts/validate_model_perf.py) gates on exactly this: real turn at N_fit must fit the budget.
+# The fit is known to run slightly optimistic, and the guards are in the measurement rather than in
+# a multiplier on the result: the shallow point is anchored at depth 512 (below), and _fit_line
+# refuses a negative slope, which noise alone can produce. Measured against real full turns on a
+# CPU-only laptop (Qwen2.5-0.5B Q4_K_M, q8_0 K/V, via `llama-bench -pg`), the same fit
+# under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench excludes
+# tokenization and sampling from its numbers, nothing measures the chat template on top, and real
+# cost grows a little faster than linearly past the deepest point the probe can afford.
 
 
 

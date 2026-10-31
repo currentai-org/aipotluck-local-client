@@ -6,10 +6,8 @@ its own copy on top. On a 16GB Jetson that was an outright allocation failure
 unloading only the model being measured was not enough, because the router is frequently holding a
 DIFFERENT one.
 
-This module used to also measure a model by driving the router through /v1/chat/completions, as a
-fallback for installs without llama-bench. That path is gone: llama-bench now ships in every
-prebuilt archive and is built from source too, so measurement has one implementation rather than
-two that could disagree.
+Measurement has one implementation: llama-bench ships in every prebuilt archive and is built from
+source too, so there is no router-driven fallback that could disagree with it.
 
 `model_perf` prefers `llama-bench`, which ships in every prebuilt llama.cpp archive. Source-built
 installs are the exception (`source_build.py` now builds it too, but best-effort and only on a
