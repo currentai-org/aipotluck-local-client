@@ -266,8 +266,8 @@ class WindowsServiceManager(ServiceManager):
         aipotluck/service/windows_service_host.py (an AipotluckWindowsService /
         win32serviceutil.ServiceFramework subclass). Requires the pywin32
         package (Windows-only optional dependency) and an elevated (admin)
-        process. STUB -- implemented per pywin32 docs, not exercised on
-        real Windows hardware."""
+        process. This path is unverified: implemented per pywin32's docs and
+        never run on Windows, unlike the Scheduled Task path above."""
         try:
             import win32serviceutil  # type: ignore  # noqa: F401
         except ImportError as exc:
@@ -279,7 +279,11 @@ class WindowsServiceManager(ServiceManager):
         host_script = Path(__file__).resolve().parent.parent.parent / "service" / "windows_service_host.py"
         python_exe = exec_path  # the resolved python.exe from platform_bootstrap
         cmd = [str(python_exe), str(host_script), "--startup", "auto", "install"]
-        log.info("Registering Windows Service: %s", " ".join(cmd))
+        log.warning(
+            "Registering Windows Service: %s -- this --system path is unverified, "
+            "never run on Windows; the default per-user Scheduled Task is the tested one",
+            " ".join(cmd),
+        )
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Windows Service registration failed: {result.stderr.strip()}")
