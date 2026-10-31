@@ -27,7 +27,7 @@
 # does NOT work -- a leading assignment on a pipeline only applies to the first command in it
 # (curl here), never to a later one (bash, which is what actually reads AIPOTLUCK_REF/etc). This
 # is silent, not an error: bash just sees the variable as unset and falls back to its default, so
-# the failure mode is "it quietly checked out main instead," not a visible one (CUR-1965).
+# the failure mode is "it quietly checked out main instead," not a visible one.
 # Put the assignment on bash's side of the pipe instead, or export it beforehand:
 #
 #   curl -fsSL .../install.sh | AIPOTLUCK_REF=my-branch bash

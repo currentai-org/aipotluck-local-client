@@ -2,9 +2,9 @@
 
 Sizing has to load the model to read its hparams, so a model too big for the device crashes the
 probe -- which means the memory-budget check in compute_sizing can never run for exactly the models
-that need it most. Without this handling, such a model would stay installed and unsized: the router discovers the
-HF cache for itself, picks llama-server's defaults, and the failure resurfaces as a dead turn much
-later with nothing connecting it back.
+that need it most. Without this handling, such a model would stay installed and unsized: the router
+discovers the HF cache for itself, picks llama-server's defaults, and the failure resurfaces as a
+dead turn much later with nothing connecting it back.
 
 The case: a Jetson with a 24B model whose 13.35GB of weights and 0.82GB vision projector did
 not fit in 15.6GB of unified memory.

@@ -89,7 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-clie
 
 # pointing at a fork/branch instead of the default: the env vars have to go on bash's side of the
 # pipe, not curl's -- a leading assignment on a pipeline only applies to the first command in it
-# (curl here), so putting them before curl silently does nothing (CUR-1965).
+# (curl here), so putting them before curl silently does nothing.
 curl -fsSL https://raw.githubusercontent.com/currentai-org/aitpotluck-local-client/main/install.sh | \
   AIPOTLUCK_REPO_URL=https://github.com/<owner>/<fork>.git AIPOTLUCK_REF=main bash
 ```
@@ -405,7 +405,7 @@ e.g. right after a fresh start) is left alone rather than treated as a failure.
 
 ## Models: pull / list
 
-`llama-server` runs in its own **router mode** (CUR-1965): the service never pins a single
+`llama-server` runs in its own **router mode**: the service never pins a single
 `-hf`/`--model` of its own. One always-running process auto-discovers every model already in the
 Hugging Face cache and serves whichever one an inference request's own `"model"` field names,
 loading/unloading instances on demand (`--models-max` caps how many at once -- `1` by default, see
@@ -780,7 +780,7 @@ aipotluck/                      the root package everything below lives under
     fetch.py                       download+checksum+extract llama.cpp releases
     newt_fetch.py                  download+checksum-verify the pinned newt binary
     model_pull.py                   `pull`/`list`: download a model ahead of time via -hf, list what's cached
-    model_sizing.py                 auto-size ctx_size/parallel/cache_type_k/-v per model (router mode, CUR-1965)
+    model_sizing.py                 auto-size ctx_size/parallel/cache_type_k/-v per model (router mode)
     model_presets.py                read/write the --models-preset INI + its sibling tuning-reasons JSON
     layout.py                      per-OS install paths
     python_bootstrap.py            find/install a suitable Python (Windows: via winget)

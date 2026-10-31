@@ -94,7 +94,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "e.g. 'bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M' "
              f"(default: {DEFAULT_MODEL_HF} -- a small placeholder model so there's something "
              "ready out of the box; override for real use). llama-server itself runs in router "
-             "mode (CUR-1965) and can serve any model already downloaded, not only this one -- "
+             "mode and can serve any model already downloaded, not only this one -- "
              "see `pull` for downloading/sizing more later.",
     )
     model_group.add_argument(

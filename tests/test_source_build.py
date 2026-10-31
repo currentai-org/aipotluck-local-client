@@ -205,7 +205,7 @@ class TestRecommendedJobs:
 
 
 class TestTotalMemory:
-    """model_sizing's memory budget (CUR-1965) is 80% of this reading. On a host with no
+    """model_sizing's memory budget is 80% of this reading. On a host with no
     /proc/meminfo -- every Mac -- it used to be None, which silently turned the budget off. The
     macOS path is exercised against a stand-in `sysctl` script, not a mock of subprocess."""
 

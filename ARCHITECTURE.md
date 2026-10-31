@@ -294,7 +294,7 @@ now:
 `aipotluck/service/llama_supervisor.py` implements `LlamaSupervisor`, used by
 `aipotluck/service/aipotluck_service.py`:
 
-- On service start, spawns `llama-server` **in router mode** (CUR-1965) with args built from
+- On service start, spawns `llama-server` **in router mode** with args built from
   `runtime.json` (`--host`, `--port`, `--models-preset`, `--models-max`, `--gpu-layers`) -- no
   `-hf`/`--model` of its own. Passing no model puts llama-server into its own native multi-model
   router (confirmed against `vendor/llama.cpp/tools/server/server-models.cpp`): it auto-discovers
@@ -344,7 +344,7 @@ request, `kill -9` on the llama-server child recovered automatically
 (new pid, `restart_count` incremented, healthy again ~35s later), and
 clean shutdown terminates both processes with no orphans.
 
-### 4.5.1 Router mode + automatic per-model sizing (`aipotluck/installer/model_sizing.py`/`model_presets.py`, CUR-1965)
+### 4.5.1 Router mode + automatic per-model sizing (`aipotluck/installer/model_sizing.py`/`model_presets.py`)
 
 This started as a single-model bug (a device silently running with 4x more KV-cache-eating
 parallel slots than a single-user box needs), and the fix became a real architecture change:

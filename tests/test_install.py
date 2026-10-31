@@ -206,7 +206,7 @@ class TestRunInstallNoService:
         assert saved["logged_in"] is False
         assert "tunnel" not in saved
         assert saved["llama_cpp"]["server_binary"] == str(fake_fetch)
-        # Router mode (CUR-1965): no single "active model" in runtime.json anymore -- ctx_size/
+        # Router mode: no single "active model" in runtime.json anymore -- ctx_size/
         # model_hf/model_path all moved to being per-model, in the --models-preset INI file.
         assert "model_hf" not in saved["llama_cpp"]
         assert "model_path" not in saved["llama_cpp"]

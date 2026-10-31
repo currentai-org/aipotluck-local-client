@@ -1,5 +1,5 @@
 """Per-model performance grading: will this model actually finish a turn before the web app
-gives up on it? (CUR-TBD)
+gives up on it?
 
 On a small device -- a CPU-only mini PC, a Jetson-class board -- it is very easy to `pull` a model
 that loads fine, appears in the chat model picker, and then simply never finishes a reply. This

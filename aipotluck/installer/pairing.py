@@ -3,7 +3,7 @@
 The alternative to copying the pairing JSON out of Settings by hand. This CLI makes up a random
 pairing id, opens aipotluck.org's pairing page for it in a browser, and polls aipotluck.org until
 the person's signed-in visit to that page has provisioned a managed endpoint. The server side
-(aipotluck.org, CUR-4110) is two routes:
+(aipotluck.org) is two routes:
 
     GET <server>/chat/local-inference/pair?id=<pairing id>&name=<device name>   (the browser)
     GET <server>/chat/api/v2/local-inference/pairings/<pairing id>              (this module)

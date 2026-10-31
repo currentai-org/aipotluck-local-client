@@ -49,8 +49,8 @@ def pull_model(
     returns at once if it is already there. `on_progress(received_bytes, total_bytes_or_None)` is
     called as bytes arrive. Raises ModelPullError on any failure; never returns partial success.
 
-    It does not load the model to prove it works: sizing loads it straight afterwards anyway, and reports a model that
-    cannot load far more precisely than a failed health check could."""
+    It does not load the model to prove it works: sizing loads it straight afterwards anyway, and
+    reports a model that cannot load far more precisely than a failed health check could."""
     log.info("Pulling %s (this can take a while for a large quant)", hf_target)
     try:
         cache_router.download(server_binary, hf_target, timeout=timeout, on_progress=on_progress)

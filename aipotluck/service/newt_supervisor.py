@@ -47,11 +47,12 @@ BACKOFF_SCHEDULE = [1, 2, 5, 10, 20, 30, 60]
 STABLE_UPTIME_RESET_SECONDS = 120
 POLL_INTERVAL_SECONDS = 5
 
-# newt's own log line for a real, successful control-channel connection -- observed against a
-# real Pangolin tunnel (CUR-1266): "Tunnel connection to server established successfully!". newt logs a fresh "ERROR:"-prefixed line every retry for as long
-# as it's genuinely failing to connect (its own internal retry loop, independent of whether the
-# OS process itself is alive) -- see this module's docstring for why this is now used only as an
-# override signal for a stale health file, not an independent positive claim.
+# newt's own log line for a real, successful control-channel connection, as observed against a real
+# Pangolin tunnel: "Tunnel connection to server established successfully!". newt logs a fresh
+# "ERROR:"-prefixed line every retry for as long as it's genuinely failing to connect (its own
+# internal retry loop, independent of whether the OS process itself is alive) -- see this module's
+# docstring for why this is now used only as an override signal for a stale health file, not an
+# independent positive claim.
 _TUNNEL_CONNECTED_SIGNAL = "established successfully"
 _TUNNEL_ERROR_PREFIX = "ERROR:"
 _LOG_TAIL_BYTES = 16 * 1024
@@ -149,14 +150,15 @@ class NewtSupervisor:
         order. Computed fresh every call (never cached in self._info) -- it has to reflect newt's
         CURRENT state, not a snapshot from whenever it last transitioned.
 
-        Why both are needed (see module docstring): the health file says "ok" once connected but is NEVER updated again on later
-        pings, and -- critically -- is NOT cleared if an already-established connection later
-        drops. So a stale "ok" from an earlier, now-dead connection would read as healthy forever
-        if trusted alone. The log-tail check closes that gap: newt keeps emitting a fresh ERROR
-        line for as long as it's genuinely still failing to (re)connect, so a recent ERROR line
-        overrides a stale "ok". A log line that itself claims success is kept as a fallback
-        positive signal (in case the health file write is momentarily behind, or --health-file
-        was ever unavailable for some reason) rather than an independent source of truth.
+        Why both are needed (see module docstring): the health file says "ok" once connected but is
+        NEVER updated again on later pings, and -- critically -- is NOT cleared if an
+        already-established connection later drops. So a stale "ok" from an earlier, now-dead
+        connection would read as healthy forever if trusted alone. The log-tail check closes that
+        gap: newt keeps emitting a fresh ERROR line for as long as it's genuinely still failing to
+        (re)connect, so a recent ERROR line overrides a stale "ok". A log line that itself claims
+        success is kept as a fallback positive signal (in case the health file write is momentarily
+        behind, or --health-file was ever unavailable for some reason) rather than an independent
+        source of truth.
         """
         if not self.log_dir:
             return None

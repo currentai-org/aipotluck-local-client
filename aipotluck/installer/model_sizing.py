@@ -369,7 +369,7 @@ def compute_sizing(profile: ModelProfile) -> SizingResult:
     tuning = {
         "parallel": (
             "single-user local device -- 1 slot instead of llama-server's default 4 maximizes "
-            "usable context for the same memory budget (CUR-1965)"
+            "usable context for the same memory budget"
         )
     }
 

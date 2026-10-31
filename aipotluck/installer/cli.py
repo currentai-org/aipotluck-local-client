@@ -22,7 +22,7 @@ Usage:
     aipotluck-local-client list     # list models already downloaded locally, with their grades
     aipotluck-local-client benchmark [model]        # measure speed without re-downloading
 
-llama-server itself runs in router mode (CUR-1965) -- one always-running process that serves
+llama-server itself runs in router mode -- one always-running process that serves
 whichever model an inference request's own "model" field names, loading/unloading instances on
 demand (see vendor/llama.cpp/tools/server/server-models.cpp). There's no single "active model" for
 this CLI to set anymore; `pull` just makes sure a model is downloaded and correctly sized
@@ -517,7 +517,7 @@ def run_pull_model(args: argparse.Namespace) -> int:
     """Downloads `args.model` via llama-server's own downloader (see model_pull.py), sizes it
     (aipotluck.installer.model_sizing -- ctx_size/parallel/cache_type_k/-v, written into the
     router's --models-preset INI file), then asks a running router to pick both up immediately.
-    There's no "active model" to set anymore -- llama-server's router mode (CUR-1965) serves
+    There's no "active model" to set anymore -- llama-server's router mode serves
     whichever model a request's own "model" field names, autoloading on demand; `pull` just makes
     sure that works well (downloaded + correctly sized) the first time it's actually requested.
     Independent of login state: pulling a model doesn't need (or touch) pairing.
