@@ -28,7 +28,7 @@ service's own router would leave it running the download inside the very process
 and would not work while the service is stopped, so this uses a scratch router too -- which also
 means the service's router learns about the model on its next reload rather than mid-download.
 
-One thing llama.cpp gets wrong, confirmed against b10989: a repo that does not exist reports
+One llama.cpp behaviour this works around (b10989): a repo that does not exist reports
 `download_finished` all the same (Hugging Face answers 401, and the downloader logs it and carries
 on). So "finished" is never taken as success on its own -- the model has to be in the cache
 afterwards, and when it isn't, the router's own last error line says why.

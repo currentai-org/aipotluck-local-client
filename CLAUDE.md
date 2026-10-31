@@ -20,9 +20,9 @@ before reaching for `pip install .` as a "simpler" alternative to the PATH-shim 
 
 ## Branching, committing, and pushing
 
-This is currently a solo, no-remote project — every commit lands directly on `main`, and that's
-fine for a change scoped the way most changes here are. The discipline that matters isn't which
-branch a commit lands on, it's what's true before it lands:
+The repo has a remote and takes changes through pull requests into `main`; every push and PR runs
+the gate below in CI. The discipline that matters isn't which branch a commit lands on, it's what's
+true before it lands:
 
 - **A change is ready to commit once its tests pass, and — for anything a unit test can't
   reach — once it's been verified for real.** See "Tests and gates" below; a green `pytest` run is

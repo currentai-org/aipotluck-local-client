@@ -201,9 +201,9 @@ against every Linux job in llama.cpp's own release CI (cpu/cuda/vulkan/rocm),
 intersected with what a native build of just the `llama-server` target
 actually needs (their CI installs several things -- `ninja-build`,
 `python3-venv`, `git-lfs`, `libjpeg-dev` -- for its own portable-build/test
-concerns that don't apply here; confirmed `libjpeg-dev` isn't even a real
-llama.cpp dependency, since image loading goes through the header-only
-`stb_image` instead of libjpeg). See `source_build.py`'s module docstring for
+concerns that don't apply here; `libjpeg-dev` isn't a llama.cpp dependency at
+all, since image loading goes through the header-only `stb_image` instead of
+libjpeg). See `source_build.py`'s module docstring for
 the full evidence trail.
 
 For everything except a GPU vendor toolchain, the installer can install the
@@ -567,13 +567,6 @@ Two details worth knowing, both of which came out of measuring real hardware rat
 - **Cold load counts.** `--models-max 1` makes every model switch a fresh load, and right after a
   download the file is still hot in the page cache, so a load timed right then measures RAM rather than disk.
   `posix_fadvise(DONTNEED)` drops it first and a real sequential read is timed instead.
-- **The safety factor is measured, not guessed.** Checked against real full turns, the fit
-  under-predicted by 1.26x at a 4,096-token input and 1.36x at 1,024 -- llama-bench
-  excludes tokenization and sampling from its numbers, nothing measures the chat template on top,
-  and real cost grows a little faster than linearly past the deepest point the probe can afford.
-  At the original 1.25x that left a turn at `N_fit` really taking ~169s against a 155s budget, so
-  the grade would have promised something false. It is 1.5x (1.75x for the live-server fallback),
-  which puts the same turn at ~141s.
 
 A model `pull` rejects -- one sizing proves cannot load, or cannot hold a usable context -- **is
 deleted** (`pull --force` keeps it anyway), via a router's own `DELETE /models` (which reuses llama.cpp's
@@ -607,11 +600,6 @@ router instead (`model_perf_live.py`), labelled as such and graded more conserva
 a skipped grade or one gone stale after a llama.cpp upgrade or a re-size. Grades live in
 `llama_presets.performance.json` beside the presets file, with a device fingerprint so a stale one
 is shown as stale rather than silently trusted.
-
-**Validating the extrapolation is part of the work, not an afterthought:**
-`scripts/validate_model_perf.py` predicts a grid of turn sizes, then actually runs turns at those
-sizes and fails when the predictions do not hold -- in particular when they are optimistic, which
-is the only direction that hurts users.
 
 ### Router mode and memory budgeting
 
