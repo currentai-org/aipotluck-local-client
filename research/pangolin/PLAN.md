@@ -1,8 +1,7 @@
 # Pangolin Implementation Plan — aipotluck-local-client
 
-Sources: `fosrl/pangolin` (cloned to `.scratch/clones/pangolin`, commit at clone time), `fosrl/newt`
-(`.scratch/clones/newt`), and https://docs.pangolin.net (fetched live via web_extract on 2026‑09‑17).
-File paths below are relative to the cloned repos unless a URL is given.
+Sources: the `fosrl/pangolin` and `fosrl/newt` source trees, and https://docs.pangolin.net, as of
+September 2026. File paths below are relative to those repos unless a URL is given.
 
 ---
 
@@ -283,8 +282,8 @@ source:
    once, and `server/routers/newt/handleNewtPingMessage.ts` /
    `server/routers/newt/pingAccumulator.ts` in source show the server actively receives
    keepalive/ping messages from each newt over the websocket, which is presumably what backs the
-   `online` flag (I did not fully trace the exact SQL/websocket handler that flips `online`, so
-   treat that link as inferred rather than fully proven from source).
+   `online` flag (the exact handler that flips `online` was not traced, so treat that link as
+   inferred rather than proven from source).
 2. **Historical status / uptime.** `server/routers/site/getStatusHistory.ts` and
    `getBatchedStatusHistory.ts` expose a `GET` endpoint (`/site/{siteId}/status-history` per the
    route naming, params `siteId`, query `days`, `tzOffsetMinutes`) backed by
@@ -301,26 +300,25 @@ source:
 For aipotluck-local-client's monitor service, the practical polling design would be:
 `GET /org/{orgId}/site/{niceId}` on an interval → read `online`, and optionally
 `GET /public-resource/{resourceId}` (implied to exist alongside the create-resource endpoint,
-per Swagger, though I did not open its exact route file) or the health-check state on the
+per Swagger, though its route file was not checked) or the health-check state on the
 associated target, to distinguish "tunnel down" from "tunnel up but llama.cpp not responding."
 
 ---
 
 ## Open Questions / Assumptions
 
-Being honest about what I could **not** fully confirm from source/docs in the time available:
+Not confirmed from source or docs:
 
 1. **Exact route/path naming for target and resource "get" endpoints** (e.g. the literal path for
-   fetching one target's current health state) — I found the *create* (`PUT`) routes documented
-   in the common-api-routes walkthrough and confirmed via `registerPath` calls in a handful of
-   source files (`getSite.ts`, `getStatusHistory.ts`), but did not enumerate the full Swagger tree
-   at `https://api.pangolin.net/v1/docs` (that's a live rendered UI, not static text I could
-   `web_extract` meaningfully) — so some GET/list endpoint paths above (e.g. `GET
-   /public-resource/{resourceId}`) are inferred by pattern rather than directly quoted.
-2. **The exact mechanism that flips `online: true/false` on a site row** — I confirmed
-   `server/routers/newt/handleNewtPingMessage.ts` and `pingAccumulator.ts` exist and strongly
-   suggest a websocket keepalive/ping model, but did not trace the full code path from "ping
-   received" to "DB row updated" to state this as 100% verified.
+   fetching one target's current health state). The *create* (`PUT`) routes are documented in the
+   common-api-routes walkthrough and confirmed via `registerPath` calls in a handful of source
+   files (`getSite.ts`, `getStatusHistory.ts`), but the full Swagger tree at
+   `https://api.pangolin.net/v1/docs` was not enumerated, so some GET/list endpoint paths above
+   (e.g. `GET /public-resource/{resourceId}`) are inferred by pattern rather than quoted.
+2. **The exact mechanism that flips `online: true/false` on a site row.**
+   `server/routers/newt/handleNewtPingMessage.ts` and `pingAccumulator.ts` exist and suggest a
+   websocket keepalive/ping model, but the code path from "ping received" to "DB row updated" was
+   not traced.
 3. Whether the **Integration API and the dashboard's internal API are the same route table** (i.e.
    whether all the `common-api-routes` examples work identically whether integration API is
    enabled via `flags.enable_integration_api` or not) is not fully spelled out; the docs imply the
@@ -331,8 +329,7 @@ Being honest about what I could **not** fully confirm from source/docs in the ti
    raw `newt`, since Newt's long-term support window is unclear from what's documented. This
    doesn't block the plan (newt's id/secret/endpoint model is unchanged) but is a decision point.
 
-All five original questions were answered with concrete, cited evidence; the caveats above are
-about *endpoint completeness/exhaustiveness*, not about whether the core architecture claims
+The caveats above are about *endpoint completeness/exhaustiveness*, not about whether the core architecture claims
 (Docker Compose install, org API key + REST API, id/secret newt registration, explicit
 site+resource+target routing, `online` status field) are real — those are all directly quoted
 from the actual docs or source.
