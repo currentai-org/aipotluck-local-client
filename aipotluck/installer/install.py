@@ -21,9 +21,18 @@ Flow:
         (--allow-apt-install, or an interactive y/N prompt -- never unconditionally), then
         configure + build llama-server from vendor/llama.cpp (source_build.py).
     4. Write runtime.json pointing at the resolved llama-server binary.
-    5. Install our blank Python service via the OS-native service manager.
-    6. Install the `aipotluck-local-client` CLI shim onto PATH (see install_cli_shim below).
+    5. Register our blank Python service against this user's CLI home -- `<install root>/cli`, the
+       one copy of this tree the CLI and GUI installers share (cli_home.py) -- rather than against
+       whatever checkout happened to run the install.
+    6. Install the `aipotluck-local-client` CLI shim onto PATH, running that same staged copy.
+       `--system` and `--install-dir` installs keep their old shape: service and shim both run this
+       checkout directly.
     7. Optionally start the service (default: yes).
+
+Before any of that, a per-user run hands itself over to a NEWER copy already staged in the CLI home
+(`_maybe_delegate`): the whole install -- llama.cpp and newt pins included -- must never move a
+machine backwards just because an older installer (a GUI bundle, a stale checkout) ran last. The
+delegated run is marked through AIPOTLUCK_INSTALL_DELEGATED so it can never bounce again.
 """
 
 from __future__ import annotations
@@ -31,14 +40,26 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from aipotluck.installer import build_cache, build_strategy, fetch, layout, model_pull, model_sizing, source_build
-from aipotluck.installer.platform_detect import HostProfile, detect_host_profile
+from aipotluck.installer import (
+    build_cache,
+    build_strategy,
+    cli_home,
+    fetch,
+    layout,
+    model_pull,
+    model_sizing,
+    python_bootstrap,
+    source_build,
+)
+from aipotluck.installer.platform_detect import HostProfile, detect_host_profile, detect_os
 from aipotluck.installer.python_bootstrap import PythonNotFoundError, ensure_python
 from aipotluck.installer.service.base import ServiceState, get_service_manager
 from aipotluck.installer.cli_shim import CLI_SHIM_NAME, install_cli_shim
@@ -47,6 +68,8 @@ from aipotluck.service.runner import DEFAULT_HOST, DEFAULT_MODELS_MAX, DEFAULT_P
 log = logging.getLogger("aipotluck.installer")
 
 SERVICE_NAME = "aipotluck"
+# Set on the environment of a delegated run so it installs itself instead of handing over again.
+DELEGATED_ENV = "AIPOTLUCK_INSTALL_DELEGATED"
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_MODEL_HF = "bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"
@@ -72,6 +95,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--system", action="store_true",
         help="Install machine-wide (requires elevation); default is per-user, no admin",
+    )
+    parser.add_argument(
+        "--bundled-python-dir", type=Path, default=None,
+        help="The directory holding the interpreter running this installer, when that interpreter "
+             "is a bundled one (the GUI's): copied into the CLI home, so the installed CLI and "
+             "service keep working if that bundle is later moved or removed. Per-user installs "
+             "only; omitted, the running interpreter's own path is used as is (a system python is "
+             "already durable).",
+    )
+    parser.add_argument(
+        "--installed-by", choices=["cli", "gui"], default="cli",
+        help="Recorded in the CLI home's manifest so `status` can say which installer staged the "
+             "copy -- and which one to uninstall first. Default: cli.",
     )
     parser.add_argument(
         "--no-start", action="store_true",
@@ -356,50 +392,98 @@ def run_install(args: argparse.Namespace) -> int:
         _print_summary(profile, lay, runtime_config, service_status=None, shim_path=None)
         return 0
 
-    service_mgr = get_service_manager(profile.os_name)
-    service_script = REPO_ROOT / "aipotluck" / "service" / "aipotluck_service.py"
-    service_args = [
-        "--config-dir", str(lay.config_dir),
-        "--log-dir", str(lay.log_dir),
-    ]
-    try:
-        python_exe = ensure_python()
-    except PythonNotFoundError as exc:
-        log.error("%s", exc)
-        raise
-    log.info("Using Python interpreter for service: %s", python_exe)
-    service_installed = True
-    try:
-        service_mgr.install(
-            SERVICE_NAME,
-            exec_path=python_exe,
-            args=[str(service_script)] + service_args,
-            system_scope=args.system,
-            working_dir=REPO_ROOT,
-            log_dir=lay.log_dir,
-        )
-        log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
-    except RuntimeError as exc:
-        # Everything else (llama.cpp, the model, runtime.json, the CLI) is in place and usable;
-        # only the OS service is missing, and the summary below says so. Logged as an error, not
-        # dropped: before this, a failed Windows registration was silently reported as installed.
-        service_installed = False
-        log.error("%s", exc)
+    shim_path: Path | None = None
+    cli_src: Path | None = None
 
-    shim_path = install_cli_shim(profile, python_exe, args.system)
-
-    if service_installed and not args.no_start:
+    if args.system or args.install_dir is not None:
+        # --system and --install-dir installs keep their old shape: the service and the shim run
+        # this checkout, because there is no per-user CLI home involved at all (a raised install
+        # root has no user to share it with, and /opt/aipotluck is not where a per-user shim's
+        # cli.py lives either).
+        service_mgr = get_service_manager(profile.os_name)
+        service_script = REPO_ROOT / "aipotluck" / "service" / "aipotluck_service.py"
+        service_args = [
+            "--config-dir", str(lay.config_dir),
+            "--log-dir", str(lay.log_dir),
+        ]
         try:
-            service_mgr.start(SERVICE_NAME, system_scope=args.system)
-            log.info("Started %s service", SERVICE_NAME)
+            python_exe = ensure_python()
+        except PythonNotFoundError as exc:
+            log.error("%s", exc)
+            raise
+        log.info("Using Python interpreter for service: %s", python_exe)
+        service_installed = True
+        try:
+            service_mgr.install(
+                SERVICE_NAME,
+                exec_path=python_exe,
+                args=[str(service_script)] + service_args,
+                system_scope=args.system,
+                working_dir=REPO_ROOT,
+                log_dir=lay.log_dir,
+            )
+            log.info("Installed %s service (system_scope=%s)", SERVICE_NAME, args.system)
         except RuntimeError as exc:
-            # Registered but not running now (Windows: the logon task can't be started from a
-            # session with no desktop). It will start at the next sign-in; the summary below shows
-            # its real state rather than a "Started" that didn't happen.
-            log.warning("%s", exc)
+            # Everything else (llama.cpp, the model, runtime.json, the CLI) is in place and usable;
+            # only the OS service is missing, and the summary below says so. Logged as an error, not
+            # dropped: before this, a failed Windows registration was silently reported as installed.
+            service_installed = False
+            log.error("%s", exc)
+
+        shim_path = install_cli_shim(profile, python_exe, args.system)
+
+        if service_installed and not args.no_start:
+            try:
+                service_mgr.start(SERVICE_NAME, system_scope=args.system)
+                log.info("Started %s service", SERVICE_NAME)
+            except RuntimeError as exc:
+                # Registered but not running now (Windows: the logon task can't be started from a
+                # session with no desktop). It will start at the next sign-in; the summary below
+                # shows its real state rather than a "Started" that didn't happen.
+                log.warning("%s", exc)
+    else:
+        # Per-user: the CLI home is the one copy of this tree that both installers stage into, and
+        # the service and shim are pointed at it -- never at this checkout, which may be a GUI
+        # bundle or a working tree that is about to be deleted.
+        if sys.version_info < python_bootstrap.MIN_PYTHON:
+            log.error(
+                "The per-user CLI home needs Python %d.%d or newer to run the staged copy; this "
+                "installer is running on %d.%d. Upgrade Python and re-run (or use --install-dir "
+                "for a self-contained install of this tree).",
+                *python_bootstrap.MIN_PYTHON, *sys.version_info[:2],
+            )
+            return 1
+        result = cli_home.adopt(
+            REPO_ROOT, lay,
+            bundled_python_dir=args.bundled_python_dir,
+            installed_by=args.installed_by,
+        )
+        inst = result.installed
+        cli_src = inst.src
+        log.info(
+            "The service and the %s command will run the CLI-home copy (%s): %s (build %s)",
+            CLI_SHIM_NAME, result.action, inst.src, inst.build.short(),
+        )
+        service_installed, _restarted, shim_path = cli_home.register(
+            profile, lay, inst, register_service=True, start=not args.no_start
+        )
+        if service_installed:
+            log.info("Installed %s service (per-user, from the CLI home)", SERVICE_NAME)
+        home = cli_home.cli_home(lay)
+        removed = cli_home.prune(home, cli_home.keep_set(home, inst))
+        if removed:
+            log.info(
+                "Removed %d superseded staged cop%s from %s",
+                len(removed), "y" if len(removed) == 1 else "ies", home,
+            )
+        # Same seam cli_home.register reports through, so the status below describes the unit that
+        # was just registered rather than a second, separately-constructed manager.
+        service_mgr = cli_home.get_service_manager(profile.os_name)
 
     status = service_mgr.status(SERVICE_NAME, system_scope=args.system)
-    _print_summary(profile, lay, runtime_config, service_status=status, shim_path=shim_path)
+    _print_summary(
+        profile, lay, runtime_config, service_status=status, shim_path=shim_path, cli_src=cli_src
+    )
 
     if status.state not in (ServiceState.RUNNING, ServiceState.STOPPED):
         log.warning("Service status is ambiguous: %s (%s)", status.state, status.detail)
@@ -432,7 +516,12 @@ def _carry_over_pairing(runtime_path: Path, runtime_config: dict) -> None:
 
 
 def _print_summary(
-    profile: HostProfile, lay: layout.Layout, runtime_config: dict, service_status, shim_path: Path | None
+    profile: HostProfile,
+    lay: layout.Layout,
+    runtime_config: dict,
+    service_status,
+    shim_path: Path | None,
+    cli_src: Path | None = None,
 ) -> None:
     print()
     print("=" * 60)
@@ -442,6 +531,10 @@ def _print_summary(
     print(f"llama.cpp:      {runtime_config['llama_cpp']['tag']} [{runtime_config['llama_cpp']['asset_key']}]")
     print(f"  server binary: {runtime_config['llama_cpp']['server_binary']}")
     print(f"Install root:   {lay.install_root}")
+    if cli_src is not None:
+        # Only for the per-user install: this is the tree the service and the shim actually run,
+        # and it is NOT the checkout that was unpacked to get here -- worth saying out loud.
+        print(f"CLI home:       {cli_src}")
     print(f"Config:         {lay.config_dir / 'runtime.json'}")
     print(f"Logs:           {lay.log_dir}")
     if service_status is not None:
@@ -471,11 +564,60 @@ def _print_summary(
     print("=" * 60)
 
 
+def _maybe_delegate(args: argparse.Namespace, raw_argv: list[str]) -> int | None:
+    """Hand this whole install over to a newer copy in the CLI home, or None to install this tree.
+
+    Newer wins, never downgrade -- and "the whole install" is the point: re-running an older
+    installer (a GUI bundle left over from last month, a stale checkout) must not move this
+    machine's llama.cpp or newt pins backwards, and must not replace the copy the service and the
+    shim already run. So rather than merely keeping the staged tree, the older installer re-execs
+    the newer copy's own install.py with the same arguments and lets it be the installer.
+
+    Not for `--system`/`--install-dir` (those install this tree into a root of the user's choosing,
+    with no CLI home involved), and not for a run that is itself a delegated one -- that env flag is
+    what stops an A->B->A ping-pong between two copies that each think the other is newer.
+    """
+    if args.system or args.install_dir is not None:
+        return None
+    if os.environ.get(DELEGATED_ENV) == "1":
+        return None
+    lay = layout.get_layout(detect_os())
+    installed = cli_home.read_installed(cli_home.cli_home(lay))
+    candidate = cli_home.read_build_info(REPO_ROOT)
+    if installed is None or not cli_home.is_newer(installed.build, candidate):
+        return None
+    log.info(
+        "A newer aipotluck-local-client (%s) is already installed; handing this install to it "
+        "(this copy is %s)",
+        installed.build.short(), candidate.short(),
+    )
+    env = dict(os.environ, **{DELEGATED_ENV: "1"})
+    # install.py's own file path, not `-m`: a module invocation would resolve `aipotluck` against
+    # the delegated copy's root anyway, but the file path also leaves the child's CWD alone, so a
+    # relative path in argv (--model-path ./x.gguf) still means what the caller meant.
+    cmd = [
+        str(installed.python),
+        str(installed.src / "aipotluck" / "installer" / "install.py"),
+        *raw_argv,
+    ]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        # Windows has no execve; the child runs in turn and its exit code becomes ours.
+        return subprocess.call(cmd, env=env)
+    os.execve(cmd[0], cmd, env)
+    return None  # not reached: a successful execve never returns
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     setup_logging(args.verbose)
     try:
+        delegated = _maybe_delegate(args, raw_argv)
+        if delegated is not None:
+            return delegated
         return run_install(args)
     except Exception as exc:  # top-level guard: always report clearly
         log.error("Install failed: %s", exc, exc_info=args.verbose)

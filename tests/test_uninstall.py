@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from aipotluck.installer import cli, layout as layout_mod, uninstall
+from aipotluck.installer import cli, cli_home, layout as layout_mod, uninstall
 from aipotluck.installer.platform_detect import HostProfile
 from aipotluck.installer.service.base import ServiceState, ServiceStatus
 
@@ -67,6 +67,63 @@ def installed(tmp_path, monkeypatch):
     (models / "weights.gguf").write_text("x")
     monkeypatch.setattr(uninstall, "_STOP_TIMEOUT_SECONDS", 0.2)
     return lay, server, bin_dir, models, gui_runtime
+
+
+def _stage_cli_home(lay, sha="0123456789ab" + "0" * 28):
+    """What a real install leaves in `<install root>/cli` (cli_home.py): a staged source tree, a
+    staged interpreter, and the `current.json` manifest pointing at both."""
+    home = cli_home.cli_home(lay)
+    src = home / f"src-{sha[:12]}"
+    (src / "aipotluck" / "service").mkdir(parents=True)
+    (src / "aipotluck" / "service" / "aipotluck_service.py").write_text("# service\n", encoding="utf-8")
+    python = home / "python-cpython-3.12" / "bin" / "python3"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli_home.write_installed(
+        home,
+        cli_home.InstalledCli(
+            cli_home.BuildInfo(sha, 1_700_000_000), src, python, "cli", "2026-01-01T00:00:00Z"
+        ),
+    )
+    return home
+
+
+def test_removes_the_shared_cli_home_after_everything_else(installed):
+    """Both the service and the shim run from the CLI home, so it is deleted last: everything the
+    uninstall itself needs to import has to be imported before the copy disappears."""
+    lay, *_ = installed
+    cli_copy = _stage_cli_home(lay)
+    report = uninstall.uninstall(LINUX, lay, RecordingServiceManager())
+    assert not cli_copy.exists()
+    assert not (lay.install_root / "llama.cpp").exists()
+    removed = report.paths_removed
+    assert str(cli_copy) in removed
+    assert removed.index(str(cli_copy)) > removed.index(str(lay.config_dir))
+    assert removed.index(str(cli_copy)) > removed.index(str(lay.log_dir))
+    assert removed.index(str(cli_copy)) > removed.index(str(lay.state_dir))
+
+
+def test_a_cli_home_that_cannot_be_deleted_is_a_warning_and_everything_else_still_goes(
+    installed, monkeypatch
+):
+    """Found on Windows: uninstall usually runs from the interpreter *inside* the CLI home, and
+    Windows locks a running python.exe's files, so the tree can outlive the uninstall."""
+    lay, server, bin_dir, *_ = installed
+    cli_copy = _stage_cli_home(lay)
+    real_rmtree = uninstall.shutil.rmtree
+
+    def locked(path, *a, **kw):
+        if Path(path) == cli_copy:
+            raise OSError(13, "Permission denied")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(uninstall.shutil, "rmtree", locked)
+    report = uninstall.uninstall(LINUX, lay, RecordingServiceManager())
+    assert report.service_removed
+    assert any(str(cli_copy) in w and "can be deleted by hand" in w for w in report.warnings)
+    assert cli_copy.exists()
+    assert not (bin_dir / "aipotluck-local-client").exists()
+    assert not server.exists() and not lay.config_dir.exists()
 
 
 def test_removes_service_shim_and_every_install_directory(installed):
@@ -230,3 +287,19 @@ def test_cli_models_only_never_touches_the_service(installed, monkeypatch):
     args = cli.build_arg_parser().parse_args(["uninstall", "--models-only", "--yes", "--install-dir", str(lay.install_root)])
     assert cli.run_uninstall(args) == 0
     assert server.exists()
+
+
+def test_models_only_leaves_the_shared_cli_home_intact(installed, monkeypatch):
+    """--models-only is the one path that must not touch the CLI home: it frees disk space while
+    keeping the client the person is still using."""
+    lay, server, *_ = installed
+    cli_copy = _stage_cli_home(lay)
+    monkeypatch.setattr(cli, "get_service_manager", lambda os_name: pytest.fail("service must be left alone"))
+    monkeypatch.setattr(cli, "detect_host_profile", lambda *a: LINUX)
+    monkeypatch.setattr(uninstall, "list_cached_models", lambda srv: [])
+    args = cli.build_arg_parser().parse_args(
+        ["uninstall", "--models-only", "--yes", "--install-dir", str(lay.install_root)]
+    )
+    assert cli.run_uninstall(args) == 0
+    assert (cli_copy / "current.json").exists()
+    assert (cli_copy / "src-0123456789ab").is_dir() and server.exists()
