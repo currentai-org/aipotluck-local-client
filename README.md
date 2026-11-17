@@ -121,6 +121,12 @@ on Windows, which itself finds-or-installs Python before calling
 one-liners themselves. Re-running either script updates the existing
 checkout (`git fetch` + `reset --hard`) rather than re-cloning.
 
+That clone is the *update source*, not where the client runs from: the
+installer stages the tree into one shared per-user copy (the "CLI home",
+`<install root>/cli` -- see "Where the CLI actually lives" under "CLI on
+PATH") and the service and the `aipotluck-local-client` command both run
+from there.
+
 **The install always finishes in a "logged out" state** -- no Pangolin
 credentials, and the service holds `llama-server` and the tunnel back until
 you pair the device. See "Pairing" below.
@@ -694,6 +700,31 @@ this project has no build step anywhere else either, and downloads
 prebuilt binaries rather than building from source (same reasoning as
 llama.cpp/newt).
 
+### Where the CLI actually lives
+
+A per-user install runs from one shared copy in `<install root>/cli`
+(`aipotluck/installer/cli_home.py`), not from the checkout or bundle that
+happened to run the install: a staged `src-<commit>` tree, an optional
+staged interpreter next to it, and a `current.json` manifest naming both.
+The `aipotluck-local-client` wrapper and the background service both point
+there, so nothing in a running install depends on `~/.aipotluck/src` or on
+the desktop GUI's own files staying put.
+
+Both installers stage into that one place, and a copy is only replaced when
+its source commit is *strictly* newer -- so re-running `install.sh` or
+`install.ps1`, or opening a newer desktop GUI, upgrades the shared copy and
+re-points the service and the wrapper in place, in either order. An older
+installer never downgrades a newer copy: it hands the whole install over to
+the newer one instead.
+
+`aipotluck-local-client uninstall` removes the shared copy along with
+everything else it installed (a copy it can't delete -- Windows keeps a
+running `python.exe`'s files locked -- is left behind with a warning naming
+the path). The checkout it was staged from stays: `~/.aipotluck/src` from
+`install.sh`, and the GUI's bundled tree, belong to whoever created them.
+`--system` and `--install-dir` installs keep the older behaviour and run
+from the tree they installed.
+
 On Linux/macOS, the per-user target (`~/.local/bin`) is only added to your
 PATH automatically on the installer's best-effort check -- if it warns that
 it isn't there, add it to your shell profile once:
@@ -765,6 +796,8 @@ aipotluck/                      the root package everything below lives under
     install.py                    installer CLI entry point -- always produces a logged-out install
     cli.py                         login/logout/status CLI for an already-installed device
     cli_shim.py                    writes the `aipotluck-local-client` wrapper onto PATH (see "CLI on PATH")
+    cli_home.py                    the shared per-user CLI copy both installers stage into (see "Where the CLI actually lives")
+    adopt.py                        entry point the desktop GUI runs on launch: adopt this tree unless a newer copy is installed
     platform_detect.py             OS/arch/GPU-backend/glibc/CUDA-compute-capability detection
     build_strategy.py              decide prebuilt-asset vs. build-from-source per host
     source_build.py                configure+build llama-server from vendor/llama.cpp

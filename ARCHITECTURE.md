@@ -533,12 +533,15 @@ and piped into a shell (`curl ... | bash`, `irm ... | iex`):
   `python3 -m aipotluck.installer.install` with any passed-through arguments. Python
   presence is not checked here -- that's `aipotluck/installer/install.py`'s job via
   `python_bootstrap.ensure_python()`, which already has the right
-  per-OS messaging.
+  per-OS messaging. That clone is the *update source*: the installer stages
+  it into the per-user CLI home and points the service and the shim there
+  (4.9), so nothing keeps running out of `~/.aipotluck/src`.
 - `install.ps1` (Windows, repo root -- distinct from
   `packaging/windows/install.ps1`): checks for `git` (installing it via
   winget if missing, mirroring the Python auto-install pattern), clones
   into `%LOCALAPPDATA%\aipotluck\src`, then hands off to
   `packaging/windows/install.ps1` (the one that finds-or-installs Python).
+  Same hand-off to the CLI home as `install.sh`.
 
 Both scripts default to the real public clone URL
 (`https://github.com/currentai-org/aipotluck-local-client.git`), overridable via
@@ -558,6 +561,101 @@ re-cloning), and the placeholder-URL guard correctly refusing to run
 without an override. The Windows `install.ps1` (repo root) has never been
 run itself; the Windows surface it drives was exercised directly on a
 Windows 10 box (see README's "Confirmed hardware").
+
+## 4.9 One shared CLI copy (implemented)
+
+Before this, each installer kept its own copy of the tree and pointed the
+`aipotluck-local-client` shim and the OS service at *it*: `install.sh` at
+its clone in `~/.aipotluck/src`, the desktop GUI at its own bundled runtime.
+Two installers on one machine therefore meant two CLIs at different
+versions, and whichever wrote the shim and the service unit last silently
+won -- including quietly downgrading a newer install to an older one. Two
+further problems came with that shape: a GUI uninstall could take the CLI
+that the CLI installer had put there with it, and a copy that moved (a
+bundle replaced on upgrade, a checkout deleted) left the service and the
+shim pointing at a path that no longer existed.
+
+Now there is one copy per user, owned by neither installer:
+`<layout.install_root>/cli` -- `~/.local/share/aipotluck/cli` on Linux,
+`~/Library/Application Support/aipotluck/cli` on macOS,
+`%LOCALAPPDATA%\aipotluck\cli` on Windows (`aipotluck/installer/cli_home.py`).
+`--system` and `--install-dir` installs keep the old behaviour and run from
+the tree they installed, since those explicitly pick a root of their own.
+
+**What is in it.** `src-<sha12>/` is the staged source tree, `python-<name>/`
+an optional staged interpreter, and `current.json` (schema 1) the manifest:
+which source directory and interpreter the copy uses, who staged it, and
+when. The manifest is written atomically (temp file, then `os.replace`), so a
+half-written one is never observed -- and a manifest that fails to parse, or
+that names a tree or interpreter which has since been deleted, reads as
+"nothing installed" rather than as an error.
+
+**Version = the source commit, never a hand-maintained string.**
+`aipotluck/_build_info.txt` holds `$Format:%H %ct$` and `.gitattributes`
+marks it `export-subst`, so anything built with `git archive` (the GUI's
+bundled tree, a GitHub tarball) ships the real `<sha> <unix time>`; in a
+plain git clone the file keeps the placeholder and the version falls back to
+`git log -1`, but only when that root really is a checkout -- a `.git`
+further up the tree is some other project (a dotfiles repo in `$HOME`) and
+is ignored. No source of truth at all means `("unknown", 0)`, which loses to
+anything already installed.
+
+**Newer wins, and only strictly.** Both installers decide through
+`cli_home.adopt`: the same commit is `current` (nothing written, not even the
+manifest), anything not strictly newer is `kept-newer` (no downgrade), and
+otherwise the tree is staged. Staging is atomic and idempotent: the copy is
+built in a hidden `.src-<sha12>.partial-<pid>`, gets a `.complete` marker
+once it is whole, and only then is `os.replace`d into its final name -- so a
+killed install leaves a partial directory that `prune` deletes, never a
+half-copied tree that looks installed. `.git`, `vendor/`, `tests/` and
+`research/` are not copied: the service and the shim never run them. A
+bundled interpreter is copied byte-for-byte into `python-<name>` only when
+it is the interpreter actually running (the GUI's case), so an installed CLI
+survives that bundle going away; otherwise the running `sys.executable` is
+already a durable system path and is used as is.
+
+**Delegation, not just tolerance.** An older installer still hands the whole
+install over rather than merely leaving the newer tree in place: `install.py`
+re-execs the newer copy's own `install.py` with the same arguments (`execve`
+on POSIX, `subprocess.call` on Windows, which has no `execve`), so re-running
+a stale installer can't move this machine's llama.cpp or newt pins backwards
+either. That delegated run is marked through `AIPOTLUCK_INSTALL_DELEGATED=1`,
+which is what stops an A -> B -> A ping-pong between two copies that each
+think the other is newer. Skipped for `--system`/`--install-dir`, which
+install this tree into a root the user chose.
+
+**The GUI's entry point, and its contract.** The desktop app runs
+`python -m aipotluck.installer.adopt --if-installed [--bundled-python-dir
+<dir>] --installed-by gui` on every launch: adopt this tree unless a newer
+copy is installed, then re-point the shim -- and the service, but only one
+that is *already* registered; adopt never creates a service where none
+exists -- and prune superseded copies. With `--if-installed` it does nothing
+at all when the user has never installed (`runtime.json` missing), so opening
+the app can't create a CLI home behind anyone's back. Its output is a
+contract: the last line on stdout is `ADOPT_RESULT <json>`, one of
+`{"action": "adopted"|"current"|"kept-newer", "sha", "installed_sha",
+"repointed", "service_restarted", "python", "src"}`, `{"action": "skipped",
+"reason": "not installed"}` or `{"action": "error", "error": "<message>"}`
+(exit 1), with all logging on stderr. The GUI parses that line instead of
+scraping human prose, so it is not free to be reworded.
+
+**Cleanup.** `prune` deletes only direct children named like staged copies
+(`src-*`, `python-*`, and their `.partial-` siblings), never the manifest,
+never anything else someone put in the directory, and never the tree holding
+the running interpreter; a copy that can't be removed (Windows locks a
+running interpreter's files) is a warning and the loop continues.
+`aipotluck-local-client uninstall` deletes the whole CLI home, last, after
+everything that could still need to import a module -- it is usually running
+from inside that tree, via the shim. A copy that won't delete there is a
+warning naming the path, not a failed uninstall. The checkout the copy was
+staged from (`~/.aipotluck/src`, the GUI's own bundle) is left to its owner.
+
+**Known limitation.** A delegated install runs from a staged copy that has
+no `.git` and no `vendor/llama.cpp` submodule, so a host that needs a
+llama.cpp *source build* cannot be served by it: that path needs `install.sh`'s
+own checkout, which is the newest copy in practice (it is the thing that just
+fetched the branch), so in the ordinary case the build runs from there
+anyway.
 
 ## 5. Open questions before implementation
 

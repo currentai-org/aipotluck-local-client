@@ -18,6 +18,15 @@
 # download+verify, service registration, PATH shim, etc). No installer
 # logic is duplicated here.
 #
+# The clone at AIPOTLUCK_SRC_DIR is the update source, not where the client
+# ends up: the installer stages this tree into one shared per-user copy
+# (`<install root>/cli`, aipotluck/installer/cli_home.py) and re-points both
+# the background service and the `aipotluck-local-client` command there, so
+# re-running this script (or opening a newer desktop GUI) upgrades that one
+# copy in place and an older copy never replaces a newer one. This script
+# still installs from its own checkout, which is the copy that can build
+# llama.cpp from source (it has `.git` and `vendor/`).
+#
 # Configurable via environment variables (all optional):
 #   AIPOTLUCK_REPO_URL   git remote to clone (default: see below)
 #   AIPOTLUCK_REF        branch/tag to check out (default: main)
