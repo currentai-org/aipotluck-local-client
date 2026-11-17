@@ -109,6 +109,13 @@ def _strip_block(text: str) -> str:
     for line in lines:
         if line.strip() == PROFILE_BEGIN:
             inside = True
+            # The blank line add_to_shell_profiles leaves between the person's own text and the
+            # block belongs to the block, so it goes with it. Without this every reinstall (install
+            # -> GUI adopt on launch -> reinstall is the ordinary lifecycle) rewrote the file one
+            # newline longer than the last, and uninstall could only ever give back a file with a
+            # growing tail of blank lines.
+            if out and not out[-1].strip():
+                out.pop()
             continue
         if inside:
             if line.strip() == PROFILE_END:
@@ -173,9 +180,6 @@ def remove_from_shell_profiles(home: Path | None = None) -> list[Path]:
         if PROFILE_BEGIN not in old:
             continue
         new = _strip_block(old)
-        # drop the blank separator line the add left behind, if that's all that's at the end
-        if new.endswith("\n\n"):
-            new = new[:-1]
         if new.strip():
             path.write_text(new, encoding="utf-8")
         else:

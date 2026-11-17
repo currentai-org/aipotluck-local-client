@@ -161,6 +161,22 @@ class TestShellProfiles:
         assert cli_shim.remove_from_shell_profiles(home=tmp_path) == [tmp_path / ".profile"]
         assert (tmp_path / ".profile").read_text() == original
 
+    def test_repeated_installs_then_remove_restores_the_file_exactly(self, monkeypatch, tmp_path):
+        """install -> GUI adopt on launch -> reinstall is the ordinary lifecycle, and every one of
+        those rewrites the block. The blank separator before it must therefore not accumulate:
+        uninstall has to hand the dotfile back byte for byte however many times it was installed,
+        not leave a growing tail of blank lines behind."""
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        original = "# my profile\nexport EDITOR=vi\n"
+        (tmp_path / ".profile").write_text(original)
+        cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        after_one = (tmp_path / ".profile").read_text()
+        cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        cli_shim.add_to_shell_profiles(tmp_path / "bin", home=tmp_path)
+        assert (tmp_path / ".profile").read_text() == after_one
+        cli_shim.remove_from_shell_profiles(home=tmp_path)
+        assert (tmp_path / ".profile").read_text() == original
+
     def test_remove_deletes_a_startup_file_it_created(self, monkeypatch, tmp_path):
         """A default macOS account has no .zshenv; install creates one, uninstall must not leave an
         empty one behind."""
