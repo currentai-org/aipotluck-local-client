@@ -51,11 +51,79 @@ class TestShimText:
         assert text.startswith("#!/usr/bin/env bash\n")
         assert f'exec "/usr/bin/python3" "{cli_shim.CLI_MODULE_PATH}" "$@"' in text
 
+    def test_posix_shim_can_point_at_a_staged_copy_instead_of_this_checkout(self, tmp_path):
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        text = cli_shim._posix_shim_text(Path("/usr/bin/python3"), cli_root)
+        assert f'exec "/usr/bin/python3" "{cli_root / "aipotluck" / "installer" / "cli.py"}" "$@"' in text
+        assert str(cli_shim.REPO_ROOT) not in text
+
     def test_windows_shim_calls_the_given_python_and_cli_module(self):
         text = cli_shim._windows_shim_text(Path(r"C:\Python312\python.exe"))
         assert text.startswith("@echo off\r\n")
         assert f'"C:\\Python312\\python.exe" "{cli_shim.CLI_MODULE_PATH}" %*' in text
         assert "\r\n" in text  # real Windows line endings, not bare \n
+
+    def test_windows_shim_can_point_at_a_staged_copy_instead_of_this_checkout(self, tmp_path):
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        text = cli_shim._windows_shim_text(Path(r"C:\Python312\python.exe"), cli_root)
+        assert f'"{cli_root / "aipotluck" / "installer" / "cli.py"}" %*' in text
+        assert str(cli_shim.REPO_ROOT) not in text
+
+
+class TestShimMatches:
+    """`shim_matches` decides whether adopt.py rewrites the shim, so its "yes" has to mean the file
+    on PATH really is the one install_cli_shim would write for this interpreter and this tree."""
+
+    @pytest.fixture(autouse=True)
+    def _redirect(self, monkeypatch, tmp_path):
+        self.bin_dir = tmp_path / "bin"
+        self.home = tmp_path / "home"
+        (self.home).mkdir()
+        monkeypatch.setattr(cli_shim, "_bin_dir", lambda profile, system_scope: self.bin_dir)
+        monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+        monkeypatch.setattr(cli_shim.Path, "home", classmethod(lambda cls: self.home))
+        monkeypatch.setattr(cli_shim, "_add_to_user_path_windows", lambda bin_dir: True)
+
+    def test_false_when_no_shim_is_installed(self, tmp_path):
+        assert cli_shim.shim_matches(HostProfile(os_name="linux", arch="x64", backend="cpu"),
+                                     Path("/usr/bin/python3"), tmp_path / "cli") is False
+
+    def test_true_after_installing_for_the_same_interpreter_and_tree(self, tmp_path):
+        profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        cli_shim.install_cli_shim(profile, Path("/usr/bin/python3"), False, cli_root=cli_root)
+
+        assert cli_shim.shim_matches(profile, Path("/usr/bin/python3"), cli_root) is True
+
+    def test_false_for_a_shim_written_for_another_tree(self, tmp_path):
+        profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
+        cli_shim.install_cli_shim(profile, Path("/usr/bin/python3"), False, cli_root=tmp_path / "old")
+
+        assert cli_shim.shim_matches(profile, Path("/usr/bin/python3"), tmp_path / "new") is False
+
+    def test_false_for_a_shim_written_for_another_interpreter(self, tmp_path):
+        profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        cli_shim.install_cli_shim(profile, Path("/usr/bin/python3.9"), False, cli_root=cli_root)
+
+        assert cli_shim.shim_matches(profile, Path("/usr/bin/python3.12"), cli_root) is False
+
+    def test_a_hand_edited_shim_does_not_match(self, tmp_path):
+        profile = HostProfile(os_name="linux", arch="x64", backend="cpu")
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        shim_path = cli_shim.install_cli_shim(profile, Path("/usr/bin/python3"), False, cli_root=cli_root)
+        shim_path.write_text(shim_path.read_text() + "echo extra\n")
+
+        assert cli_shim.shim_matches(profile, Path("/usr/bin/python3"), cli_root) is False
+
+    def test_windows_crlf_is_compared_exactly(self, tmp_path):
+        # A Windows .cmd read back with universal newlines would never equal the text that was
+        # written, so every run would rewrite the shim and restart the service.
+        profile = HostProfile(os_name="windows", arch="x64", backend="cpu")
+        cli_root = tmp_path / "cli" / "src-abc123def456"
+        cli_shim.install_cli_shim(profile, Path(r"C:\Python\python.exe"), False, cli_root=cli_root)
+
+        assert cli_shim.shim_matches(profile, Path(r"C:\Python\python.exe"), cli_root) is True
 
 
 class TestShellProfiles:
