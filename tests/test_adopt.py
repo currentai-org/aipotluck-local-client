@@ -295,14 +295,14 @@ class TestKeepSet:
         src = home / "src-aaaa"
         inst = InstalledCli(BuildInfo(SHA_OLD, TIME_OLD), src, home / "python-cpython" / "bin" / "python3", "gui", "x")
 
-        assert adopt.keep_set(home, inst) == {src, home / "python-cpython"}
+        assert cli_home.keep_set(home, inst) == {src, home / "python-cpython"}
 
     def test_an_interpreter_outside_the_cli_home_contributes_nothing(self, tmp_path):
         home = tmp_path / "cli"
         src = home / "src-aaaa"
         inst = InstalledCli(BuildInfo(SHA_OLD, TIME_OLD), src, tmp_path / "elsewhere" / "python3", "cli", "x")
 
-        assert adopt.keep_set(home, inst) == {src}
+        assert cli_home.keep_set(home, inst) == {src}
 
 
 # --------------------------------------------------------------- second run / versions

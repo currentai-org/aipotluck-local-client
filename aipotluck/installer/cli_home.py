@@ -447,6 +447,23 @@ def _is_staged_name(name: str) -> bool:
     return name.startswith((".src-", ".python-")) and ".partial-" in name
 
 
+def keep_set(home: Path, inst: InstalledCli) -> set[Path]:
+    """What `prune` must leave alone: the staged source tree, plus the staged interpreter's
+    top-level directory when it was copied in alongside it (`python-<name>`). A system interpreter
+    elsewhere on disk contributes nothing -- it isn't in the CLI home to delete.
+
+    Shared by every caller that adopts and then prunes (adopt.py, install.py), so "keep what the
+    manifest points at" can never be computed two slightly different ways.
+    """
+    home = Path(home)
+    keep = {inst.src}
+    try:
+        keep.add(home / inst.python.relative_to(home).parts[0])
+    except ValueError:
+        pass
+    return keep
+
+
 def prune(home: Path, keep: Iterable[Path]) -> list[Path]:
     """Delete staged copies in `home` that are neither in `keep` nor holding this process's
     interpreter, and return what was removed.

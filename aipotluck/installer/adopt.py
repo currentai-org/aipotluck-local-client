@@ -94,18 +94,6 @@ def emit(payload: dict) -> None:
     print(RESULT_PREFIX + json.dumps(payload), flush=True)
 
 
-def keep_set(home: Path, inst: cli_home.InstalledCli) -> set[Path]:
-    """What prune must leave alone: the staged source tree, plus the staged interpreter's top-level
-    directory when it was copied in alongside it (`python-<name>`). A system interpreter elsewhere
-    on disk contributes nothing -- it isn't in the CLI home to delete."""
-    keep = {inst.src}
-    try:
-        keep.add(home / inst.python.relative_to(home).parts[0])
-    except ValueError:
-        pass
-    return keep
-
-
 def run(args: argparse.Namespace) -> int:
     profile = HostProfile(os_name=detect_os(), arch=detect_arch(), backend="cpu")
     lay = layout.get_layout(profile.os_name)
@@ -142,7 +130,7 @@ def run(args: argparse.Namespace) -> int:
         log.info("Pointed the CLI shim at %s (service %s)", shim_path, "re-pointed" if service_present else "not installed")
 
     home = cli_home.cli_home(lay)
-    removed = cli_home.prune(home, keep_set(home, inst))
+    removed = cli_home.prune(home, cli_home.keep_set(home, inst))
     if removed:
         log.info("Removed %d superseded staged cop%s from %s", len(removed), "y" if len(removed) == 1 else "ies", home)
 
