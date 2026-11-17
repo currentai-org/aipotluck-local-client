@@ -303,4 +303,3 @@ def test_models_only_leaves_the_shared_cli_home_intact(installed, monkeypatch):
     assert cli.run_uninstall(args) == 0
     assert (cli_copy / "current.json").exists()
     assert (cli_copy / "src-0123456789ab").is_dir() and server.exists()
-
