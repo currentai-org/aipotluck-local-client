@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from aipotluck.installer import install
+from aipotluck.installer import cli_home, cli_shim, install
+from aipotluck.installer.cli_home import BuildInfo, InstalledCli
+from aipotluck.installer.layout import Layout
 from aipotluck.installer.platform_detect import HostProfile
 from aipotluck.installer.service.base import ServiceState, ServiceStatus
 
@@ -41,6 +44,20 @@ def _fake_model_prefetch(monkeypatch):
         install.model_sizing, "ensure_preset", lambda *a, **kw: ensure_preset_calls.append((a, kw))
     )
     return pull_calls, ensure_preset_calls
+
+
+@pytest.fixture(autouse=True)
+def _never_a_real_os_service(monkeypatch):
+    """No test in this file may register (or start, or stop) a real OS service. cli_home's manager
+    seam is what the per-user branch registers through, so it is a MagicMock by default: even a
+    regression that routes a test down a path it wasn't meant to take writes nothing to the real
+    systemd/launchd/Task Scheduler. Tests that assert on the registration replace this with their
+    own mock."""
+    mgr = MagicMock()
+    mgr.status.return_value = ServiceStatus(ServiceState.NOT_INSTALLED, detail="fake")
+    factory = MagicMock(return_value=mgr)
+    monkeypatch.setattr(cli_home, "get_service_manager", factory)
+    return factory, mgr
 
 
 @pytest.fixture
@@ -730,3 +747,364 @@ class TestRunInstallCompanions:
         )
         assert install.run_install(make_args(tmp_path / "inst", ["--no-service"])) == 0
         assert calls == [("llama-x.tar.gz", fake_fetch.parent)]
+
+
+# --------------------------------------------------------- the per-user CLI home (CUR-4337)
+
+SHA_OLD = "a" * 40
+SHA_NEW = "b" * 40
+TIME_OLD = 1_000_000
+TIME_NEW = 1_100_000
+
+
+def _layout(tmp_path: Path) -> Layout:
+    """A per-user Layout rooted under tmp_path -- what get_layout would return for this HOME."""
+    root = tmp_path / "install"
+    return Layout(install_root=root, config_dir=root / "config", log_dir=root / "logs", state_dir=root / "state")
+
+
+def _fake_source(tmp_path: Path, *, sha: str = SHA_NEW, commit_time: int = TIME_NEW, name: str = "source") -> Path:
+    """A throwaway tree shaped like this install's own: the package (with the two entry points a
+    staged copy has to carry) plus a stamped build-info file, so its version is the one the test
+    chose rather than whatever this checkout's git HEAD happens to be."""
+    root = tmp_path / name
+    package = root / "aipotluck"
+    (package / "installer").mkdir(parents=True)
+    (package / "service").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "installer" / "cli.py").write_text("# cli\n", encoding="utf-8")
+    (package / "installer" / "install.py").write_text("# install\n", encoding="utf-8")
+    (package / "service" / "aipotluck_service.py").write_text("# service\n", encoding="utf-8")
+    (package / "_build_info.txt").write_text(f"{sha} {commit_time}\n", encoding="utf-8")
+    return root
+
+
+def _parse(argv: list[str] | None = None):
+    """Parse as the CLI would, with no --install-dir/--model-path: the DEFAULT (per-user) shape."""
+    return install.build_arg_parser().parse_args(argv or [])
+
+
+def _fake_cli_home_manager(monkeypatch, *, state: ServiceState = ServiceState.RUNNING):
+    """The service manager the per-user branch reports through, patched on cli_home (where register
+    imports it) so one patch reaches the registration and the status below it."""
+    mgr = MagicMock()
+    mgr.status.return_value = ServiceStatus(state, detail="fake")
+    factory = MagicMock(return_value=mgr)
+    monkeypatch.setattr(cli_home, "get_service_manager", factory)
+    return factory, mgr
+
+
+@pytest.fixture
+def per_user(monkeypatch, tmp_path):
+    """Everything the default install touches outside the network/subprocess boundaries mocked:
+    the per-user Layout, this "checkout" (a fake source tree), the shim's bin dir and HOME, and
+    detect_os. Returns (layout, source_root)."""
+    lay = _layout(tmp_path)
+    source = _fake_source(tmp_path)
+    monkeypatch.setattr(
+        install.layout, "get_layout",
+        lambda os_name, system_scope=False, override_root=None: lay,
+    )
+    monkeypatch.setattr(install, "REPO_ROOT", source)
+    monkeypatch.setattr(install, "detect_os", lambda: "linux")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(cli_shim, "_bin_dir", lambda profile, system_scope: tmp_path / "bin")
+    monkeypatch.setattr(cli_shim, "_login_shell", lambda: "bash")
+    monkeypatch.setattr(cli_shim.Path, "home", classmethod(lambda cls: home))
+    return lay, source
+
+
+def _installed(lay: Layout) -> InstalledCli:
+    inst = cli_home.read_installed(cli_home.cli_home(lay))
+    assert inst is not None, "nothing staged in the CLI home"
+    return inst
+
+
+class TestRunInstallPerUser:
+    """The DEFAULT install registers the service and the CLI shim against the shared CLI home
+    (`<install root>/cli`), not against whatever tree ran the install.
+
+    Why it matters: that tree may be a GUI bundle or a checkout the person deletes tomorrow. Before
+    the CLI home existed, whichever installer ran last owned the service and the `aipotluck-local-
+    client` command, and it could quietly be the older of the two -- llama.cpp and newt pins
+    included.
+    """
+
+    def test_the_service_runs_the_staged_copy_not_this_checkout(self, tmp_path, fake_fetch, per_user, monkeypatch):
+        lay, source = per_user
+        _, mgr = _fake_cli_home_manager(monkeypatch, state=ServiceState.RUNNING)
+
+        rc = install.run_install(_parse())
+
+        assert rc == 0
+        inst = _installed(lay)
+        _, kwargs = mgr.install.call_args
+        assert kwargs["exec_path"] == inst.python
+        assert kwargs["args"][0] == str(inst.src / "aipotluck" / "service" / "aipotluck_service.py")
+        assert kwargs["working_dir"] == inst.src
+        assert kwargs["system_scope"] is False
+        assert kwargs["args"][1:] == ["--config-dir", str(lay.config_dir), "--log-dir", str(lay.log_dir)]
+        assert str(source) not in str(kwargs["args"][0])
+        # A running service is restarted onto the new copy rather than left on the old one.
+        mgr.stop.assert_called_once_with(cli_home.SERVICE_NAME)
+        mgr.start.assert_called_once_with(cli_home.SERVICE_NAME, system_scope=False)
+
+    def test_the_staged_script_really_lives_under_the_cli_home(self, tmp_path, fake_fetch, per_user, monkeypatch):
+        # The path assertions above would also pass for a staged tree that landed somewhere else;
+        # this pins the location to <install root>/cli/src-<sha12>.
+        lay, _ = per_user
+        _fake_cli_home_manager(monkeypatch, state=ServiceState.NOT_INSTALLED)
+
+        install.run_install(_parse())
+
+        inst = _installed(lay)
+        home = lay.install_root / cli_home.CLI_HOME_DIRNAME
+        assert inst.src == home / f"src-{SHA_NEW[:12]}"
+        assert (inst.src / "aipotluck" / "service" / "aipotluck_service.py").is_file()
+        assert (home / cli_home.MANIFEST_NAME).is_file()
+
+    def test_the_shim_runs_the_cli_from_the_cli_home(self, tmp_path, fake_fetch, per_user, monkeypatch):
+        lay, source = per_user
+        _fake_cli_home_manager(monkeypatch, state=ServiceState.NOT_INSTALLED)
+
+        install.run_install(_parse())
+
+        inst = _installed(lay)
+        text = (tmp_path / "bin" / cli_shim.CLI_SHIM_NAME).read_text(encoding="utf-8")
+        cli_py = inst.src / "aipotluck" / "installer" / "cli.py"
+        assert f'exec "{inst.python}" "{cli_py}" "$@"' in text
+        assert str(source) not in text
+
+    def test_bundled_python_dir_and_installed_by_reach_adopt(self, tmp_path, fake_fetch, per_user, monkeypatch):
+        lay, _ = per_user
+        _fake_cli_home_manager(monkeypatch, state=ServiceState.NOT_INSTALLED)
+        real_adopt = cli_home.adopt
+        calls = []
+
+        def _spy(source_root, lay, **kwargs):
+            calls.append((source_root, lay, kwargs))
+            return real_adopt(source_root, lay, **kwargs)
+
+        monkeypatch.setattr(cli_home, "adopt", _spy)
+        bundle = tmp_path / "bundle" / "python"
+
+        rc = install.run_install(_parse(["--bundled-python-dir", str(bundle), "--installed-by", "gui"]))
+
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0][0] == install.REPO_ROOT
+        assert calls[0][1] == lay
+        assert calls[0][2] == {"bundled_python_dir": bundle, "installed_by": "gui"}
+        assert _installed(lay).installed_by == "gui"
+
+    def test_superseded_staged_copies_are_pruned(self, tmp_path, fake_fetch, per_user, monkeypatch):
+        lay, _ = per_user
+        stale = cli_home.cli_home(lay) / ("src-" + "0" * 12)
+        stale.mkdir(parents=True)
+        _fake_cli_home_manager(monkeypatch, state=ServiceState.NOT_INSTALLED)
+
+        install.run_install(_parse())
+
+        inst = _installed(lay)
+        assert not stale.exists()
+        assert inst.src.is_dir()
+
+    def test_the_summary_names_the_cli_home_copy(self, tmp_path, fake_fetch, per_user, monkeypatch, capsys):
+        lay, _ = per_user
+        _fake_cli_home_manager(monkeypatch, state=ServiceState.RUNNING)
+
+        install.run_install(_parse())
+
+        out = capsys.readouterr().out
+        assert f"CLI home:       {_installed(lay).src}" in out
+
+    def test_no_service_stages_nothing_into_the_cli_home(self, tmp_path, fake_fetch, per_user, monkeypatch, capsys):
+        # `--no-service` stays exactly what it was: fetch/extract llama.cpp, write runtime.json,
+        # stop. No CLI home, no shim, no service manager.
+        lay, _ = per_user
+        factory, mgr = _fake_cli_home_manager(monkeypatch)
+        adopt = MagicMock()
+        monkeypatch.setattr(cli_home, "adopt", adopt)
+        monkeypatch.setattr(install, "get_service_manager", MagicMock())
+
+        rc = install.run_install(_parse(["--no-service"]))
+
+        assert rc == 0
+        adopt.assert_not_called()
+        factory.assert_not_called()
+        mgr.install.assert_not_called()
+        assert not (lay.install_root / cli_home.CLI_HOME_DIRNAME).exists()
+        assert not (tmp_path / "bin").exists()
+        out = capsys.readouterr().out
+        assert "CLI home:" not in out
+        assert "not installed (--no-service)" in out
+
+
+class TestInstallDirKeepsThisCheckout:
+    """--install-dir and --system are untouched by the CLI home: no staging, no manifest, and the
+    service still runs this checkout out of the root the user named."""
+
+    def test_install_dir_never_consults_or_creates_a_cli_home(
+        self, tmp_path, fake_fetch, monkeypatch, _never_a_real_os_service
+    ):
+        cli_home_factory, _ = _never_a_real_os_service
+        adopt = MagicMock()
+        monkeypatch.setattr(cli_home, "adopt", adopt)
+        mgr = MagicMock()
+        mgr.status.return_value = ServiceStatus(ServiceState.RUNNING, detail="active")
+        monkeypatch.setattr(install, "get_service_manager", lambda os_name: mgr)
+        monkeypatch.setattr(install, "ensure_python", lambda: Path("/usr/bin/python3"))
+        monkeypatch.setattr(install, "install_cli_shim", lambda *a, **kw: Path("/fake/bin/aipotluck-local-client"))
+        install_dir = tmp_path / "install"
+
+        rc = install.run_install(make_args(install_dir))
+
+        assert rc == 0
+        adopt.assert_not_called()
+        cli_home_factory.assert_not_called()
+        assert not (install_dir / cli_home.CLI_HOME_DIRNAME).exists()
+        _, kwargs = mgr.install.call_args
+        assert kwargs["exec_path"] == Path("/usr/bin/python3")
+        assert kwargs["args"][0] == str(install.REPO_ROOT / "aipotluck" / "service" / "aipotluck_service.py")
+        assert kwargs["working_dir"] == install.REPO_ROOT
+
+
+class TestDelegationToANewerCliHome:
+    """An older copy of this installer (a GUI bundle from last month, a stale checkout) must hand
+    the WHOLE install to the newer copy in the CLI home, not just decline to replace its tree:
+    otherwise llama.cpp and newt would be re-pinned to older versions while the CLI stayed new.
+    """
+
+    def _plant_installed(self, lay: Layout, *, sha: str, commit_time: int) -> InstalledCli:
+        """An already-installed CLI home, exactly as a previous run would have left it."""
+        home = cli_home.cli_home(lay)
+        src = home / f"src-{sha[:12]}"
+        (src / "aipotluck" / "installer").mkdir(parents=True)
+        (src / "aipotluck" / "installer" / "install.py").write_text("# newer install\n", encoding="utf-8")
+        python = src / "python3"
+        python.write_text("", encoding="utf-8")
+        inst = InstalledCli(BuildInfo(sha, commit_time), src, python, "cli", "2026-01-01T00:00:00Z")
+        cli_home.write_installed(home, inst)
+        return inst
+
+    def _setup(self, tmp_path, monkeypatch, *, installed: tuple[str, int] | None, source: tuple[str, int]):
+        lay = _layout(tmp_path)
+        monkeypatch.setattr(
+            install.layout, "get_layout", lambda os_name, system_scope=False, override_root=None: lay
+        )
+        monkeypatch.setattr(install, "detect_os", lambda: "linux")
+        monkeypatch.setattr(install, "REPO_ROOT", _fake_source(tmp_path, sha=source[0], commit_time=source[1]))
+        inst = None
+        if installed is not None:
+            inst = self._plant_installed(lay, sha=installed[0], commit_time=installed[1])
+        return lay, inst
+
+    def test_a_newer_installed_copy_receives_the_whole_install(self, tmp_path, monkeypatch):
+        lay, inst = self._setup(
+            tmp_path, monkeypatch, installed=(SHA_NEW, TIME_NEW), source=(SHA_OLD, TIME_OLD)
+        )
+        calls = []
+
+        def _execve(path, argv, env):
+            calls.append((path, argv, env))
+            raise SystemExit(0)  # stands in for the process being replaced
+
+        monkeypatch.setattr(install.os, "execve", _execve)
+        run_install = MagicMock(return_value=0)
+        monkeypatch.setattr(install, "run_install", run_install)
+
+        with pytest.raises(SystemExit):
+            install.main(["--no-start", "--model-path", "./m.gguf"])
+
+        assert len(calls) == 1
+        path, argv, env = calls[0]
+        assert path == str(inst.python)
+        assert argv == [
+            str(inst.python),
+            str(inst.src / "aipotluck" / "installer" / "install.py"),
+            "--no-start",
+            "--model-path",
+            "./m.gguf",
+        ]
+        assert env[install.DELEGATED_ENV] == "1"
+        # The marker goes to the child only -- this process's own environment is left alone.
+        assert install.DELEGATED_ENV not in os.environ
+        run_install.assert_not_called()
+
+    def test_windows_runs_the_newer_copy_and_returns_its_exit_code(self, tmp_path, monkeypatch):
+        _, inst = self._setup(
+            tmp_path, monkeypatch, installed=(SHA_NEW, TIME_NEW), source=(SHA_OLD, TIME_OLD)
+        )
+        # os.name cannot be patched on the real module (pathlib would start handing out
+        # WindowsPath), so install.py's view of `os` is replaced with a proxy that only lies about
+        # name -- the branch under test is os.name == "nt", and Windows has no execve.
+        class _FakeOs:
+            name = "nt"
+
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, item):
+                return getattr(self._real, item)
+
+        monkeypatch.setattr(install, "os", _FakeOs(os))
+        call = MagicMock(return_value=7)
+        monkeypatch.setattr(install.subprocess, "call", call)
+        run_install = MagicMock(return_value=0)
+        monkeypatch.setattr(install, "run_install", run_install)
+
+        assert install.main(["--no-start"]) == 7
+
+        argv, kwargs = call.call_args
+        assert argv[0] == [
+            str(inst.python),
+            str(inst.src / "aipotluck" / "installer" / "install.py"),
+            "--no-start",
+        ]
+        assert kwargs["env"][install.DELEGATED_ENV] == "1"
+        run_install.assert_not_called()
+
+    def _assert_no_delegation(self, monkeypatch, tmp_path, argv, *, installed, source):
+        self._setup(tmp_path, monkeypatch, installed=installed, source=source)
+        execve = MagicMock()
+        monkeypatch.setattr(install.os, "execve", execve)
+        args = install.build_arg_parser().parse_args(argv)
+        assert install._maybe_delegate(args, argv) is None
+        execve.assert_not_called()
+
+    def test_a_delegated_run_installs_itself_instead_of_handing_over_again(self, tmp_path, monkeypatch):
+        # Without this the newer copy -- which is older than nothing, so it would delegate back --
+        # would hand straight back to the caller and the two would ping-pong forever.
+        monkeypatch.setenv(install.DELEGATED_ENV, "1")
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, [], installed=(SHA_NEW, TIME_NEW), source=(SHA_OLD, TIME_OLD)
+        )
+
+    def test_an_identical_installed_build_is_not_a_reason_to_delegate(self, tmp_path, monkeypatch):
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, [], installed=(SHA_NEW, TIME_NEW), source=(SHA_NEW, TIME_NEW)
+        )
+
+    def test_an_older_installed_build_is_not_a_reason_to_delegate(self, tmp_path, monkeypatch):
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, [], installed=(SHA_OLD, TIME_OLD), source=(SHA_NEW, TIME_NEW)
+        )
+
+    def test_nothing_installed_is_not_a_reason_to_delegate(self, tmp_path, monkeypatch):
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, [], installed=None, source=(SHA_NEW, TIME_NEW)
+        )
+
+    def test_system_installs_never_delegate(self, tmp_path, monkeypatch):
+        # --system installs machine-wide into /opt/aipotluck: there is no per-user CLI home to hand
+        # over to, and the shim it writes belongs to no user either.
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, ["--system"], installed=(SHA_NEW, TIME_NEW), source=(SHA_OLD, TIME_OLD)
+        )
+
+    def test_install_dir_installs_never_delegate(self, tmp_path, monkeypatch):
+        self._assert_no_delegation(
+            monkeypatch, tmp_path, ["--install-dir", str(tmp_path / "elsewhere")],
+            installed=(SHA_NEW, TIME_NEW), source=(SHA_OLD, TIME_OLD),
+        )
