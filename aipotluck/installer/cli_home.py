@@ -30,6 +30,10 @@ copy without the marker is never trusted, so a killed install leaves a partial d
 both installers delegate to -- adopt mine, keep the newer one, or do nothing -- and `prune` is the
 only thing that deletes staged copies, never the manifest and never a tree holding the running
 interpreter.
+
+`register` is the other half of the same idea: the OS service and the `aipotluck-local-client`
+shim are pointed at the staged copy's interpreter and source tree, never at whichever checkout or
+bundled tree happened to run the install.
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from aipotluck.installer import layout
+from aipotluck.installer.cli_shim import install_cli_shim
+from aipotluck.installer.platform_detect import HostProfile
+from aipotluck.installer.service.base import ServiceState, get_service_manager
 from aipotluck.proc import NO_WINDOW
 
 log = logging.getLogger("aipotluck.installer.cli_home")
@@ -56,6 +63,7 @@ MANIFEST_NAME = "current.json"
 BUILD_INFO_RELPATH = Path("aipotluck") / "_build_info.txt"
 SCHEMA = 1
 READY_MARKER = ".complete"
+SERVICE_NAME = "aipotluck"
 
 # Never worth copying into the CLI home: history and vendored trees are large, and a staged copy
 # with tests/research in it is weight the service and shim never run.
@@ -362,6 +370,70 @@ def adopt(
         python,
     )
     return AdoptResult("adopted", inst)
+
+
+# ------------------------------------------------------- the service and the shim
+
+# Nothing here points at the running checkout: the OS service and the PATH shim are both rewritten
+# against the staged copy (InstalledCli.python + InstalledCli.src), which is the whole point of a
+# single CLI home -- otherwise a GUI bundled with an older tree, or a checkout that has since been
+# deleted, would keep owning the service and the `aipotluck-local-client` command.
+
+
+def service_args(lay: layout.Layout) -> list[str]:
+    """The service's own arguments: where to read runtime.json from and where to log. Identical to
+    what install.py has always passed, so a unit registered here is the unit install.py would
+    register -- just running the staged copy instead of the checkout."""
+    return ["--config-dir", str(lay.config_dir), "--log-dir", str(lay.log_dir)]
+
+
+def register(
+    profile: HostProfile, lay: layout.Layout, inst: InstalledCli, *, register_service: bool, start: bool
+) -> tuple[bool, bool, Path]:
+    """Points the OS service and the CLI shim at `inst` and returns
+    `(service_installed, restarted, shim_path)`.
+
+    `register_service=False` is the case with no service to re-point -- the GUI runs the service
+    itself, or nothing was ever installed -- and it must not *create* one: the shim is still
+    rewritten either way, because that is what the person's shell actually runs.
+
+    A service that was running is stopped first, restarted afterwards and reported through
+    `restarted`; one that was stopped or missing stays that way unless `start` says otherwise, so
+    re-pointing a stopped service never silently starts it. A failed registration is an ERROR and a
+    failed start a WARNING, not an exception: the staged CLI and the shim are usable regardless,
+    and the caller reports the real state rather than an install that "succeeded" into nothing.
+    """
+    service_installed = False
+    restarted = False
+    if register_service:
+        mgr = get_service_manager(profile.os_name)
+        was_running = mgr.status(SERVICE_NAME).state is ServiceState.RUNNING
+        if was_running:
+            mgr.stop(SERVICE_NAME)
+        try:
+            mgr.install(
+                SERVICE_NAME,
+                exec_path=inst.python,
+                args=[
+                    str(inst.src / "aipotluck" / "service" / "aipotluck_service.py"),
+                    *service_args(lay),
+                ],
+                system_scope=False,
+                working_dir=inst.src,
+                log_dir=lay.log_dir,
+            )
+            service_installed = True
+        except RuntimeError as exc:
+            log.error("%s", exc)
+        if service_installed and (start or was_running):
+            try:
+                mgr.start(SERVICE_NAME, system_scope=False)
+                restarted = was_running
+            except RuntimeError as exc:
+                log.warning("%s", exc)
+
+    shim_path = install_cli_shim(profile, inst.python, False, cli_root=inst.src)
+    return service_installed, restarted, shim_path
 
 
 # ------------------------------------------------------------------------------- pruning
