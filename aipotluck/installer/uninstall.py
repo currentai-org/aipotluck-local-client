@@ -13,10 +13,14 @@ What goes, in this order:
 4. **The `aipotluck-local-client` command** (the PATH shim), and on Windows its PATH entry.
 5. **This install's directories**: llama.cpp, newt, any source build, config (runtime.json with
    the pairing, presets), logs and the download cache.
+6. **The shared CLI copy (`<install root>/cli`)**, last: the service and the
+   `aipotluck-local-client` shim both run from it, so it is the copy this very process is probably
+   running out of. A copy that can't be deleted (Windows locks a running `python.exe`'s files) is a
+   warning, not a failure -- nothing uses it once the two above are gone.
 
 What stays: the HF model cache unless asked (it is shared with any other llama.cpp on the machine),
-and this checkout of the CLI itself -- whoever installed it removes it (the GUI deletes its own
-bundled copy; a CLI install was a `git clone` the user owns).
+and the original checkout the CLI home was staged from (`~/.aipotluck/src`, or the desktop GUI's own
+bundled tree) -- that belongs to whoever made it, and stays with its owner to remove.
 
 Deleting the local pairing does not remove the server from the person's aipotluck.org account; that
 lives on the server and is removed there.
@@ -36,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from aipotluck.installer import cache_router, cli_shim, layout as layout_mod
+from aipotluck.installer import cache_router, cli_home, cli_shim, layout as layout_mod
 from aipotluck.installer.model_pull import ModelPullError, list_cached_models
 from aipotluck.installer.platform_detect import HostProfile
 from aipotluck.installer.service.base import ServiceManager, ServiceState
@@ -236,6 +240,19 @@ def uninstall(
                 f"couldn't delete {path} ({exc}). The service is already removed; close whatever "
                 "has those files open and run uninstall again to finish."
             ) from exc
+
+    # The shared CLI copy goes LAST, after everything that could still need to import a module:
+    # when `aipotluck-local-client uninstall` is run, this process is usually running from the
+    # interpreter staged in here (that is what the shim execs), so a lazy import after this point
+    # could fail against a tree that no longer exists. Not fatal if it can't be removed -- Windows
+    # keeps a running python.exe's files locked -- because nothing points at the copy any more.
+    cli_copy = cli_home.cli_home(lay)
+    try:
+        _rmtree(cli_copy, report)
+    except OSError as exc:
+        report.warnings.append(
+            f"couldn't delete {cli_copy} ({exc}); it is no longer used and can be deleted by hand"
+        )
     try:
         if lay.install_root.exists() and not any(lay.install_root.iterdir()):
             lay.install_root.rmdir()

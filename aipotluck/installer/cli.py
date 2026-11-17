@@ -651,14 +651,22 @@ def run_list_models(args: argparse.Namespace) -> int:
 
 
 def run_uninstall(args: argparse.Namespace) -> int:
-    """Removes this install: service first, then (if asked) models, then files. See uninstall.py."""
+    """Removes this install: service first, then (if asked) models, then files. See uninstall.py.
+
+    Nothing after the `uninstall()` call may import a module lazily: the running interpreter is
+    usually the one staged in the CLI home, which that call has just deleted (`json` and `logging`
+    are already imported at the top of this file, which is why this stays on the safe side).
+    """
     from aipotluck.installer import uninstall as uninstall_mod
 
     profile, lay = _profile_and_layout(args)
     if args.models_only:
         what = "every downloaded model (the rest of the install stays)"
     else:
-        what = "the background service, llama.cpp, newt, this device's pairing, config, logs and downloads"
+        what = (
+            "the background service, llama.cpp, newt, this device's pairing, config, logs and "
+            "downloads, and the installed copy of the CLI"
+        )
         if args.remove_models:
             what += ", and every downloaded model"
     if not args.yes:
